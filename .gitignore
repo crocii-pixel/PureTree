@@ -1,0 +1,8 @@
+# Build artifacts
+*.exe
+*.pdb
+*.ilk
+*.obj
+build/
+.vscode/
+_CProps/
