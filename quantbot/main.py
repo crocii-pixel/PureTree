@@ -3,8 +3,9 @@ import logging
 import sys
 import threading
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import schedule
 
@@ -61,6 +62,38 @@ def setup_logging() -> Optional[str]:
     except Exception as e:  # 로깅 설정 실패가 봇 기동을 막지 않도록 격리
         logger.warning(f"파일 로깅 설정 실패: {e}")
         return None
+
+
+def derive_schedule(boundary_kst: str, liquidate_lead_sec: int = 10,
+                    settings_lag_sec: int = 5) -> Dict[str, str]:
+    """
+    거래소의 일봉 갱신 시각에서 청산/세팅 스케줄을 유도합니다.
+
+    변동성 돌파 전략은 '당일 시가'가 갱신되는 순간을 기준으로 동작하므로,
+    일봉 경계 **직전에 청산**하고 **직후에 세팅**해야 합니다.
+    거래소마다 경계가 달라(빗썸 00:00 / 업비트·코인원 09:00 KST) 수동 설정 시
+    실수하기 쉬워 자동 계산합니다.
+
+    >>> derive_schedule("09:00")
+    {'liquidate_time': '08:59:50', 'settings_time': '09:00:05'}
+    >>> derive_schedule("00:00")
+    {'liquidate_time': '23:59:50', 'settings_time': '00:00:05'}
+
+    :param boundary_kst: 일봉 갱신 시각 ('09:00' / '00:00')
+    :param liquidate_lead_sec: 경계 몇 초 전에 청산할지
+    :param settings_lag_sec: 경계 몇 초 후에 세팅을 갱신할지
+    """
+    try:
+        hour, minute = (int(part) for part in boundary_kst.split(":")[:2])
+    except (ValueError, AttributeError):
+        hour, minute = 9, 0
+
+    # 자정 경계에서 음수가 되지 않도록 datetime 연산으로 처리 (00:00 - 10s = 23:59:50)
+    base = datetime(2000, 1, 1, hour % 24, minute % 60)
+    return {
+        "liquidate_time": (base - timedelta(seconds=liquidate_lead_sec)).strftime("%H:%M:%S"),
+        "settings_time": (base + timedelta(seconds=settings_lag_sec)).strftime("%H:%M:%S"),
+    }
 
 
 class QuantBot:
@@ -166,6 +199,23 @@ class QuantBot:
         if self.exchange.is_simulation:
             return TradeStore.SIMULATION_STATUSES
         return TradeStore.LIVE_STATUSES
+
+    def resolve_schedule(self) -> Tuple[str, str, bool]:
+        """
+        적용할 청산/세팅 시각을 결정합니다.
+
+        config.json의 `schedule`에 값이 있으면 그대로 쓰고, 비어 있으면 거래소의
+        일봉 갱신 시각에서 자동 유도합니다. 항목별로 섞어 쓰는 것도 가능합니다.
+
+        :return: (청산 시각, 세팅 시각, 자동 유도 여부)
+        """
+        schedule_cfg = self.config.get("schedule") or {}
+        derived = derive_schedule(self.exchange.DAILY_CANDLE_OPEN_KST)
+
+        liquidate_time = schedule_cfg.get("liquidate_time") or derived["liquidate_time"]
+        settings_time = schedule_cfg.get("settings_time") or derived["settings_time"]
+        is_auto = not schedule_cfg.get("liquidate_time") and not schedule_cfg.get("settings_time")
+        return liquidate_time, settings_time, is_auto
 
     def restore_daily_state(self) -> None:
         """
@@ -552,25 +602,27 @@ class QuantBot:
         self.update_daily_settings()
 
         # 3. 스케줄러 등록
-        schedule_cfg = self.config.get("schedule", {})
-        settings_time = schedule_cfg.get("settings_time", "09:00:05")
-        liquidate_time = schedule_cfg.get("liquidate_time", "08:59:50")
+        liquidate_time, settings_time, is_auto = self.resolve_schedule()
 
         schedule.every().day.at(settings_time).do(self.update_daily_settings)
         schedule.every().day.at(liquidate_time).do(self.liquidate_position)
 
+        source = "자동 유도" if is_auto else "config.json 지정"
         logger.info(
-            f"⏰ 스케줄러 등록 완료 ({liquidate_time} 청산 / {settings_time} 세팅 갱신 / 1s 실시간 감시)"
+            f"⏰ 스케줄러 등록 완료 ({liquidate_time} 청산 / {settings_time} 세팅 갱신 / "
+            f"1s 실시간 감시 | {source})"
         )
 
-        # 일봉 갱신 시각은 거래소마다 다르므로(빗썸 00:00 / 업비트·코인원 09:00 KST)
-        # 스케줄이 어긋나면 '당일 시가' 기준이 틀어질 수 있어 경고합니다.
+        # 직접 지정한 값이 거래소의 일봉 갱신 시각과 어긋나면 '당일 시가' 기준이 틀어집니다.
         boundary = self.exchange.DAILY_CANDLE_OPEN_KST
-        if not settings_time.startswith(boundary[:2]):
+        if not is_auto and not settings_time.startswith(boundary[:2]):
+            recommended = derive_schedule(boundary)
             logger.warning(
                 f"⚠️ [스케줄 확인 필요] {self.exchange.DISPLAY_NAME}의 일봉 갱신 시각은 "
                 f"{boundary}(KST)이지만 세팅 갱신 시각은 {settings_time}입니다. "
-                f"config.json의 schedule 값을 {boundary} 직후로 조정하는 것을 권장합니다."
+                f"권장값은 {recommended['liquidate_time']} 청산 / "
+                f"{recommended['settings_time']} 세팅이며, config.json에서 schedule 항목을 "
+                f"지우면 거래소에 맞춰 자동으로 설정됩니다."
             )
 
         # 4. 24시간 메인 실행 루프

@@ -620,7 +620,8 @@ class TestConfigManager:
         assert loaded["tickers"] == ["XRP"]
         # 누락된 키는 기본값으로 자동 보정
         assert loaded["ma_window"] == 5
-        assert loaded["schedule"]["settings_time"] == "09:00:05"
+        # schedule 기본값은 비어 있고(자동 유도), 봇이 거래소 기준으로 채움
+        assert loaded["schedule"] == {}
 
     def test_corrupted_config_falls_back_to_defaults(self, tmp_path):
         path = tmp_path / "config.json"
@@ -890,6 +891,49 @@ class TestQuantBotIntegration:
     def test_balance_report_uses_adapter(self, bot):
         report = bot.get_balance_report()
         assert "총 계좌 평가 자산" in report
+
+    def test_derive_schedule_from_candle_boundary(self):
+        """일봉 갱신 시각에서 청산/세팅 시각을 유도 (자정 경계 처리 포함)"""
+        from main import derive_schedule
+
+        assert derive_schedule("09:00") == {
+            "liquidate_time": "08:59:50", "settings_time": "09:00:05"}
+        # 자정 경계에서 음수로 넘어가지 않아야 함
+        assert derive_schedule("00:00") == {
+            "liquidate_time": "23:59:50", "settings_time": "00:00:05"}
+        assert derive_schedule("12:30") == {
+            "liquidate_time": "12:29:50", "settings_time": "12:30:05"}
+        # 잘못된 값은 09:00 기준으로 안전하게 폴백
+        assert derive_schedule("bad")["settings_time"] == "09:00:05"
+
+    def test_schedule_auto_follows_exchange(self, bot):
+        """schedule을 비우면 거래소의 일봉 갱신 시각을 따라간다"""
+        bot.config["schedule"] = {}
+
+        bot.exchange.DAILY_CANDLE_OPEN_KST = "00:00"      # 빗썸 기준
+        assert bot.resolve_schedule() == ("23:59:50", "00:00:05", True)
+
+        bot.exchange.DAILY_CANDLE_OPEN_KST = "09:00"      # 업비트/코인원 기준
+        assert bot.resolve_schedule() == ("08:59:50", "09:00:05", True)
+
+    def test_explicit_schedule_overrides_auto(self, bot):
+        """직접 지정한 값이 있으면 그대로 사용"""
+        bot.config["schedule"] = {"liquidate_time": "10:00:00",
+                                  "settings_time": "10:00:10"}
+        assert bot.resolve_schedule() == ("10:00:00", "10:00:10", False)
+
+    def test_partial_schedule_fills_missing_from_auto(self, bot):
+        """항목 하나만 지정하면 나머지는 자동 유도로 채움"""
+        bot.exchange.DAILY_CANDLE_OPEN_KST = "09:00"
+        bot.config["schedule"] = {"settings_time": "09:05:00"}
+
+        liquidate, settings, is_auto = bot.resolve_schedule()
+        assert (liquidate, settings) == ("08:59:50", "09:05:00")
+        assert is_auto is False
+
+    def test_default_config_uses_auto_schedule(self):
+        """기본 설정은 자동 유도(빈 schedule)"""
+        assert config_manager.DEFAULT_CONFIG["schedule"] == {}
 
     def test_cli_parses_exchange_override(self):
         from main import parse_args
