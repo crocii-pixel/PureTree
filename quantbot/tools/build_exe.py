@@ -179,7 +179,8 @@ def main(argv: List[str] | None = None) -> int:
     _print(f"  3) 설정 창    : dist\\{APP_NAME}.exe --config")
     _print(f"  4) 연동 검증  : dist\\{APP_NAME}.exe --test --dry-run")
     if windowed:
-        _print("  * 콘솔이 없는 빌드이므로 로그는 dist\\logs\\quantbot.log 에 기록됩니다.")
+        _print("  * 콘솔이 없는 빌드이므로 로그는 %LOCALAPPDATA%\\QuantBot\\logs\\ 에 날짜별로 기록됩니다.")
+        _print("  * 매매 이력 DB: %LOCALAPPDATA%\\QuantBot\\quantbot.db")
     _print("=" * 70)
     return 0
 

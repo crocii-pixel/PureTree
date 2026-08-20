@@ -22,17 +22,19 @@ gui_manager.py - QuantBot 시스템 트레이 GUI + 미니 대시보드
 
 from __future__ import annotations
 
+import html
 import logging
 import re
 import sys
 import threading
+import time
 from collections import deque
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 # --- PyQt6 우선, 없으면 PyQt5 폴백 -----------------------------------
 try:
     from PyQt6.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal
-    from PyQt6.QtGui import QAction, QBrush, QColor, QIcon
+    from PyQt6.QtGui import QAction, QBrush, QColor, QIcon, QTextCursor
     from PyQt6.QtWidgets import (
         QApplication, QFrame, QGridLayout, QHBoxLayout, QLabel, QMenu,
         QMessageBox, QPushButton, QSystemTrayIcon, QTableWidget,
@@ -41,7 +43,7 @@ try:
     QT_BINDING = "PyQt6"
 except ImportError:  # pragma: no cover - 설치 환경에 따라 분기
     from PyQt5.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal
-    from PyQt5.QtGui import QBrush, QColor, QIcon
+    from PyQt5.QtGui import QBrush, QColor, QIcon, QTextCursor
     from PyQt5.QtWidgets import (
         QAction, QApplication, QFrame, QGridLayout, QHBoxLayout, QLabel,
         QMenu, QMessageBox, QPushButton, QSystemTrayIcon, QTableWidget,
@@ -59,26 +61,91 @@ LOG_CAPACITY = 300      # 대시보드에 보관할 최근 로그 줄 수
 REFRESH_MS = 1000       # 대시보드 갱신 주기(ms)
 
 
+# 로그 레벨별 기본 아이콘 (메시지에 자체 아이콘이 없을 때 사용)
+LEVEL_ICONS: Dict[int, str] = {
+    logging.DEBUG: "·",
+    logging.INFO: "ℹ️",
+    logging.WARNING: "⚠️",
+    logging.ERROR: "⛔",
+    logging.CRITICAL: "🚨",
+}
+
+
+def _level_color(level: int) -> str:
+    """로그 레벨에 대응하는 본문 색상"""
+    if level >= logging.ERROR:
+        return ui_theme.COLORS["danger"]
+    if level >= logging.WARNING:
+        return ui_theme.COLORS["amber"]
+    if level <= logging.DEBUG:
+        return ui_theme.COLORS["text_muted"]
+    return ui_theme.COLORS["text_dim"]
+
+
 class LogBuffer(logging.Handler):
-    """대시보드에 표시할 최근 로그를 메모리에 순환 보관하는 로깅 핸들러"""
+    """
+    대시보드에 표시할 최근 로그를 메모리에 순환 보관하는 로깅 핸들러.
+
+    가독성을 위해 **모든 줄이 아이콘으로 시작**하도록 정규화합니다.
+      - 메시지 앞에 이미 이모지가 있으면(🚀 ✅ ⏰ 등) 그것을 아이콘 자리로 끌어냅니다.
+      - 없으면 로그 레벨 기본 아이콘(ℹ️ / ⚠️ / ⛔)을 붙입니다.
+    아이콘 열이 항상 같은 위치에 오므로 훑어보며 구분하기 쉽습니다.
+    """
 
     # 텔레그램용 HTML 태그(<b> 등)를 화면 표시용으로 제거
     _TAG_PATTERN = re.compile(r"</?[a-zA-Z][^>]*>")
 
+    # 메시지 맨 앞의 이모지(변이 선택자 / ZWJ 결합 포함) 추출
+    _LEADING_ICON = re.compile(
+        "^\\s*(["
+        "\U0001F300-\U0001FAFF"   # 그림 이모지
+        "←-⇿"           # 화살표
+        "⌀-➿"           # 기술 기호 / 딩뱃 (⏰ ⏸ ✅ ⚠)
+        "⬀-⯿"           # 기타 기호
+        "]"
+        "[︎️‍\U0001F300-\U0001FAFF]*)\\s*"
+    )
+
     def __init__(self, capacity: int = LOG_CAPACITY):
         super().__init__()
-        self.records: Deque[str] = deque(maxlen=capacity)
-        self.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s",
-                                            datefmt="%H:%M:%S"))
+        # (시각, 레벨, 아이콘, 본문) 튜플로 보관해 화면에서 색/아이콘을 자유롭게 조합
+        self.records: Deque[Tuple[str, int, str, str]] = deque(maxlen=capacity)
+        self.setFormatter(logging.Formatter("%(message)s"))
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            self.records.append(self._TAG_PATTERN.sub("", self.format(record)))
+            message = self._TAG_PATTERN.sub("", self.format(record)).strip()
+            icon, body = self.split_icon(message, record.levelno)
+            timestamp = time.strftime("%H:%M:%S", time.localtime(record.created))
+            self.records.append((timestamp, record.levelno, icon, body))
         except Exception:
             pass  # 로그 표시 실패가 매매를 중단시키지 않도록 무시
 
+    @classmethod
+    def split_icon(cls, message: str, level: int) -> Tuple[str, str]:
+        """메시지 선두 이모지를 아이콘으로 분리, 없으면 레벨 기본 아이콘 사용"""
+        match = cls._LEADING_ICON.match(message)
+        if match:
+            return match.group(1), message[match.end():]
+        return LEVEL_ICONS.get(level, "ℹ️"), message
+
     def tail(self, lines: int = 200) -> str:
-        return "\n".join(list(self.records)[-lines:])
+        """평문 로그 (테스트/복사용)"""
+        return "\n".join(
+            f"{t} {icon} {body}" for t, _level, icon, body in list(self.records)[-lines:]
+        )
+
+    def tail_html(self, lines: int = 200) -> str:
+        """대시보드 표시용 HTML (시각은 흐리게, 본문은 레벨 색상으로)"""
+        muted = ui_theme.COLORS["text_muted"]
+        rows: List[str] = []
+        for timestamp, level, icon, body in list(self.records)[-lines:]:
+            rows.append(
+                f'<span style="color:{muted}">{timestamp}</span>&nbsp;'
+                f'{html.escape(icon)}&nbsp;'
+                f'<span style="color:{_level_color(level)}">{html.escape(body)}</span>'
+            )
+        return "<div style='white-space:pre'>" + "<br>".join(rows) + "</div>"
 
 
 class BotThread(QThread):
@@ -347,12 +414,17 @@ class Dashboard(QWidget):
                     item.setToolTip(tip)
                 self.table.setItem(row, col, item)
 
-        # 로그는 스크롤이 맨 아래일 때만 자동 추적
+        # 로그는 스크롤이 맨 아래일 때만 자동 추적 (사용자가 위로 올려 읽는 중이면 유지)
         scrollbar = self.log_view.verticalScrollBar()
         at_bottom = scrollbar.value() >= scrollbar.maximum() - 4
-        self.log_view.setPlainText(self.log_buffer.tail())
+        self.log_view.setHtml(self.log_buffer.tail_html())
         if at_bottom:
-            scrollbar.setValue(scrollbar.maximum())
+            # setHtml 직후에는 문서 레이아웃이 끝나지 않아 maximum()이 아직 0일 수 있으므로
+            # 커서를 문서 끝으로 옮겨 확실하게 최신 줄이 보이도록 합니다.
+            cursor = self.log_view.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            self.log_view.setTextCursor(cursor)
+            self.log_view.ensureCursorVisible()
 
     def closeEvent(self, event) -> None:
         """창을 닫아도 앱은 트레이에 계속 상주"""

@@ -3,6 +3,7 @@ import logging
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import schedule
@@ -11,6 +12,7 @@ import config_manager
 from exchange_base import ExchangeBase, create_exchange
 from notifier import TelegramNotifier
 from strategy_engine import StrategyEngine
+from trade_store import TradeStore, session_date
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,14 +42,18 @@ def setup_logging() -> Optional[str]:
                 root.removeHandler(handler)
 
     try:
-        from logging.handlers import RotatingFileHandler
+        from logging.handlers import TimedRotatingFileHandler
 
-        log_dir = config_manager.BASE_DIR / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / "quantbot.log"
+        config_manager.ensure_data_dir()
+        log_path = config_manager.LOG_DIR / "quantbot.log"
 
-        file_handler = RotatingFileHandler(
-            log_path, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+        # 자정마다 회전하며 지난 파일은 quantbot-2026-08-20.log 형태로 보관 (30일치)
+        file_handler = TimedRotatingFileHandler(
+            log_path, when="midnight", interval=1, backupCount=30, encoding="utf-8"
+        )
+        file_handler.suffix = "%Y-%m-%d"
+        file_handler.namer = lambda name: str(
+            config_manager.LOG_DIR / f"quantbot-{Path(name).name.rsplit('.', 1)[-1]}.log"
         )
         file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
         root.addHandler(file_handler)
@@ -71,11 +77,13 @@ class QuantBot:
         config: Optional[Dict[str, Any]] = None,
         exchange: Optional[ExchangeBase] = None,
         notifier: Optional[TelegramNotifier] = None,
+        store: Optional[TradeStore] = None,
     ):
         """
         :param config: 설정 딕셔너리 (None이면 config.json 자동 로딩)
         :param exchange: 거래소 어댑터 (None이면 설정값 기준으로 동적 생성)
         :param notifier: 텔레그램 알림 객체 (None이면 새로 생성)
+        :param store: 매매 이력 저장소 (None이면 기본 SQLite 저장소 생성)
         """
         self.config: Dict[str, Any] = config or config_manager.load_config()
 
@@ -93,6 +101,15 @@ class QuantBot:
             notifier=self.notifier,
             force_simulation=bool(self.config.get("force_simulation", False)),
         )
+
+        # 매매 이력 저장소 (재시작 시 당일 상태 복구의 근거)
+        self.store: Optional[TradeStore] = store
+        if self.store is None and self.config.get("persist_trades", True):
+            try:
+                self.store = TradeStore()
+            except Exception as e:
+                logger.error(f"매매 이력 저장소 초기화 실패: {e}. 메모리 상태로만 동작합니다.")
+                self.store = None
 
         self.strategy_engine = StrategyEngine(
             k=self.k, ma_window=self.ma_window, use_dynamic_k=self.use_dynamic_k
@@ -126,6 +143,153 @@ class QuantBot:
         self.notifier.send_message(init_msg)
 
         self._setup_telegram_command_handlers()
+
+    # ------------------------------------------------------------------
+    # 매매 이력 / 당일 상태 (재시작 복구)
+    # ------------------------------------------------------------------
+    def trade_date(self) -> str:
+        """
+        현재 매매 세션의 기준일.
+
+        거래소별 일봉 갱신 시각(빗썸 00:00 / 업비트·코인원 09:00 KST)을 반영하므로,
+        새벽에 날짜가 넘어가도 같은 세션의 매수 이력이 유지됩니다.
+        """
+        return session_date(self.exchange.DAILY_CANDLE_OPEN_KST)
+
+    def _trade_statuses(self) -> tuple:
+        """
+        체결로 인정할 상태값.
+
+        시뮬레이션 실행에서는 모의 체결도 재매수 방지 대상이지만,
+        실전 실행에서는 이전 dry-run 기록이 실제 매수를 막으면 안 되므로 제외합니다.
+        """
+        if self.exchange.is_simulation:
+            return TradeStore.SIMULATION_STATUSES
+        return TradeStore.LIVE_STATUSES
+
+    def restore_daily_state(self) -> None:
+        """
+        저장소에서 당일 상태를 복구합니다.
+
+        봇이 장중에 재시작되면 has_bought가 초기화되어 **같은 날 같은 종목을 재매수**하는
+        문제가 있었습니다. 체결 이력과 daily_state를 근거로 상태를 되돌립니다.
+        """
+        if self.store is None:
+            return
+
+        trade_date = self.trade_date()
+        exchange = self.exchange.NAME
+        states = self.store.load_daily_state(exchange, trade_date)
+        restored: List[str] = []
+
+        for ticker in self.tickers:
+            # 체결 이력이 가장 강한 근거 (daily_state보다 우선)
+            if self.store.has_trade(exchange, ticker, "buy", trade_date,
+                                    self._trade_statuses()):
+                self.has_bought[ticker] = True
+                restored.append(f"{ticker}(체결)")
+                continue
+
+            state = states.get(ticker)
+            if not state:
+                continue
+            if state.get("has_bought"):
+                self.has_bought[ticker] = True
+                restored.append(f"{ticker}(기록)")
+            if state.get("skipped"):
+                self.skipped_today[ticker] = True
+                restored.append(f"{ticker}(제외)")
+
+        if restored:
+            msg = (
+                f"♻️ <b>[당일 상태 복구]</b> {trade_date} 세션\n"
+                f"재매수 방지를 위해 이전 실행 기록을 반영했습니다: {', '.join(restored)}"
+            )
+            logger.info(f"[당일 상태 복구] {trade_date} | {', '.join(restored)}")
+            self.notifier.send_message(msg)
+        else:
+            logger.info(f"[당일 상태 복구] {trade_date} 세션에 반영할 이전 기록이 없습니다.")
+
+    def reconcile_with_exchange(self) -> None:
+        """
+        거래소 API의 당일 주문 이력과 로컬 DB를 대사합니다.
+
+        봇이 주문 직후 종료되어 DB 기록을 남기지 못한 경우를 잡아내기 위한 안전망입니다.
+        (빗썸은 pybithumb이 주문 목록 조회를 제공하지 않아 대사를 건너뜁니다)
+        """
+        if self.store is None or self.exchange.is_simulation:
+            return
+
+        trade_date = self.trade_date()
+        try:
+            orders = self.exchange.get_today_orders(self.tickers, trade_date)
+        except Exception as e:
+            logger.warning(f"[주문 대사] 거래소 조회 실패: {e}")
+            return
+
+        if orders is None:
+            logger.info(
+                f"[주문 대사] {self.exchange.DISPLAY_NAME}는 주문 이력 조회를 지원하지 않아 "
+                f"로컬 기록만 사용합니다."
+            )
+            return
+
+        discovered: List[str] = []
+        for order in orders:
+            symbol = str(order.get("symbol", "")).upper()
+            order_id = order.get("order_id")
+            if symbol not in self.tickers or not order_id:
+                continue
+            if self.store.has_exchange_order_id(self.exchange.NAME, str(order_id)):
+                continue
+
+            side = order.get("side", "buy")
+            code = self.store.next_order_code(self.exchange.NAME, symbol, trade_date)
+            self.store.record_trade(
+                order_code=code,
+                exchange=self.exchange.NAME,
+                symbol=symbol,
+                side=side,
+                status="success",
+                units=float(order.get("units", 0.0) or 0.0),
+                price=float(order.get("price", 0.0) or 0.0),
+                amount_krw=float(order.get("amount_krw", 0.0) or 0.0),
+                exchange_order_id=str(order_id),
+                source="exchange",   # API 대사로 발견한 주문
+                raw=order,
+                trade_date=trade_date,
+            )
+            if side == "buy":
+                self.has_bought[symbol] = True
+            discovered.append(f"{symbol} {side}")
+
+        if discovered:
+            msg = (
+                f"🔎 <b>[주문 대사]</b> 로컬 기록에 없던 거래소 주문을 발견해 반영했습니다.\n"
+                f"{', '.join(discovered)}"
+            )
+            logger.warning(f"[주문 대사] DB 누락 주문 반영: {', '.join(discovered)}")
+            self.notifier.send_message(msg)
+        else:
+            logger.info(f"[주문 대사] {trade_date} 세션 - 로컬 기록과 거래소 이력이 일치합니다.")
+
+    def _record_order(self, result: Dict[str, Any], side: str, ticker: str) -> None:
+        """주문 결과를 저장소에 기록"""
+        if self.store is None or not result:
+            return
+        self.store.record_trade(
+            order_code=result.get("order_code") or f"UNCODED-{ticker}",
+            exchange=self.exchange.NAME,
+            symbol=ticker,
+            side=side,
+            status=result.get("status", "unknown"),
+            units=float(result.get("units", 0.0) or 0.0),
+            price=float(result.get("price", 0.0) or 0.0),
+            amount_krw=float(result.get("budget_krw", 0.0) or 0.0),
+            exchange_order_id=result.get("order_id"),
+            raw=result.get("raw"),
+            trade_date=self.trade_date(),
+        )
 
     def _setup_telegram_command_handlers(self):
         """텔레그램 /자산, /상태 명령어 핸들러 매핑 및 Polling 스레드 가동"""
@@ -221,6 +385,24 @@ class QuantBot:
                 self.has_bought[ticker] = False    # 당일 매수 플래그 초기화
                 self.skipped_today[ticker] = False  # 잔고 부족 스킵 플래그 초기화
 
+                if self.store is not None:
+                    # 산출된 지표만 저장 (has_bought/skipped는 체결 시점에 기록)
+                    self.store.upsert_daily_state(
+                        self.exchange.NAME, ticker, self.trade_date(),
+                        target_price=eval_res["target_price"],
+                        effective_k=eval_res["effective_k"],
+                        ma_value=eval_res.get("ma_value", 0.0),
+                        is_above_ma=bool(eval_res["is_above_ma"]),
+                    )
+                    self.store.record_signal(
+                        self.exchange.NAME, ticker, self.trade_date(),
+                        target_price=eval_res["target_price"],
+                        effective_k=eval_res["effective_k"],
+                        noise_ratio=eval_res.get("noise_ratio_20d"),
+                        ma_value=eval_res.get("ma_value"),
+                        close_price=eval_res.get("current_price"),
+                    )
+
                 summary_lines.append(
                     f"• <b>{ticker}</b> -> 목표가: {self.target_prices[ticker]:,.0f}원 | "
                     f"적용K: {self.effective_ks[ticker]:.4f} | MA{self.ma_window}상회: {self.is_above_ma[ticker]}"
@@ -238,6 +420,8 @@ class QuantBot:
                 f"🌅 <b>[{self.exchange.DISPLAY_NAME} 일일 세팅 갱신 완료]</b>\n" + "\n".join(summary_lines)
             )
 
+        # 세팅이 플래그를 초기화했으므로, 저장된 당일 이력을 다시 반영해 재매수를 방지
+        self.restore_daily_state()
         logger.info("=" * 65)
 
     def liquidate_position(self):
@@ -252,9 +436,16 @@ class QuantBot:
 
         for ticker in self.tickers:
             try:
-                result = self.exchange.sell_market(ticker)
+                order_code = None
+                if self.store is not None:
+                    order_code = self.store.next_order_code(
+                        self.exchange.NAME, ticker, self.trade_date())
+
+                result = self.exchange.sell_market(ticker, order_code=order_code)
                 if result:
-                    logger.info(f"[{ticker}] 청산 처리 결과: {result}")
+                    self._record_order(result, "sell", ticker)
+                    logger.info(f"[{ticker}] 청산 처리 결과: {result.get('status')} "
+                                f"(주문코드: {order_code or 'N/A'})")
                 self.has_bought[ticker] = False
             except Exception as e:
                 logger.error(f"[{ticker}] 청산 루틴 처리 에러: {e}", exc_info=True)
@@ -273,6 +464,14 @@ class QuantBot:
                 has_bought = self.has_bought.get(ticker, False)
 
                 if target_price <= 0 or has_bought or self.skipped_today.get(ticker, False):
+                    continue
+
+                # 저장소에 당일 체결 기록이 있으면 메모리 상태와 무관하게 재매수 차단
+                if self.store is not None and self.store.has_trade(
+                        self.exchange.NAME, ticker, "buy", self.trade_date(),
+                        self._trade_statuses()):
+                    self.has_bought[ticker] = True
+                    logger.info(f"[{ticker}] 당일 매수 이력이 확인되어 추가 매수를 건너뜁니다.")
                     continue
 
                 current_price: Optional[float] = self.exchange.get_current_price(ticker)
@@ -300,6 +499,10 @@ class QuantBot:
                             f"[{ticker}] 주문가능 예산({budget:,.0f}원) < 최소 주문금액"
                             f"({self.exchange.MIN_ORDER_KRW:,.0f}원). 당일 매수 대상에서 제외합니다."
                         )
+                        if self.store is not None:
+                            self.store.upsert_daily_state(
+                                self.exchange.NAME, ticker, self.trade_date(),
+                                skipped=True, skip_reason="잔고 부족 (최소 주문금액 미만)")
                         self.notifier.send_message(skip_msg)
                         continue
 
@@ -309,11 +512,23 @@ class QuantBot:
                         f"예산 {budget_ratio * 100:.1f}% 시장가 매수 집행!"
                     )
 
-                    buy_result = self.exchange.buy_market(ticker, budget_ratio=budget_ratio)
+                    order_code = None
+                    if self.store is not None:
+                        order_code = self.store.next_order_code(
+                            self.exchange.NAME, ticker, self.trade_date())
+
+                    buy_result = self.exchange.buy_market(
+                        ticker, budget_ratio=budget_ratio, order_code=order_code)
 
                     if buy_result:
                         self.has_bought[ticker] = True
-                        logger.info(f"✅ [매수 집행 성공] {ticker} 처리 완료. (has_bought = True)")
+                        self._record_order(buy_result, "buy", ticker)
+                        if self.store is not None:
+                            self.store.upsert_daily_state(
+                                self.exchange.NAME, ticker, self.trade_date(), has_bought=True)
+                        logger.info(
+                            f"✅ [매수 집행 성공] {ticker} 처리 완료. "
+                            f"(주문코드: {order_code or 'N/A'})")
                     else:
                         logger.warning(f"⚠️ [매수 거부/실패] {ticker}")
 
@@ -330,10 +545,13 @@ class QuantBot:
         logger.info(f"QuantBot ({self.exchange.DISPLAY_NAME} 자동매매) 가동 | 대상: {self.tickers}")
         logger.info("=" * 70)
 
-        # 1. 봇 시작 시 즉시 세팅 수행
+        # 1. 거래소 주문 이력과 로컬 DB 대사 (DB에 없는 주문을 먼저 반영)
+        self.reconcile_with_exchange()
+
+        # 2. 봇 시작 시 즉시 세팅 수행 (끝에서 당일 상태를 복구)
         self.update_daily_settings()
 
-        # 2. 스케줄러 등록
+        # 3. 스케줄러 등록
         schedule_cfg = self.config.get("schedule", {})
         settings_time = schedule_cfg.get("settings_time", "09:00:05")
         liquidate_time = schedule_cfg.get("liquidate_time", "08:59:50")
@@ -355,7 +573,7 @@ class QuantBot:
                 f"config.json의 schedule 값을 {boundary} 직후로 조정하는 것을 권장합니다."
             )
 
-        # 3. 24시간 메인 실행 루프
+        # 4. 24시간 메인 실행 루프
         while not self.stop_event.is_set():
             try:
                 # GUI에서 일시정지한 경우 스케줄/감시를 모두 건너뜁니다.

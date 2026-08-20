@@ -194,6 +194,7 @@ class ExchangeBase(abc.ABC):
         price: float = 0.0,
         budget_krw: float = 0.0,
         raw: Any = None,
+        order_code: Optional[str] = None,
     ) -> Dict[str, Any]:
         """거래소별 상이한 주문 응답을 봇 상위 계층이 동일하게 다루도록 정규화"""
         return {
@@ -204,6 +205,8 @@ class ExchangeBase(abc.ABC):
             "units": float(units),
             "price": float(price),
             "budget_krw": float(budget_krw),
+            "order_code": order_code,
+            "order_id": self.extract_order_id(raw),
             "raw": raw,
         }
 
@@ -232,16 +235,40 @@ class ExchangeBase(abc.ABC):
         """
 
     @abc.abstractmethod
-    def _place_buy_market(self, market: str, budget_krw: float, units: float, price: float) -> Any:
-        """거래소 실전 시장가 매수 API 호출 (원본 응답 반환)"""
+    def _place_buy_market(self, market: str, budget_krw: float, units: float,
+                          price: float, order_code: Optional[str] = None) -> Any:
+        """
+        거래소 실전 시장가 매수 API 호출 (원본 응답 반환)
+
+        :param order_code: 클라이언트 주문 코드. 지원 거래소(코인원 user_order_id 등)에만 전달
+        """
 
     @abc.abstractmethod
-    def _place_sell_market(self, market: str, units: float, price: float) -> Any:
+    def _place_sell_market(self, market: str, units: float, price: float,
+                           order_code: Optional[str] = None) -> Any:
         """거래소 실전 시장가 매도 API 호출 (원본 응답 반환)"""
 
     def _is_order_success(self, raw: Any) -> bool:
         """거래소 주문 응답의 성공 여부 판별 (기본 구현: 응답이 비어있지 않으면 성공)"""
         return bool(raw)
+
+    def extract_order_id(self, raw: Any) -> Optional[str]:
+        """거래소 주문 응답에서 주문 ID를 추출 (대사/추적용). 하위 클래스에서 재정의"""
+        if isinstance(raw, dict):
+            for key in ("uuid", "order_id", "orderId"):
+                if raw.get(key):
+                    return str(raw[key])
+        return None
+
+    def get_today_orders(self, symbols: List[str],
+                         trade_date: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
+        """
+        거래소 API로 당일 주문 이력을 조회합니다. (기동 시 로컬 DB와 대사)
+
+        지원하지 않는 거래소는 None을 반환합니다.
+        반환 형식: [{'symbol','side','order_id','units','price','amount_krw','created_at'}]
+        """
+        return None
 
     # ------------------------------------------------------------------
     # 공통 인터페이스 구현
@@ -315,6 +342,7 @@ class ExchangeBase(abc.ABC):
         ticker: str,
         budget_ratio: float = 1.0,
         budget_krw: Optional[float] = None,
+        order_code: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         시장가 매수 집행 (주문 가능 원화 기준 예산 계산 + 최소 주문금액 검증)
@@ -352,24 +380,28 @@ class ExchangeBase(abc.ABC):
 
             units = budget_krw / price
 
+            code_line = f"\n주문코드: <code>{order_code}</code>" if order_code else ""
+
             if self.is_simulation:
                 msg = (
-                    f"🟢 <b>[{self.DISPLAY_NAME} 시뮬레이션 매수]</b> {symbol}\n"
+                    f"🟢 <b>[{self.DISPLAY_NAME} 시뮬레이션 매수]</b> {symbol}{code_line}\n"
                     f"투입 금액: {budget_krw:,.0f}원\n추정 수량: {units:.8f} {symbol}"
                 )
                 logger.info(msg)
                 self._notify(msg)
-                return self._order_result("buy", symbol, "simulated", units, price, budget_krw)
+                return self._order_result("buy", symbol, "simulated", units, price,
+                                          budget_krw, order_code=order_code)
 
-            raw = self._place_buy_market(market, budget_krw, units, price)
+            raw = self._place_buy_market(market, budget_krw, units, price, order_code)
             if self._is_order_success(raw):
                 msg = (
-                    f"🟢 <b>[{self.DISPLAY_NAME} 실전 매수 체결]</b> {symbol}\n"
+                    f"🟢 <b>[{self.DISPLAY_NAME} 실전 매수 체결]</b> {symbol}{code_line}\n"
                     f"매수 금액: {budget_krw:,.0f}원\n수량: {units:.8f}\n응답: {raw}"
                 )
                 logger.info(msg)
                 self._notify(msg)
-                return self._order_result("buy", symbol, "success", units, price, budget_krw, raw)
+                return self._order_result("buy", symbol, "success", units, price,
+                                          budget_krw, raw, order_code)
 
             err = f"🚨 <b>[{self.DISPLAY_NAME} 실전 매수 실패]</b> {symbol}\n응답: {raw}"
             logger.error(err)
@@ -382,7 +414,8 @@ class ExchangeBase(abc.ABC):
             self._notify(err)
             return None
 
-    def sell_market(self, ticker: str, units: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    def sell_market(self, ticker: str, units: Optional[float] = None,
+                    order_code: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
         시장가 매도 집행 (수량 미지정 시 보유 전량 매도)
 
@@ -414,24 +447,28 @@ class ExchangeBase(abc.ABC):
                 )
                 return None
 
+            code_line = f"\n주문코드: <code>{order_code}</code>" if order_code else ""
+
             if self.is_simulation:
                 msg = (
-                    f"🔴 <b>[{self.DISPLAY_NAME} 시뮬레이션 매도]</b> {symbol}\n"
+                    f"🔴 <b>[{self.DISPLAY_NAME} 시뮬레이션 매도]</b> {symbol}{code_line}\n"
                     f"수량: {units:.8f} {symbol}\n추정 평가액: {estimated_value:,.0f}원"
                 )
                 logger.info(msg)
                 self._notify(msg)
-                return self._order_result("sell", symbol, "simulated", units, price, estimated_value)
+                return self._order_result("sell", symbol, "simulated", units, price,
+                                          estimated_value, order_code=order_code)
 
-            raw = self._place_sell_market(market, units, price)
+            raw = self._place_sell_market(market, units, price, order_code)
             if self._is_order_success(raw):
                 msg = (
-                    f"🔴 <b>[{self.DISPLAY_NAME} 실전 매도 체결]</b> {symbol}\n"
+                    f"🔴 <b>[{self.DISPLAY_NAME} 실전 매도 체결]</b> {symbol}{code_line}\n"
                     f"수량: {units:.8f} {symbol}\n응답: {raw}"
                 )
                 logger.info(msg)
                 self._notify(msg)
-                return self._order_result("sell", symbol, "success", units, price, estimated_value, raw)
+                return self._order_result("sell", symbol, "success", units, price,
+                                          estimated_value, raw, order_code)
 
             err = f"🚨 <b>[{self.DISPLAY_NAME} 실전 매도 실패]</b> {symbol}\n응답: {raw}"
             logger.error(err)

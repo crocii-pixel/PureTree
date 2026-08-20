@@ -32,6 +32,7 @@ base/                            # (상위) C++ PureTree 프로젝트 - 봇과 �
     ├── upbit_adapter.py         # 업비트 어댑터
     ├── coinone_adapter.py       # 코인원 어댑터 (Open API v2.1)
     │
+    ├── trade_store.py           # 매매 이력/당일 상태 SQLite 저장소
     ├── strategy_engine.py       # 변동성 돌파 + 동적 K + MA 모멘텀 전략
     ├── data_collector.py        # OHLCV 수집 (어댑터 위임 지원)
     ├── execution_manager.py     # 주문 파사드 (하위 호환)
@@ -44,7 +45,6 @@ base/                            # (상위) C++ PureTree 프로젝트 - 봇과 �
     ├── tests/                   # pytest 단위 테스트
     ├── build.bat                # PyInstaller 빌드
     │
-    ├── logs/                    # 실행 로그 (quantbot.log, 5MB 순환)
     ├── .env                     # API Key (git 추적 제외)
     ├── config.json              # 거래소/종목/전략 설정 (git 추적 제외)
     └── requirements.txt
@@ -112,7 +112,7 @@ build.bat
 
 | 옵션 | 설명 |
 |---|---|
-| `build.bat` | **트레이 GUI 빌드 (기본)** — 콘솔 창 없음, 로그는 `dist\logs\quantbot.log` |
+| `build.bat` | **트레이 GUI 빌드 (기본)** — 콘솔 창 없음, 로그는 `%LOCALAPPDATA%\QuantBot\logs\` |
 | `build.bat --clean` | `build/`, `dist/`, `*.spec` 정리 후 빌드 |
 | `build.bat --console` | 콘솔 창을 띄우는 디버그 빌드 |
 
@@ -154,6 +154,44 @@ dist\QuantBot.exe --test --dry-run
 > 기본 스케줄은 업비트·코인원 기준이므로, **빗썸 사용 시** `schedule` 값을
 > `"liquidate_time": "23:59:50"`, `"settings_time": "00:00:05"`로 변경하세요.
 > (불일치 시 봇 기동 로그에 경고가 출력됩니다.)
+
+## 💾 매매 이력 저장 (재시작 안전장치)
+
+봇은 체결 이력과 당일 상태를 SQLite에 남깁니다. 장중에 재시작되어도 **이미 매수한 종목을
+그날 다시 사지 않습니다.**
+
+```
+%LOCALAPPDATA%\QuantBot\
+├── quantbot.db                   # trades / daily_state / equity_snapshot / signals
+└── logs\
+    ├── quantbot.log              # 오늘 로그
+    └── quantbot-2026-08-20.log   # 자정마다 회전 (30일 보관)
+```
+
+> [!NOTE]
+> DB와 로그를 프로젝트 폴더가 아닌 `%LOCALAPPDATA%`에 두는 이유는, 이 저장소가 OneDrive
+> 동기화 폴더 안에 있기 때문입니다. 동기화 클라이언트가 파일을 잠그거나 충돌 사본을 만들면
+> SQLite DB가 손상될 수 있습니다. `QUANTBOT_DATA_DIR` 환경변수로 위치를 바꿀 수 있습니다.
+
+**주문 코드**: 모든 주문에 `QB-20260821-BTC-01` 형태의 코드가 붙어 텔레그램·로그·DB에서
+동일하게 추적됩니다. 코인원은 이 코드를 `user_order_id`로 거래소에도 전달합니다.
+
+**재매수 방지 3중 안전장치**
+
+1. 기동 시 거래소 API의 당일 주문 이력과 로컬 DB를 **대사** (업비트/코인원 지원, 빗썸은 미지원)
+2. `daily_state` + 체결 이력으로 **당일 상태 복구**
+3. 매수 직전 저장소를 한 번 더 조회해 **이중 확인**
+
+세션 기준일은 거래소의 일봉 갱신 시각을 따릅니다. 업비트·코인원은 09:00 이전이면 전날
+세션으로 계산하므로, 새벽에 날짜가 바뀌어도 이력이 끊기지 않습니다.
+
+시뮬레이션(`--dry-run`) 체결은 `simulated` 상태로 따로 기록되어 **실전 매수를 막지 않습니다.**
+
+이력 조회:
+
+```bash
+python -m trade_store
+```
 
 ## 🔐 보안
 

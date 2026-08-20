@@ -121,13 +121,26 @@ class BithumbAdapter(ExchangeBase):
     # ------------------------------------------------------------------
     # 주문 집행 (베이스 클래스의 가드레일 통과 후 호출됨)
     # ------------------------------------------------------------------
-    def _place_buy_market(self, market: str, budget_krw: float, units: float, price: float) -> Any:
-        """빗썸 시장가 매수: 주문 단위가 '수량'이므로 예산/현재가로 환산한 units를 전달"""
+    def _place_buy_market(self, market: str, budget_krw: float, units: float,
+                          price: float, order_code: Optional[str] = None) -> Any:
+        """
+        빗썸 시장가 매수: 주문 단위가 '수량'이므로 예산/현재가로 환산한 units를 전달.
+        빗썸 API 1.0은 클라이언트 주문 ID를 지원하지 않아 order_code는 로컬에만 기록됩니다.
+        """
         return self.client.buy_market_order(market, units)
 
-    def _place_sell_market(self, market: str, units: float, price: float) -> Any:
+    def _place_sell_market(self, market: str, units: float, price: float,
+                           order_code: Optional[str] = None) -> Any:
         """빗썸 시장가 매도"""
         return self.client.sell_market_order(market, units)
+
+    def extract_order_id(self, raw: Any) -> Optional[str]:
+        """빗썸 주문 응답 튜플 (type, order_currency, order_id, payment_currency)에서 주문번호 추출"""
+        if isinstance(raw, tuple) and len(raw) >= 3:
+            return str(raw[2])
+        if isinstance(raw, dict) and raw.get("order_id"):
+            return str(raw["order_id"])
+        return None
 
     def _is_order_success(self, raw: Any) -> bool:
         """빗썸 주문 성공 판별: 튜플(주문번호 포함) 또는 status '0000'"""

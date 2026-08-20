@@ -79,13 +79,15 @@ class DummyExchange(ExchangeBase):
     def get_balance(self, currency: str = "KRW", use_available: bool = True) -> float:
         return self.krw if self.to_symbol(currency) == "KRW" else self.coin
 
-    def _place_buy_market(self, market, budget_krw, units, price):
-        self.placed.append({"side": "buy", "market": market, "budget": budget_krw, "units": units})
-        return {"ok": True}
+    def _place_buy_market(self, market, budget_krw, units, price, order_code=None):
+        self.placed.append({"side": "buy", "market": market, "budget": budget_krw,
+                            "units": units, "order_code": order_code})
+        return {"ok": True, "order_id": f"dummy-{len(self.placed)}"}
 
-    def _place_sell_market(self, market, units, price):
-        self.placed.append({"side": "sell", "market": market, "units": units})
-        return {"ok": True}
+    def _place_sell_market(self, market, units, price, order_code=None):
+        self.placed.append({"side": "sell", "market": market, "units": units,
+                            "order_code": order_code})
+        return {"ok": True, "order_id": f"dummy-{len(self.placed)}"}
 
 
 # ======================================================================
@@ -765,8 +767,9 @@ class FakeNotifier:
 class TestQuantBotIntegration:
 
     @pytest.fixture
-    def bot(self):
+    def bot(self, tmp_path):
         from main import QuantBot
+        from trade_store import TradeStore
 
         exchange = DummyExchange(price=1000.0, krw=100_000.0, coin=10.0)
         config = {
@@ -778,7 +781,10 @@ class TestQuantBotIntegration:
             "force_simulation": True,
             "schedule": {"liquidate_time": "08:59:50", "settings_time": "09:00:05"},
         }
-        return QuantBot(config=config, exchange=exchange, notifier=FakeNotifier())
+        # 실제 사용자 DB를 오염시키지 않도록 테스트마다 임시 DB 사용
+        store = TradeStore(tmp_path / "test.db")
+        return QuantBot(config=config, exchange=exchange,
+                        notifier=FakeNotifier(), store=store)
 
     def test_bot_uses_injected_adapter(self, bot):
         assert bot.exchange.NAME == "dummy"
@@ -904,7 +910,231 @@ class TestQuantBotIntegration:
 
 
 # ======================================================================
-# 11. 아이콘 생성 (Seed + Trading)
+# 11. 매매 이력 저장소 / 재시작 복구 / 주문 대사
+# ======================================================================
+class TestTradeStore:
+
+    @pytest.fixture
+    def store(self, tmp_path):
+        from trade_store import TradeStore
+        return TradeStore(tmp_path / "t.db")
+
+    def test_order_code_increments_per_symbol_and_day(self, store):
+        first = store.next_order_code("upbit", "BTC", "2026-08-21")
+        assert first == "QB-20260821-BTC-01"
+
+        store.record_trade(first, "upbit", "BTC", "buy", "success", trade_date="2026-08-21")
+        assert store.next_order_code("upbit", "BTC", "2026-08-21") == "QB-20260821-BTC-02"
+        # 종목/날짜가 다르면 다시 01부터
+        assert store.next_order_code("upbit", "ETH", "2026-08-21") == "QB-20260821-ETH-01"
+        assert store.next_order_code("upbit", "BTC", "2026-08-22") == "QB-20260822-BTC-01"
+
+    def test_record_trade_is_idempotent(self, store):
+        assert store.record_trade("C-1", "upbit", "BTC", "buy", "success") is True
+        assert store.record_trade("C-1", "upbit", "BTC", "buy", "success") is False
+        assert len(store.get_trades()) == 1
+
+    def test_has_trade_filters_by_side_and_date(self, store):
+        store.record_trade("C-1", "upbit", "BTC", "buy", "success", trade_date="2026-08-21")
+
+        assert store.has_trade("upbit", "BTC", "buy", "2026-08-21") is True
+        assert store.has_trade("upbit", "BTC", "sell", "2026-08-21") is False
+        assert store.has_trade("upbit", "BTC", "buy", "2026-08-22") is False
+        assert store.has_trade("bithumb", "BTC", "buy", "2026-08-21") is False
+
+    def test_simulated_trades_do_not_block_live_buy(self, store):
+        """dry-run 기록이 실전 매수를 막으면 안 된다 (모드별 상태 분리)"""
+        store.record_trade("C-1", "upbit", "BTC", "buy", "simulated", trade_date="2026-08-21")
+
+        # 실전 기준(기본값)에서는 모의 체결을 무시
+        assert store.has_trade("upbit", "BTC", "buy", "2026-08-21") is False
+        # 시뮬레이션 기준에서는 인정 (반복 모의매수 방지)
+        assert store.has_trade("upbit", "BTC", "buy", "2026-08-21",
+                               store.SIMULATION_STATUSES) is True
+
+    def test_failed_orders_do_not_block_retry(self, store):
+        """실패한 주문은 '체결 이력'으로 보지 않아야 재시도가 가능"""
+        store.record_trade("C-1", "upbit", "BTC", "buy", "failed", trade_date="2026-08-21")
+        assert store.has_trade("upbit", "BTC", "buy", "2026-08-21") is False
+
+    def test_daily_state_partial_update_preserves_fields(self, store):
+        store.upsert_daily_state("upbit", "BTC", "2026-08-21",
+                                 target_price=100.0, effective_k=0.6)
+        store.upsert_daily_state("upbit", "BTC", "2026-08-21", has_bought=True)
+
+        state = store.load_daily_state("upbit", "2026-08-21")["BTC"]
+        assert state["target_price"] == 100.0     # 이전 값 유지
+        assert state["effective_k"] == 0.6
+        assert state["has_bought"] == 1
+
+    def test_exchange_order_id_lookup(self, store):
+        store.record_trade("C-1", "upbit", "BTC", "buy", "success",
+                           exchange_order_id="uuid-123")
+        assert store.has_exchange_order_id("upbit", "uuid-123") is True
+        assert store.has_exchange_order_id("upbit", "uuid-999") is False
+
+    @pytest.mark.parametrize("now,boundary,expected", [
+        # 업비트/코인원: 09:00 이전은 전날 세션
+        ("2026-08-21T08:30", "09:00", "2026-08-20"),
+        ("2026-08-21T09:30", "09:00", "2026-08-21"),
+        ("2026-08-21T00:10", "09:00", "2026-08-20"),
+        # 빗썸: 자정 기준이라 달력 날짜와 동일
+        ("2026-08-21T00:10", "00:00", "2026-08-21"),
+        ("2026-08-21T23:50", "00:00", "2026-08-21"),
+    ])
+    def test_session_date_respects_exchange_boundary(self, now, boundary, expected):
+        from datetime import datetime
+        from trade_store import session_date
+
+        assert session_date(boundary, datetime.fromisoformat(now)) == expected
+
+
+class TestRestartRecovery:
+    """재시작 시 당일 재매수 방지 (이번 작업의 핵심)"""
+
+    def _make_bot(self, tmp_path, store=None):
+        """
+        실전 모드(가짜 클라이언트) 봇 생성.
+
+        시뮬레이션 모드에서는 `_place_*`가 호출되지 않아 '주문이 실제로 나갔는지'를
+        검증할 수 없으므로, 키를 넣어 실전 경로를 타게 합니다.
+        (DummyExchange는 네트워크를 쓰지 않으므로 실주문 위험이 없습니다)
+        """
+        from main import QuantBot
+        from trade_store import TradeStore
+
+        exchange = DummyExchange(price=1000.0, krw=100_000.0, coin=10.0,
+                                 api_key="k", secret_key="s")
+        assert exchange.is_simulation is False
+        config = {
+            "exchange": "dummy", "tickers": ["BTC", "ETH"], "ma_window": 5,
+            "use_dynamic_k": True, "fixed_k": 0.5, "force_simulation": False,
+            "schedule": {"liquidate_time": "08:59:50", "settings_time": "09:00:05"},
+        }
+        return QuantBot(config=config, exchange=exchange,
+                        notifier=FakeNotifier(),
+                        store=store or TradeStore(tmp_path / "t.db"))
+
+    def test_buy_is_recorded_with_order_code(self, tmp_path):
+        bot = self._make_bot(tmp_path)
+        bot.target_prices = {"BTC": 500.0, "ETH": 500.0}
+        bot.is_above_ma = {"BTC": True, "ETH": True}
+        bot.monitor_market()
+
+        trades = bot.store.get_trades(trade_date=bot.trade_date())
+        codes = {t["symbol"]: t["order_code"] for t in trades}
+        assert set(codes) == {"BTC", "ETH"}
+        assert all(c.startswith("QB-") for c in codes.values())
+        # 주문코드가 거래소 어댑터까지 전달되어야 함
+        assert all(p["order_code"] for p in bot.exchange.placed)
+
+    def test_restart_does_not_rebuy_same_day(self, tmp_path):
+        """재시작 시나리오: 새 봇 인스턴스가 같은 종목을 다시 사면 안 된다"""
+        from trade_store import TradeStore
+
+        db = tmp_path / "shared.db"
+        first = self._make_bot(tmp_path, TradeStore(db))
+        first.target_prices = {"BTC": 500.0, "ETH": 500.0}
+        first.is_above_ma = {"BTC": True, "ETH": True}
+        first.monitor_market()
+        assert len(first.exchange.placed) == 2
+
+        # --- 봇 재시작 (메모리 상태 전부 소실) ---
+        second = self._make_bot(tmp_path, TradeStore(db))
+        assert second.has_bought == {"BTC": False, "ETH": False}   # 초기값은 False
+
+        second.restore_daily_state()
+        assert second.has_bought == {"BTC": True, "ETH": True}     # DB에서 복구
+
+        second.target_prices = {"BTC": 500.0, "ETH": 500.0}
+        second.is_above_ma = {"BTC": True, "ETH": True}
+        second.monitor_market()
+        assert second.exchange.placed == []                        # 재매수 없음
+
+    def test_store_guard_blocks_buy_even_without_restore(self, tmp_path):
+        """복구를 호출하지 않아도 저장소 조회가 재매수를 막는 이중 안전장치"""
+        from trade_store import TradeStore
+
+        db = tmp_path / "shared.db"
+        first = self._make_bot(tmp_path, TradeStore(db))
+        first.target_prices = {"BTC": 500.0}
+        first.is_above_ma = {"BTC": True}
+        first.monitor_market()
+
+        second = self._make_bot(tmp_path, TradeStore(db))
+        second.target_prices = {"BTC": 500.0, "ETH": 0.0}
+        second.is_above_ma = {"BTC": True}
+        second.monitor_market()   # restore_daily_state 호출 없음
+
+        assert second.exchange.placed == []
+        assert second.has_bought["BTC"] is True
+
+    def test_skip_state_is_restored(self, tmp_path):
+        from trade_store import TradeStore
+
+        db = tmp_path / "shared.db"
+        first = self._make_bot(tmp_path, TradeStore(db))
+        first.exchange.krw = 8_000.0     # 최소 주문금액 미만
+        first.target_prices = {"BTC": 500.0, "ETH": 500.0}
+        first.is_above_ma = {"BTC": True, "ETH": True}
+        first.monitor_market()
+        assert first.skipped_today["BTC"] is True
+
+        second = self._make_bot(tmp_path, TradeStore(db))
+        second.restore_daily_state()
+        assert second.skipped_today["BTC"] is True
+
+    def test_daily_settings_persists_indicators(self, tmp_path):
+        bot = self._make_bot(tmp_path)
+        bot.update_daily_settings()
+
+        states = bot.store.load_daily_state("dummy", bot.trade_date())
+        assert set(states) == {"BTC", "ETH"}
+        assert states["BTC"]["target_price"] > 0
+        assert bot.store.get_trades() == []   # 세팅만으로는 체결 기록이 생기지 않음
+
+    def test_reconcile_records_orders_missing_from_db(self, tmp_path):
+        """거래소에는 있는데 DB에 없는 주문을 대사로 찾아내 반영"""
+        bot = self._make_bot(tmp_path)
+        bot.exchange.get_today_orders = lambda symbols, trade_date=None: [
+            {"symbol": "BTC", "side": "buy", "order_id": "ex-1",
+             "units": 0.01, "price": 1000.0, "amount_krw": 10.0, "created_at": ""},
+        ]
+
+        bot.reconcile_with_exchange()
+
+        assert bot.has_bought["BTC"] is True
+        trades = bot.store.get_trades()
+        assert len(trades) == 1
+        assert trades[0]["source"] == "exchange"   # API 대사로 발견한 주문 표시
+
+    def test_reconcile_skips_already_recorded_orders(self, tmp_path):
+        bot = self._make_bot(tmp_path)
+        bot.store.record_trade("QB-X", "dummy", "BTC", "buy", "success",
+                               exchange_order_id="ex-1", trade_date=bot.trade_date())
+        bot.exchange.get_today_orders = lambda symbols, trade_date=None: [
+            {"symbol": "BTC", "side": "buy", "order_id": "ex-1", "units": 0.01,
+             "price": 1000.0, "amount_krw": 10.0, "created_at": ""},
+        ]
+
+        bot.reconcile_with_exchange()
+        assert len(bot.store.get_trades()) == 1   # 중복 기록 없음
+
+    def test_reconcile_noop_when_unsupported(self, tmp_path):
+        """빗썸처럼 주문 이력 조회를 지원하지 않으면 조용히 넘어간다"""
+        bot = self._make_bot(tmp_path)
+        bot.reconcile_with_exchange()      # DummyExchange는 기본 None 반환
+        assert bot.store.get_trades() == []
+
+    def test_data_dir_is_outside_sync_folder(self):
+        """DB/로그는 OneDrive 동기화 폴더 밖에 있어야 손상 위험이 없음"""
+        assert "OneDrive" not in str(config_manager.DATA_DIR)
+        assert config_manager.DB_PATH.parent == config_manager.DATA_DIR
+        assert config_manager.LOG_DIR.parent == config_manager.DATA_DIR
+
+
+# ======================================================================
+# 12. 아이콘 생성 (Seed + Trading)
 # ======================================================================
 class TestIconGeneration:
 
@@ -958,7 +1188,7 @@ class TestIconGeneration:
 
 
 # ======================================================================
-# 12. 트레이 GUI (위젯 생성 없이 로직만 검증)
+# 13. 트레이 GUI (위젯 생성 없이 로직만 검증)
 # ======================================================================
 class TestTrayGui:
 
@@ -983,6 +1213,62 @@ class TestTrayGui:
         assert len(buffer.records) == 5          # 순환 버퍼 용량 유지
         assert "메시지 7" in text and "메시지 2" not in text
         assert "<b>" not in text and "</b>" not in text   # HTML 태그 제거
+
+    def test_every_log_line_starts_with_an_icon(self):
+        """가독성: 모든 로그 줄이 아이콘으로 시작해야 한다"""
+        gui_manager = pytest.importorskip("gui_manager")
+
+        buffer = gui_manager.LogBuffer()
+        logger = logging.getLogger("icon-test")
+        logger.addHandler(buffer)
+        logger.setLevel(logging.DEBUG)
+        try:
+            logger.info("StrategyEngine 초기화 완료")          # 아이콘 없는 메시지
+            logger.warning("주문 거부: 최소 주문금액 미만")      # 아이콘 없는 경고
+            logger.error("잔고 조회 예외 발생")                 # 아이콘 없는 오류
+            logger.debug("현재가 조회 중")
+        finally:
+            logger.removeHandler(buffer)
+
+        icons = [icon for _t, _lv, icon, _body in buffer.records]
+        assert icons == ["ℹ️", "⚠️", "⛔", "·"]
+        assert all(line.split()[1] for line in buffer.tail().splitlines())
+
+    def test_message_emoji_is_promoted_to_icon_column(self):
+        """메시지에 이미 이모지가 있으면 그것을 아이콘 자리로 옮기고 본문에서는 제거"""
+        gui_manager = pytest.importorskip("gui_manager")
+
+        icon, body = gui_manager.LogBuffer.split_icon(
+            "🚀 [빗썸 매수 신호] BTC", logging.INFO)
+        assert icon == "🚀"
+        assert body == "[빗썸 매수 신호] BTC"
+
+        # 변이 선택자가 붙은 이모지도 하나의 아이콘으로 분리
+        icon, body = gui_manager.LogBuffer.split_icon(
+            "⏭️ [XRP 당일 매수 제외] 예산 부족", logging.INFO)
+        assert icon == "⏭️"
+        assert body.startswith("[XRP")
+
+    def test_log_html_escapes_and_colors_by_level(self):
+        gui_manager = pytest.importorskip("gui_manager")
+        import ui_theme
+
+        buffer = gui_manager.LogBuffer()
+        logger = logging.getLogger("html-test")
+        logger.addHandler(buffer)
+        logger.setLevel(logging.INFO)
+        try:
+            logger.info("현재가(99,270,000원) >= 목표가(91,920,933원)")
+            logger.error("치명적 예외")
+        finally:
+            logger.removeHandler(buffer)
+
+        markup = buffer.tail_html()
+        # 메시지의 부등호가 HTML 태그로 해석되지 않도록 이스케이프
+        assert "&gt;=" in markup
+        # 레벨별 색상
+        assert ui_theme.COLORS["danger"] in markup
+        assert ui_theme.COLORS["text_muted"] in markup   # 타임스탬프
 
     def test_dark_theme_stylesheet(self):
         import ui_theme

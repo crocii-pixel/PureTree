@@ -132,16 +132,61 @@ class UpbitAdapter(ExchangeBase):
     # ------------------------------------------------------------------
     # 주문 집행
     # ------------------------------------------------------------------
-    def _place_buy_market(self, market: str, budget_krw: float, units: float, price: float) -> Any:
+    def _place_buy_market(self, market: str, budget_krw: float, units: float,
+                          price: float, order_code: Optional[str] = None) -> Any:
         """
         업비트 시장가 매수(ord_type='price'): 주문 단위가 '원화 금액'이므로
         환산 수량(units)이 아닌 budget_krw를 그대로 전달합니다.
+
+        업비트 API에는 클라이언트 주문 식별자(identifier)가 있지만 pyupbit가 노출하지 않아
+        order_code는 로컬 DB에만 기록됩니다. (대사는 get_today_orders로 수행)
         """
         return self.client.buy_market_order(market, budget_krw)
 
-    def _place_sell_market(self, market: str, units: float, price: float) -> Any:
+    def _place_sell_market(self, market: str, units: float, price: float,
+                           order_code: Optional[str] = None) -> Any:
         """업비트 시장가 매도(ord_type='market'): 주문 단위는 '코인 수량'"""
         return self.client.sell_market_order(market, units)
+
+    def get_today_orders(self, symbols: List[str],
+                         trade_date: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
+        """
+        업비트 당일 체결 주문 조회 (기동 시 로컬 DB와 대사).
+        pyupbit의 get_order(ticker, state='done')로 종목별 완료 주문을 가져옵니다.
+        """
+        if self.is_simulation or self.client is None:
+            return None
+
+        results: List[Dict[str, Any]] = []
+        for symbol in symbols:
+            market = self.to_market(symbol)
+            try:
+                orders = self.client.get_order(market, state="done")
+            except Exception as e:
+                logger.warning(f"[업비트][{market}] 주문 이력 조회 실패: {e}")
+                continue
+
+            if not isinstance(orders, list):
+                continue
+
+            for order in orders:
+                if not isinstance(order, dict):
+                    continue
+                created = str(order.get("created_at", ""))
+                if trade_date and not created.startswith(trade_date):
+                    continue
+                executed = float(order.get("executed_volume", 0.0) or 0.0)
+                paid = float(order.get("price", 0.0) or 0.0)
+                results.append({
+                    "symbol": self.to_symbol(order.get("market", market)),
+                    "side": "buy" if order.get("side") == "bid" else "sell",
+                    "order_id": order.get("uuid"),
+                    "units": executed,
+                    "price": paid / executed if executed and paid else 0.0,
+                    "amount_krw": paid,
+                    "created_at": created,
+                })
+        return results
 
     def _is_order_success(self, raw: Any) -> bool:
         """업비트 주문 성공 판별: 응답 dict에 'uuid'가 존재하고 'error'가 없어야 성공"""

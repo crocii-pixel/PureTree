@@ -23,7 +23,7 @@ import hmac
 import json
 import logging
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import requests
@@ -248,28 +248,95 @@ class CoinoneAdapter(ExchangeBase):
     # ------------------------------------------------------------------
     # 주문 집행
     # ------------------------------------------------------------------
-    def _place_buy_market(self, market: str, budget_krw: float, units: float, price: float) -> Any:
+    def _place_buy_market(self, market: str, budget_krw: float, units: float,
+                          price: float, order_code: Optional[str] = None) -> Any:
         """
         코인원 시장가 매수(type='MARKET', side='BUY').
         업비트와 동일하게 주문 단위가 '원화 금액(amount)'입니다.
+
+        코인원 v2.1은 클라이언트 주문 ID(user_order_id)를 지원하므로 주문코드를 그대로 전달해
+        거래소 쪽 기록에서도 동일한 코드로 추적할 수 있습니다.
         """
-        return self._request_private("/v2.1/order", {
+        body = {
             "quote_currency": self.QUOTE_CURRENCY,
             "target_currency": market,
             "side": "BUY",
             "type": "MARKET",
             "amount": str(int(budget_krw)),
-        })
+        }
+        if order_code:
+            body["user_order_id"] = order_code
+        return self._request_private("/v2.1/order", body)
 
-    def _place_sell_market(self, market: str, units: float, price: float) -> Any:
+    def _place_sell_market(self, market: str, units: float, price: float,
+                           order_code: Optional[str] = None) -> Any:
         """코인원 시장가 매도(type='MARKET', side='SELL'). 주문 단위는 '코인 수량(qty)'"""
-        return self._request_private("/v2.1/order", {
+        body = {
             "quote_currency": self.QUOTE_CURRENCY,
             "target_currency": market,
             "side": "SELL",
             "type": "MARKET",
             "qty": f"{units:.8f}",
-        })
+        }
+        if order_code:
+            body["user_order_id"] = order_code
+        return self._request_private("/v2.1/order", body)
+
+    def extract_order_id(self, raw: Any) -> Optional[str]:
+        """코인원 주문 응답에서 order_id 추출"""
+        if isinstance(raw, dict) and raw.get("order_id"):
+            return str(raw["order_id"])
+        return None
+
+    def get_today_orders(self, symbols: List[str],
+                         trade_date: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
+        """
+        코인원 당일 체결 주문 조회 (기동 시 로컬 DB와 대사).
+        `/v2.1/order/completed_orders`를 종목별로 호출합니다.
+        """
+        if self.is_simulation:
+            return None
+
+        results: List[Dict[str, Any]] = []
+        for symbol in symbols:
+            target = self.to_symbol(symbol)
+            data = self._request_private("/v2.1/order/completed_orders", {
+                "quote_currency": self.QUOTE_CURRENCY,
+                "target_currency": target,
+                "size": 100,
+            })
+
+            if data.get("result") != "success":
+                logger.warning(f"[코인원][{target}] 주문 이력 조회 실패: {data}")
+                continue
+
+            for order in data.get("completed_orders", []) or []:
+                if not isinstance(order, dict):
+                    continue
+                created = self._to_iso(order.get("timestamp") or order.get("traded_at"))
+                if trade_date and not created.startswith(trade_date):
+                    continue
+                units = float(order.get("executed_qty", 0.0) or 0.0)
+                amount = float(order.get("traded_amount", 0.0) or 0.0)
+                results.append({
+                    "symbol": str(order.get("target_currency", target)).upper(),
+                    "side": "buy" if str(order.get("side", "")).upper() == "BUY" else "sell",
+                    "order_id": order.get("order_id"),
+                    "units": units,
+                    "price": float(order.get("price", 0.0) or 0.0),
+                    "amount_krw": amount,
+                    "created_at": created,
+                })
+        return results
+
+    @staticmethod
+    def _to_iso(timestamp: Any) -> str:
+        """코인원 응답의 ms 타임스탬프를 ISO 문자열로 변환 (파싱 실패 시 빈 문자열)"""
+        try:
+            from datetime import datetime
+            return datetime.fromtimestamp(int(timestamp) / 1000).isoformat()
+        except (TypeError, ValueError):
+            return str(timestamp or "")
 
     def _is_order_success(self, raw: Any) -> bool:
         """코인원 주문 성공 판별: result == 'success' (error_code '0')"""

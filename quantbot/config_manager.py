@@ -37,9 +37,40 @@ def _base_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+def _data_dir() -> Path:
+    """
+    실행 기록(SQLite DB, 로그) 저장 디렉토리.
+
+    config.json/.env과 달리 봇이 계속 쓰는 파일이므로 **동기화 폴더 밖**에 둡니다.
+    프로젝트가 OneDrive 안에 있으면 동기화 클라이언트가 파일을 잠그거나
+    충돌 사본을 만들어 SQLite DB가 손상될 수 있기 때문입니다.
+
+    우선순위: 환경변수 QUANTBOT_DATA_DIR > %LOCALAPPDATA%/QuantBot > ~/.quantbot
+    """
+    override = os.getenv("QUANTBOT_DATA_DIR")
+    if override:
+        return Path(override).expanduser()
+
+    local_appdata = os.getenv("LOCALAPPDATA")
+    if local_appdata:
+        return Path(local_appdata) / "QuantBot"
+    return Path.home() / ".quantbot"
+
+
 BASE_DIR = _base_dir()
 CONFIG_PATH = BASE_DIR / "config.json"
 ENV_PATH = BASE_DIR / ".env"
+
+DATA_DIR = _data_dir()
+DB_PATH = DATA_DIR / "quantbot.db"
+LOG_DIR = DATA_DIR / "logs"
+
+
+def ensure_data_dir() -> Path:
+    """데이터 디렉토리 생성 (로그 하위 폴더 포함)"""
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    return DATA_DIR
+
 
 # config.json 기본 스키마
 DEFAULT_CONFIG: Dict[str, Any] = {
