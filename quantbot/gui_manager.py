@@ -1,0 +1,538 @@
+"""
+gui_manager.py - QuantBot 시스템 트레이 GUI + 미니 대시보드
+
+[구성]
+  - QSystemTrayIcon 으로 윈도우 트레이에 상주 (아이콘: assets/quantbot.ico)
+  - 트레이 우클릭 메뉴
+      * 대시보드 열기   : 미니 대시보드 창 표시
+      * 자산 조회       : 실시간 잔고를 트레이 알림으로 표시 (백그라운드 조회)
+      * 일시정지 / 재개 : threading.Event로 매매 감시 제어
+      * 설정            : 거래소/API Key 설정 창(config_gui) 실행
+      * 종료            : 봇 스레드 안전 종료 후 앱 종료
+  - 대시보드 창
+      * 총 평가 자산(원화 + 코인) / 연동 모드
+      * 종목별 목표가 / 적용 K / MA 상회 / 당일 체결 여부 테이블
+      * 최근 로그 (읽기 전용)
+      * 1초 주기 QTimer 자동 갱신
+
+[PyQt 호환]
+  PyQt6가 있으면 PyQt6, 없으면 PyQt5를 사용합니다.
+  enum은 두 버전 모두에서 동작하는 스코프 표기(Qt.AlignmentFlag.AlignLeft 등)를 씁니다.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+import sys
+import threading
+from collections import deque
+from typing import Any, Deque, Dict, List, Optional
+
+# --- PyQt6 우선, 없으면 PyQt5 폴백 -----------------------------------
+try:
+    from PyQt6.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal
+    from PyQt6.QtGui import QAction, QBrush, QColor, QIcon
+    from PyQt6.QtWidgets import (
+        QApplication, QFrame, QGridLayout, QHBoxLayout, QLabel, QMenu,
+        QMessageBox, QPushButton, QSystemTrayIcon, QTableWidget,
+        QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
+    )
+    QT_BINDING = "PyQt6"
+except ImportError:  # pragma: no cover - 설치 환경에 따라 분기
+    from PyQt5.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal
+    from PyQt5.QtGui import QBrush, QColor, QIcon
+    from PyQt5.QtWidgets import (
+        QAction, QApplication, QFrame, QGridLayout, QHBoxLayout, QLabel,
+        QMenu, QMessageBox, QPushButton, QSystemTrayIcon, QTableWidget,
+        QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
+    )
+    QT_BINDING = "PyQt5"
+
+import config_manager
+import ui_theme
+from app_icon import ICO_PATH, ensure_icon
+
+logger = logging.getLogger("GuiManager")
+
+LOG_CAPACITY = 300      # 대시보드에 보관할 최근 로그 줄 수
+REFRESH_MS = 1000       # 대시보드 갱신 주기(ms)
+
+
+class LogBuffer(logging.Handler):
+    """대시보드에 표시할 최근 로그를 메모리에 순환 보관하는 로깅 핸들러"""
+
+    # 텔레그램용 HTML 태그(<b> 등)를 화면 표시용으로 제거
+    _TAG_PATTERN = re.compile(r"</?[a-zA-Z][^>]*>")
+
+    def __init__(self, capacity: int = LOG_CAPACITY):
+        super().__init__()
+        self.records: Deque[str] = deque(maxlen=capacity)
+        self.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s",
+                                            datefmt="%H:%M:%S"))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.records.append(self._TAG_PATTERN.sub("", self.format(record)))
+        except Exception:
+            pass  # 로그 표시 실패가 매매를 중단시키지 않도록 무시
+
+    def tail(self, lines: int = 200) -> str:
+        return "\n".join(list(self.records)[-lines:])
+
+
+class BotThread(QThread):
+    """QuantBot.run()을 UI와 분리된 백그라운드 스레드에서 실행"""
+
+    crashed = pyqtSignal(str)
+
+    def __init__(self, bot: Any):
+        super().__init__()
+        self.bot = bot
+
+    def run(self) -> None:
+        try:
+            self.bot.run()
+        except Exception as e:  # pragma: no cover - 스레드 예외 방어
+            logger.error(f"봇 스레드 예외 종료: {e}", exc_info=True)
+            self.crashed.emit(str(e))
+
+
+class BalanceWorker(QObject):
+    """잔고 조회(네트워크)를 UI 스레드 밖에서 수행하기 위한 워커"""
+
+    finished = pyqtSignal(str)
+
+    def __init__(self, bot: Any):
+        super().__init__()
+        self.bot = bot
+
+    def query(self) -> None:
+        """별도 스레드에서 호출됩니다."""
+        try:
+            report = self.bot.exchange.get_total_balance_krw(self.bot.tickers)
+            lines = [
+                f"총 평가 자산: {report['total_eval']:,.0f}원",
+                f"주문가능 원화: {report['krw_available']:,.0f}원",
+            ]
+            for asset in report["assets"]:
+                lines.append(f"{asset['currency']}: {asset['balance']:.4f} "
+                             f"({asset['eval_krw']:,.0f}원)")
+            self.finished.emit("\n".join(lines))
+        except Exception as e:
+            self.finished.emit(f"잔고 조회 실패: {e}")
+
+
+def _color(hex_value: str) -> "QBrush":
+    """QSS로 지정할 수 없는 테이블 셀 글자색을 위한 QBrush 생성"""
+    return QBrush(QColor(hex_value))
+
+
+def _card(title: str):
+    """제목 라벨이 달린 카드 프레임과 내부 레이아웃 생성"""
+    frame = QFrame()
+    frame.setObjectName("Card")
+    layout = QVBoxLayout(frame)
+    layout.setContentsMargins(18, 14, 18, 16)
+    layout.setSpacing(10)
+
+    if title:
+        label = QLabel(title.upper())
+        label.setObjectName("CardTitle")
+        layout.addWidget(label)
+    return frame, layout
+
+
+class Dashboard(QWidget):
+    """봇 상태를 1초 주기로 갱신하는 미니 대시보드 창"""
+
+    COLUMNS = ["종목", "현재가", "목표가", "적용 K", "MA", "당일 상태"]
+
+    def __init__(self, bot: Any, log_buffer: LogBuffer):
+        super().__init__()
+        self.bot = bot
+        self.log_buffer = log_buffer
+        self._price_cache: Dict[str, float] = {}
+
+        self.setWindowTitle("QuantBot")
+        self.resize(780, 660)
+        if ICO_PATH.exists():
+            self.setWindowIcon(QIcon(str(ICO_PATH)))
+
+        self._build_ui()
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.refresh)
+        self.timer.start(REFRESH_MS)
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 20, 22, 20)
+        layout.setSpacing(14)
+
+        # --- 헤더: 타이틀 + 상태 배지 ---
+        header = QHBoxLayout()
+        header.setSpacing(8)
+
+        title = QLabel("QuantBot")
+        title.setObjectName("Title")
+        header.addWidget(title)
+
+        self.exchange_label = QLabel("")
+        self.exchange_label.setObjectName("Subtitle")
+        header.addWidget(self.exchange_label)
+        header.addStretch(1)
+
+        self.mode_pill = QLabel("")
+        self.mode_pill.setObjectName("Pill")
+        header.addWidget(self.mode_pill)
+
+        self.state_pill = QLabel("")
+        self.state_pill.setObjectName("Pill")
+        header.addWidget(self.state_pill)
+        layout.addLayout(header)
+
+        # --- 지표 카드 3종 ---
+        metrics = QHBoxLayout()
+        metrics.setSpacing(12)
+        self.metric_labels: Dict[str, QLabel] = {}
+        for key, caption in (
+            ("strategy", "전략"),
+            ("tickers", "감시 종목"),
+            ("filled", "당일 체결"),
+        ):
+            card, card_layout = _card("")
+            caption_label = QLabel(caption)
+            caption_label.setObjectName("MetricLabel")
+            value_label = QLabel("-")
+            value_label.setObjectName("Metric")
+            card_layout.addWidget(caption_label)
+            card_layout.addWidget(value_label)
+            self.metric_labels[key] = value_label
+            metrics.addWidget(card, 1)
+        layout.addLayout(metrics)
+
+        # --- 종목별 상태 테이블 ---
+        table_card, table_layout = _card("종목별 현황")
+        self.table = QTableWidget(0, len(self.COLUMNS))
+        self.table.setHorizontalHeaderLabels(self.COLUMNS)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setShowGrid(False)
+        self.table.setAlternatingRowColors(True)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.table.setMinimumHeight(150)
+
+        # 컬럼이 카드 폭을 균등하게 채우도록 (종목명만 내용에 맞춤)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(header.ResizeMode.Stretch)
+        header.setSectionResizeMode(0, header.ResizeMode.ResizeToContents)
+        header.setHighlightSections(False)
+        self.table.verticalHeader().setDefaultSectionSize(38)
+        table_layout.addWidget(self.table)
+        layout.addWidget(table_card)
+
+        # --- 로그 영역 ---
+        log_card, log_layout = _card("실행 로그")
+        self.log_view = QTextEdit()
+        self.log_view.setObjectName("Log")
+        self.log_view.setReadOnly(True)
+        self.log_view.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        log_layout.addWidget(self.log_view)
+        layout.addWidget(log_card, stretch=1)
+
+        # --- 버튼 ---
+        button_row = QHBoxLayout()
+        button_row.setSpacing(8)
+        self.pause_button = QPushButton("일시정지")
+        self.pause_button.setObjectName("Primary")
+        self.pause_button.clicked.connect(self.toggle_pause)
+        button_row.addWidget(self.pause_button)
+
+        self.config_button = QPushButton("설정")
+        self.config_button.clicked.connect(self.open_config)
+        button_row.addWidget(self.config_button)
+        button_row.addStretch(1)
+
+        close_button = QPushButton("닫기")
+        close_button.setObjectName("Ghost")
+        close_button.clicked.connect(self.hide)
+        button_row.addWidget(close_button)
+        layout.addLayout(button_row)
+
+    def open_config(self) -> None:
+        """설정 창을 같은 프로세스 안에서 별도 창으로 표시"""
+        from config_gui import build_config_window
+
+        if getattr(self, "_config_window", None) is None:
+            self._config_window = build_config_window()
+        self._config_window.show()
+        self._config_window.raise_()
+        self._config_window.activateWindow()
+
+    def toggle_pause(self) -> None:
+        """일시정지 / 재개 토글"""
+        if self.bot.is_paused:
+            self.bot.resume()
+        else:
+            self.bot.pause()
+        self.refresh()
+
+    def set_price(self, ticker: str, price: float) -> None:
+        """트레이 쪽에서 조회한 현재가를 공유 (중복 API 호출 방지)"""
+        self._price_cache[ticker] = price
+
+    def refresh(self) -> None:
+        """봇 상태를 읽어 화면 갱신 (네트워크 호출 없음 - 메모리 상태만 사용)"""
+        exchange = self.bot.exchange
+
+        # --- 헤더 ---
+        self.exchange_label.setText(exchange.DISPLAY_NAME)
+        if exchange.is_simulation:
+            self.mode_pill.setText("시뮬레이션")
+            ui_theme.pill(self.mode_pill, "warn")
+        else:
+            self.mode_pill.setText("실전 매매")
+            ui_theme.pill(self.mode_pill, "ok")
+
+        if self.bot.is_paused:
+            self.state_pill.setText("일시정지")
+            ui_theme.pill(self.state_pill, "danger")
+        else:
+            self.state_pill.setText("가동 중")
+            ui_theme.pill(self.state_pill, "ok")
+
+        # --- 지표 카드 ---
+        strategy = "동적 K" if self.bot.use_dynamic_k else f"K {self.bot.k}"
+        filled = sum(1 for t in self.bot.tickers if self.bot.has_bought.get(t))
+        self.metric_labels["strategy"].setText(f"{strategy} · MA{self.bot.ma_window}")
+        self.metric_labels["tickers"].setText(str(len(self.bot.tickers)))
+        self.metric_labels["filled"].setText(f"{filled} / {len(self.bot.tickers)}")
+
+        self.pause_button.setText("재개" if self.bot.is_paused else "일시정지")
+
+        # --- 테이블 ---
+        self.table.setRowCount(len(self.bot.tickers))
+        for row, ticker in enumerate(self.bot.tickers):
+            if self.bot.has_bought.get(ticker):
+                status, tone, tip = "체결 완료", ui_theme.COLORS["accent"], "당일 매수 체결 완료"
+            elif self.bot.skipped_today.get(ticker):
+                status, tone = "당일 제외", ui_theme.COLORS["amber"]
+                tip = "주문 가능 예산이 최소 주문금액 미만이라 당일 매수 대상에서 제외되었습니다."
+            else:
+                status, tone, tip = "대기", ui_theme.COLORS["text_muted"], "돌파 신호 대기 중"
+
+            price = self._price_cache.get(ticker, 0.0)
+            target = self.bot.target_prices.get(ticker, 0.0)
+            above_ma = self.bot.is_above_ma.get(ticker)
+
+            cells = [
+                (ticker, ui_theme.COLORS["text"], False),
+                (f"{price:,.0f}" if price else "—", ui_theme.COLORS["text"], True),
+                (f"{target:,.0f}" if target else "—", ui_theme.COLORS["text_dim"], True),
+                (f"{self.bot.effective_ks.get(ticker, 0.0):.4f}",
+                 ui_theme.COLORS["text_dim"], True),
+                ("충족" if above_ma else "미달",
+                 ui_theme.COLORS["accent"] if above_ma else ui_theme.COLORS["text_muted"], False),
+                (status, tone, False),
+            ]
+            for col, (text, color, numeric) in enumerate(cells):
+                item = QTableWidgetItem(text)
+                item.setForeground(_color(color))
+                if numeric:
+                    item.setTextAlignment(int(Qt.AlignmentFlag.AlignRight
+                                              | Qt.AlignmentFlag.AlignVCenter))
+                if col == len(cells) - 1:
+                    item.setToolTip(tip)
+                self.table.setItem(row, col, item)
+
+        # 로그는 스크롤이 맨 아래일 때만 자동 추적
+        scrollbar = self.log_view.verticalScrollBar()
+        at_bottom = scrollbar.value() >= scrollbar.maximum() - 4
+        self.log_view.setPlainText(self.log_buffer.tail())
+        if at_bottom:
+            scrollbar.setValue(scrollbar.maximum())
+
+    def closeEvent(self, event) -> None:
+        """창을 닫아도 앱은 트레이에 계속 상주"""
+        event.ignore()
+        self.hide()
+
+
+class TrayApplication:
+    """시스템 트레이 아이콘 + 메뉴 + 봇 스레드 수명주기 관리"""
+
+    def __init__(self, bot: Any, log_buffer: LogBuffer):
+        self.bot = bot
+        self.log_buffer = log_buffer
+
+        self.app = QApplication.instance() or QApplication(sys.argv)
+        self.app.setQuitOnLastWindowClosed(False)  # 창을 닫아도 트레이에 상주
+        ui_theme.apply_theme(self.app)             # 다크 테마 (대시보드 + 설정 창 공용)
+
+        ensure_icon()
+        self.icon = QIcon(str(ICO_PATH)) if ICO_PATH.exists() else QIcon()
+
+        self.dashboard = Dashboard(bot, log_buffer)
+        self.tray = QSystemTrayIcon(self.icon)
+        self.tray.setToolTip(f"QuantBot - {bot.exchange.DISPLAY_NAME}")
+        self._build_menu()
+        self.tray.activated.connect(self._on_tray_activated)
+        self.tray.show()
+
+        self.bot_thread = BotThread(bot)
+        self.bot_thread.crashed.connect(self._on_bot_crashed)
+        self.bot_thread.start()
+
+        # 트레이 툴팁/대시보드용 현재가 갱신 타이머 (5초 주기, 백그라운드 조회)
+        self.price_timer = QTimer()
+        self.price_timer.timeout.connect(self._refresh_prices_async)
+        self.price_timer.start(5000)
+
+        mode = "시뮬레이션" if bot.exchange.is_simulation else "실전 매매"
+        self.notify("QuantBot 가동", f"{bot.exchange.DISPLAY_NAME} / {mode}\n"
+                                     f"종목: {', '.join(bot.tickers)}")
+
+    # -- 메뉴 ---------------------------------------------------------
+    def _build_menu(self) -> None:
+        menu = QMenu()
+
+        self.dashboard_action = QAction("대시보드 열기")
+        self.dashboard_action.triggered.connect(self.show_dashboard)
+        menu.addAction(self.dashboard_action)
+
+        self.balance_action = QAction("자산 조회")
+        self.balance_action.triggered.connect(self.query_balance)
+        menu.addAction(self.balance_action)
+
+        menu.addSeparator()
+
+        self.pause_action = QAction("일시정지")
+        self.pause_action.triggered.connect(self.toggle_pause)
+        menu.addAction(self.pause_action)
+
+        self.config_action = QAction("설정...")
+        self.config_action.triggered.connect(self.open_config)
+        menu.addAction(self.config_action)
+
+        menu.addSeparator()
+
+        self.quit_action = QAction("종료")
+        self.quit_action.triggered.connect(self.quit)
+        menu.addAction(self.quit_action)
+
+        self.menu = menu
+        self.tray.setContextMenu(menu)
+
+    def _on_tray_activated(self, reason) -> None:
+        """트레이 아이콘 더블클릭 시 대시보드 표시"""
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self.show_dashboard()
+
+    # -- 액션 ---------------------------------------------------------
+    def notify(self, title: str, message: str) -> None:
+        """트레이 풍선 알림"""
+        self.tray.showMessage(title, message,
+                              QSystemTrayIcon.MessageIcon.Information, 5000)
+
+    def show_dashboard(self) -> None:
+        self.dashboard.refresh()
+        self.dashboard.show()
+        self.dashboard.raise_()
+        self.dashboard.activateWindow()
+
+    def query_balance(self) -> None:
+        """잔고 조회를 백그라운드 스레드에서 수행하고 결과를 트레이 알림으로 표시"""
+        self.balance_action.setEnabled(False)
+        self.notify("자산 조회", "잔고를 조회하는 중입니다...")
+
+        worker = BalanceWorker(self.bot)
+        worker.finished.connect(self._on_balance_ready)
+        self._balance_worker = worker  # GC 방지
+        threading.Thread(target=worker.query, daemon=True).start()
+
+    def _on_balance_ready(self, text: str) -> None:
+        self.notify("자산 현황", text)
+        self.balance_action.setEnabled(True)
+
+    def toggle_pause(self) -> None:
+        if self.bot.is_paused:
+            self.bot.resume()
+            self.pause_action.setText("일시정지")
+            self.notify("QuantBot", "매매 감시를 재개했습니다.")
+        else:
+            self.bot.pause()
+            self.pause_action.setText("재개")
+            self.notify("QuantBot", "매매 감시를 일시정지했습니다.")
+        self.dashboard.refresh()
+
+    def open_config(self) -> None:
+        """설정 창 표시 (동일 Qt 이벤트 루프 안에서 별도 창으로 동작)"""
+        try:
+            self.dashboard.open_config()
+        except Exception as e:
+            logger.error(f"설정 창 실행 실패: {e}", exc_info=True)
+            QMessageBox.warning(None, "설정 실행 실패", str(e))
+
+    def _refresh_prices_async(self) -> None:
+        """현재가를 백그라운드로 조회해 대시보드/툴팁에 반영"""
+        def worker() -> None:
+            prices: Dict[str, float] = {}
+            for ticker in self.bot.tickers:
+                try:
+                    price = self.bot.exchange.get_current_price(ticker)
+                    if price:
+                        prices[ticker] = float(price)
+                except Exception:
+                    continue
+            for ticker, price in prices.items():
+                self.dashboard.set_price(ticker, price)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_bot_crashed(self, message: str) -> None:
+        self.notify("QuantBot 오류", f"봇 스레드가 종료되었습니다.\n{message}")
+
+    def quit(self) -> None:
+        """봇 스레드 안전 종료 후 애플리케이션 종료"""
+        logger.info("트레이 메뉴에서 종료 요청됨")
+        self.price_timer.stop()
+        self.bot.stop()
+
+        if not self.bot_thread.wait(5000):  # 최대 5초 대기
+            logger.warning("봇 스레드가 제한 시간 내 종료되지 않아 강제 종료합니다.")
+            self.bot_thread.terminate()
+
+        self.tray.hide()
+        self.app.quit()
+
+    def run(self) -> int:
+        """Qt 이벤트 루프 시작"""
+        exec_fn = getattr(self.app, "exec", None) or self.app.exec_
+        return exec_fn()
+
+
+def run_gui(config: Optional[Dict[str, Any]] = None, bot: Optional[Any] = None) -> int:
+    """
+    트레이 GUI 실행 진입점
+
+    :param config: 설정 딕셔너리 (None이면 config.json 로딩)
+    :param bot: 이미 생성된 QuantBot 인스턴스 (테스트용 주입)
+    """
+    log_buffer = LogBuffer()
+    logging.getLogger().addHandler(log_buffer)
+
+    if bot is None:
+        from main import QuantBot
+        bot = QuantBot(config=config or config_manager.load_config())
+
+    logger.info(f"트레이 GUI 시작 ({QT_BINDING})")
+    tray_app = TrayApplication(bot, log_buffer)
+    return tray_app.run()
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    sys.exit(run_gui())

@@ -6,3 +6,18 @@
 build/
 .vscode/
 _CProps/
+
+# Python & Environment Security
+.env
+apiKey.txt
+config.json
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# PyInstaller
+dist/
+*.spec
+
+# Runtime
+logs/
