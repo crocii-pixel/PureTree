@@ -344,6 +344,47 @@ class TestBithumbAdapter:
     def test_order_success_detection(self, adapter, raw, expected):
         assert adapter._is_order_success(raw) is expected
 
+    @pytest.mark.parametrize("common,native", [
+        ("day", "day"),
+        ("minute60", "hour"),      # pybithumb만 1시간봉을 'hour'로 부름
+        ("minute30", "minute30"),
+    ])
+    def test_interval_name_is_translated(self, adapter, monkeypatch, common, native):
+        """공통 봉 이름을 pybithumb 표기로 변환하지 않으면 KeyError로 조용히 실패한다"""
+        captured = {}
+
+        def fake_ohlcv(symbol, interval="day"):
+            captured["interval"] = interval
+            return make_ohlcv(50)
+
+        import pybithumb
+        monkeypatch.setattr(pybithumb, "get_ohlcv", fake_ohlcv)
+        adapter.get_ohlcv("BTC", count=10, interval=common)
+        assert captured["interval"] == native
+
+    @pytest.mark.parametrize("interval,base", [
+        ("minute120", "hour"),     # 2시간봉: 국내 거래소 미제공 -> 1시간봉에서 합성
+        ("minute180", "hour"),     # 3시간봉
+        ("minute240", "hour"),     # 빗썸은 4시간봉도 없음
+        ("week", "day"),
+    ])
+    def test_unsupported_intervals_are_resampled(self, adapter, monkeypatch, interval, base):
+        captured = {}
+
+        def fake_ohlcv(symbol, interval="day"):
+            captured["interval"] = interval
+            return make_ohlcv(200)
+
+        import pybithumb
+        monkeypatch.setattr(pybithumb, "get_ohlcv", fake_ohlcv)
+        df = adapter.get_ohlcv("BTC", count=10, interval=interval)
+
+        assert captured["interval"] == base      # 하위 봉을 받아서
+        assert not df.empty                      # 합성에 성공
+
+    def test_unknown_interval_returns_empty(self, adapter):
+        assert adapter.get_ohlcv("BTC", interval="minute7").empty
+
     def test_ohlcv_normalization(self, adapter, monkeypatch):
         import pybithumb
         monkeypatch.setattr(pybithumb, "get_ohlcv", lambda symbol, interval="day": make_ohlcv(200))
@@ -355,6 +396,53 @@ class TestBithumbAdapter:
 # ======================================================================
 # 6. 업비트 어댑터
 # ======================================================================
+class TestResampling:
+    """하위 봉 -> 상위 봉 합성 (2H/3H는 국내 거래소가 제공하지 않음)"""
+
+    def _hourly(self, hours=24):
+        index = pd.date_range("2026-08-21 00:00", periods=hours, freq="h")
+        return pd.DataFrame({
+            "open": range(100, 100 + hours),
+            "high": range(110, 110 + hours),
+            "low": range(90, 90 + hours),
+            "close": range(105, 105 + hours),
+            "volume": [10.0] * hours,
+        }, index=index)
+
+    def test_two_hour_candles_aggregate_correctly(self):
+        df = ExchangeBase.resample_ohlcv(self._hourly(24), "minute120")
+
+        assert len(df) == 12
+        first = df.iloc[0]
+        assert first["open"] == 100        # 첫 봉의 시가
+        assert first["close"] == 106       # 두 번째 봉의 종가
+        assert first["high"] == 111        # 두 봉 중 최고가
+        assert first["low"] == 90          # 두 봉 중 최저가
+        assert first["volume"] == 20.0     # 거래량은 합산
+
+    def test_four_hour_candles(self):
+        df = ExchangeBase.resample_ohlcv(self._hourly(24), "minute240")
+        assert len(df) == 6
+
+    def test_index_is_labeled_by_candle_start(self):
+        """주봉 인덱스가 미래(주 종료일)로 찍히지 않아야 함"""
+        daily = pd.DataFrame({
+            "open": [1.0] * 14, "high": [2.0] * 14, "low": [0.5] * 14,
+            "close": [1.5] * 14, "volume": [1.0] * 14,
+        }, index=pd.date_range("2026-08-03", periods=14, freq="D"))
+
+        weekly = ExchangeBase.resample_ohlcv(daily, "week")
+        assert weekly.index[0] == pd.Timestamp("2026-08-03")   # 월요일 = 주 시작
+        assert weekly.index.max() <= daily.index.max()
+
+    def test_unknown_interval_returns_input_unchanged(self):
+        source = self._hourly(4)
+        assert ExchangeBase.resample_ohlcv(source, "minute7").equals(source)
+
+    def test_empty_input_is_safe(self):
+        assert ExchangeBase.resample_ohlcv(pd.DataFrame(), "minute120").empty
+
+
 class TestUpbitAdapter:
 
     class FakeUpbitClient:

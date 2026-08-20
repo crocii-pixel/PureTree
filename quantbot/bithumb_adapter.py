@@ -66,17 +66,56 @@ class BithumbAdapter(ExchangeBase):
             logger.error(f"[빗썸][{symbol}] 현재가 조회 실패: {e}")
             return None
 
+    # 공통 봉 이름 -> pybithumb 표기.
+    # pybithumb만 1시간봉을 'hour'로 부르기 때문에 공통 이름을 그대로 넘기면 KeyError가 납니다.
+    NATIVE_INTERVALS = {
+        "minute1": "minute1", "minute3": "minute3", "minute5": "minute5",
+        "minute10": "minute10", "minute30": "minute30",
+        "minute60": "hour", "hour": "hour",
+        "hour6": "hour6", "hour12": "hour12", "day": "day",
+    }
+
+    # 빗썸이 제공하지 않는 봉 -> (기반 봉, 합성할 목표 봉)
+    # 2H/3H/4H는 1시간봉에서, 주봉/월봉은 일봉에서 합성합니다.
+    SYNTHETIC_INTERVALS = {
+        "minute15": ("minute5", "minute15"),
+        "minute120": ("hour", "minute120"),
+        "minute180": ("hour", "minute180"),
+        "minute240": ("hour", "minute240"),
+        "week": ("day", "week"),
+        "month": ("day", "month"),
+    }
+
     def get_ohlcv(self, ticker: str, count: int = 100, interval: str = "day") -> pd.DataFrame:
         """
         빗썸 OHLCV 시세 조회
 
-        :param interval: 'day', 'minute1', 'minute60' 등 (pybithumb 표기 그대로 사용)
+        :param interval: 공통 봉 이름 ('day', 'minute60', 'minute240', 'week' 등).
+            빗썸이 직접 제공하지 않는 봉은 하위 봉을 받아 자동으로 합성합니다.
         """
         symbol = self.to_symbol(ticker)
         try:
             import pybithumb
-            logger.info(f"빗썸 데이터 수집 요청 - Symbol: {symbol}, Count: {count}, Interval: {interval}")
-            df = pybithumb.get_ohlcv(symbol, interval=interval)
+
+            resample_to = None
+            if interval in self.SYNTHETIC_INTERVALS:
+                native, resample_to = self.SYNTHETIC_INTERVALS[interval]
+                native = self.NATIVE_INTERVALS.get(native, native)
+            else:
+                native = self.NATIVE_INTERVALS.get(interval)
+                if native is None:
+                    logger.error(f"[빗썸] 지원하지 않는 봉 단위입니다: {interval}")
+                    return pd.DataFrame()
+
+            logger.info(
+                f"빗썸 데이터 수집 요청 - Symbol: {symbol}, Count: {count}, "
+                f"Interval: {native}" + (f" -> {resample_to} 합성" if resample_to else "")
+            )
+            df = pybithumb.get_ohlcv(symbol, interval=native)
+
+            if resample_to and df is not None and not df.empty:
+                df = self.resample_ohlcv(df, resample_to)
+
             normalized = self._normalize_ohlcv(df, count)
             if normalized.empty:
                 logger.warning(f"[빗썸][{symbol}] 조회된 시세 데이터가 없습니다.")

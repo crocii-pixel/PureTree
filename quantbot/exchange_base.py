@@ -165,6 +165,43 @@ class ExchangeBase(abc.ABC):
             except Exception as e:  # 알림 실패가 매매 로직을 중단시키지 않도록 격리
                 logger.debug(f"[{self.DISPLAY_NAME}] 알림 발송 실패: {e}")
 
+    # 공통 봉 이름 -> pandas 리샘플링 규칙
+    # 거래소가 직접 제공하지 않는 봉(2H/3H 등)을 하위 봉에서 합성할 때 사용합니다.
+    RESAMPLE_RULES: Dict[str, str] = {
+        "minute1": "1min", "minute3": "3min", "minute5": "5min",
+        "minute10": "10min", "minute15": "15min", "minute30": "30min",
+        "minute60": "1h", "minute120": "2h", "minute180": "3h", "minute240": "4h",
+        "hour6": "6h", "hour12": "12h",
+        "day": "1D", "week": "W-MON", "month": "MS",   # 주봉은 거래소와 동일하게 월요일 시작
+    }
+
+    @classmethod
+    def resample_ohlcv(cls, df: pd.DataFrame, interval: str) -> pd.DataFrame:
+        """
+        하위 봉 데이터를 상위 봉으로 합성합니다.
+
+        2시간봉·3시간봉은 국내 거래소가 제공하지 않아 1시간봉에서 만들어야 하고,
+        빗썸은 4시간봉·주봉·월봉도 없어 동일하게 합성이 필요합니다.
+
+        :param df: 하위 봉 OHLCV (DatetimeIndex 필수)
+        :param interval: 목표 봉 이름 ('minute120', 'minute240', 'week' 등)
+        """
+        rule = cls.RESAMPLE_RULES.get(interval)
+        if rule is None or df is None or df.empty:
+            return df if df is not None else pd.DataFrame()
+
+        if not isinstance(df.index, pd.DatetimeIndex):
+            logger.warning("리샘플링 실패: DatetimeIndex가 아닙니다.")
+            return df
+
+        # label/closed를 'left'로 고정: pandas는 주봉을 기본적으로 '주 종료일'로 라벨링해
+        # 인덱스가 미래 날짜가 되는데, 다른 봉과 기준이 달라져 혼동을 유발합니다.
+        resampled = df.resample(rule, label="left", closed="left").agg({
+            "open": "first", "high": "max", "low": "min",
+            "close": "last", "volume": "sum",
+        })
+        return resampled.dropna(subset=["open", "high", "low", "close"])
+
     @staticmethod
     def _normalize_ohlcv(df: Optional[pd.DataFrame], count: int) -> pd.DataFrame:
         """
