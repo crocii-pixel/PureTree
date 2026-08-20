@@ -400,7 +400,8 @@ class TestResampling:
     """하위 봉 -> 상위 봉 합성 (2H/3H는 국내 거래소가 제공하지 않음)"""
 
     def _hourly(self, hours=24):
-        index = pd.date_range("2026-08-21 00:00", periods=hours, freq="h")
+        # UTC 자정(= KST 09:00)에서 시작해야 봉 경계가 딱 떨어짐
+        index = pd.date_range("2026-08-21 09:00", periods=hours, freq="h")
         return pd.DataFrame({
             "open": range(100, 100 + hours),
             "high": range(110, 110 + hours),
@@ -434,6 +435,38 @@ class TestResampling:
         weekly = ExchangeBase.resample_ohlcv(daily, "week")
         assert weekly.index[0] == pd.Timestamp("2026-08-03")   # 월요일 = 주 시작
         assert weekly.index.max() <= daily.index.max()
+
+    @pytest.mark.parametrize("interval,utc_hours", [
+        ("minute120", {0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22}),
+        ("minute180", {0, 3, 6, 9, 12, 15, 18, 21}),
+        ("minute240", {0, 4, 8, 12, 16, 20}),
+    ])
+    def test_intraday_candles_align_to_utc(self, interval, utc_hours):
+        """
+        TradingView와 거래소 네이티브 봉이 모두 UTC 기준이므로 합성 봉도 맞춰야 한다.
+        데이터 시작점 기준으로 나누면 같은 4H인데 1시간 어긋난 봉이 만들어진다.
+        """
+        # KST 기준 naive 인덱스 (국내 거래소 응답 형식)
+        index = pd.date_range("2026-08-20 07:00", periods=48, freq="h")
+        hourly = pd.DataFrame({
+            "open": [100.0] * 48, "high": [110.0] * 48, "low": [90.0] * 48,
+            "close": [105.0] * 48, "volume": [1.0] * 48,
+        }, index=index)
+
+        resampled = ExchangeBase.resample_ohlcv(hourly, interval)
+        utc_index = resampled.index - pd.Timedelta(hours=9)   # KST -> UTC
+        assert set(utc_index.hour) <= utc_hours
+
+    def test_daily_candles_keep_exchange_boundary(self):
+        """일봉은 거래소 세션 경계(빗썸 00:00 KST)를 그대로 둬야 한다"""
+        index = pd.date_range("2026-08-20 00:00", periods=48, freq="h")
+        hourly = pd.DataFrame({
+            "open": [100.0] * 48, "high": [110.0] * 48, "low": [90.0] * 48,
+            "close": [105.0] * 48, "volume": [1.0] * 48,
+        }, index=index)
+
+        daily = ExchangeBase.resample_ohlcv(hourly, "day")
+        assert set(daily.index.hour) == {0}    # UTC 정렬(09:00)로 밀리지 않음
 
     def test_unknown_interval_returns_input_unchanged(self):
         source = self._hourly(4)

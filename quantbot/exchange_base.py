@@ -196,7 +196,16 @@ class ExchangeBase(abc.ABC):
 
         # label/closed를 'left'로 고정: pandas는 주봉을 기본적으로 '주 종료일'로 라벨링해
         # 인덱스가 미래 날짜가 되는데, 다른 봉과 기준이 달라져 혼동을 유발합니다.
-        resampled = df.resample(rule, label="left", closed="left").agg({
+        options: Dict[str, Any] = {"label": "left", "closed": "left"}
+
+        # 분/시간봉은 **UTC 자정 기준**으로 경계를 맞춥니다.
+        # TradingView와 거래소 네이티브 봉(업비트 4H 등)이 모두 UTC 기준이라,
+        # 데이터 시작점 기준으로 나누면 같은 4H인데 1시간씩 어긋난 봉이 만들어집니다.
+        # 인덱스가 KST naive이므로 UTC 00:00에 대응하는 KST 09:00을 기준점으로 사용합니다.
+        if interval.startswith("minute") or interval.startswith("hour"):
+            options["origin"] = pd.Timestamp("1970-01-01 09:00:00")
+
+        resampled = df.resample(rule, **options).agg({
             "open": "first", "high": "max", "low": "min",
             "close": "last", "volume": "sum",
         })
