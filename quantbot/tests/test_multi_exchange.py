@@ -739,8 +739,8 @@ class TestConfigManager:
 
         assert loaded["exchange"] == "upbit"
         assert loaded["tickers"] == ["XRP"]
-        # 누락된 키는 기본값으로 자동 보정
-        assert loaded["ma_window"] == 5
+        # 누락된 키는 기본값으로 자동 보정 (MA는 워크포워드 검증 결과 10이 기본)
+        assert loaded["ma_window"] == 10
         # schedule 기본값은 비어 있고(자동 유도), 봇이 거래소 기준으로 채움
         assert loaded["schedule"] == {}
 
@@ -1503,7 +1503,195 @@ class TestEvaluateThenRebalance:
 
 
 # ======================================================================
-# 13. 아이콘 생성 (Seed + Trading)
+# 13. 진입 필터 (백테스트/워크포워드로 검증된 항목)
+# ======================================================================
+class TestEntryFilters:
+    """상위 시간대 필터 / BTC 국면 필터 - 기본값은 모두 꺼짐"""
+
+    def _make_bot(self, tmp_path, ohlcv=None, **overrides):
+        from main import QuantBot
+        from trade_store import TradeStore
+
+        class FilterExchange(DummyExchange):
+            """봉 단위별로 다른 데이터를 돌려주는 테스트 어댑터"""
+
+            def __init__(self, ohlcv_map=None, **kwargs):
+                self.ohlcv_map = ohlcv_map or {}
+                self.ohlcv_calls = []
+                super().__init__(**kwargs)
+
+            def get_ohlcv(self, ticker, count=100, interval="day"):
+                self.ohlcv_calls.append((ticker, interval))
+                key = (ExchangeBase.to_symbol(ticker), interval)
+                if key in self.ohlcv_map:
+                    return self.ohlcv_map[key]
+                if interval in self.ohlcv_map:
+                    return self.ohlcv_map[interval]
+                return make_ohlcv()
+
+        exchange = FilterExchange(ohlcv_map=ohlcv, price=1000.0, krw=100_000.0,
+                                  coin=0.0, api_key="k", secret_key="s")
+        config = {
+            "exchange": "dummy", "tickers": ["BTC", "XRP"], "ma_window": 10,
+            "use_dynamic_k": True, "force_simulation": False, "start_paused": False,
+            "schedule": {},
+        }
+        config.update(overrides)
+        return QuantBot(config=config, exchange=exchange,
+                        notifier=FakeNotifier(), store=TradeStore(tmp_path / "t.db"))
+
+    # -- 기본값 --------------------------------------------------------
+    def test_filters_are_off_by_default(self, tmp_path):
+        """검증 강도가 약한 필터는 기본적으로 꺼져 있어야 한다"""
+        assert config_manager.DEFAULT_CONFIG["higher_timeframe_filter"] is None
+        assert config_manager.DEFAULT_CONFIG["btc_regime_filter"] is False
+
+        bot = self._make_bot(tmp_path)
+        assert bot.higher_timeframe_ok("XRP") is True
+        assert bot.btc_regime_ok("XRP") is True
+
+    def test_default_ma_window_is_ten(self):
+        """워크포워드에서 MA5보다 나았던 값"""
+        assert config_manager.DEFAULT_CONFIG["ma_window"] == 10
+
+    # -- 상위 시간대 필터 ----------------------------------------------
+    def _weekly(self, closes):
+        index = pd.date_range("2026-01-05", periods=len(closes), freq="W-MON")
+        return pd.DataFrame({
+            "open": closes, "high": [c * 1.05 for c in closes],
+            "low": [c * 0.95 for c in closes], "close": closes,
+            "volume": [1.0] * len(closes),
+        }, index=index)
+
+    def test_weekly_uptrend_allows_entry(self, tmp_path):
+        rising = self._weekly([100, 110, 120, 130, 140, 150])
+        bot = self._make_bot(tmp_path, ohlcv={"week": rising},
+                             higher_timeframe_filter="week", higher_timeframe_ma=4)
+        assert bot.higher_timeframe_ok("XRP") is True
+
+    def test_weekly_downtrend_blocks_entry(self, tmp_path):
+        falling = self._weekly([150, 140, 130, 120, 110, 100])
+        bot = self._make_bot(tmp_path, ohlcv={"week": falling},
+                             higher_timeframe_filter="week", higher_timeframe_ma=4)
+        assert bot.higher_timeframe_ok("XRP") is False
+
+    def test_in_progress_candle_is_excluded(self, tmp_path):
+        """
+        진행 중인 봉은 값이 계속 바뀌므로 판정에서 제외해야 한다.
+        마지막 봉만 급등시켜도 직전 마감 봉이 하락이면 차단되어야 함.
+        """
+        data = self._weekly([150, 140, 130, 120, 110, 999])   # 마지막(진행 중)만 급등
+        bot = self._make_bot(tmp_path, ohlcv={"week": data},
+                             higher_timeframe_filter="week", higher_timeframe_ma=4)
+        assert bot.higher_timeframe_ok("XRP") is False
+
+    def test_insufficient_data_does_not_block(self, tmp_path):
+        """데이터가 부족하면 진입을 막지 않는다 (조용한 거래 중단 방지)"""
+        short = self._weekly([100, 110])
+        bot = self._make_bot(tmp_path, ohlcv={"week": short},
+                             higher_timeframe_filter="week", higher_timeframe_ma=4)
+        assert bot.higher_timeframe_ok("XRP") is True
+
+    # -- BTC 국면 필터 -------------------------------------------------
+    def _btc_daily(self, start, end, days=30):
+        closes = list(pd.Series(range(days)).map(
+            lambda i: start + (end - start) * i / (days - 1)))
+        index = pd.date_range("2026-07-01", periods=days, freq="D")
+        return pd.DataFrame({
+            "open": closes, "high": closes, "low": closes,
+            "close": closes, "volume": [1.0] * days,
+        }, index=index)
+
+    def test_btc_decline_blocks_altcoin(self, tmp_path):
+        falling = self._btc_daily(100.0, 80.0)      # 20일 수익률 -20%
+        bot = self._make_bot(tmp_path, ohlcv={("BTC", "day"): falling},
+                             btc_regime_filter=True)
+        assert bot.btc_regime_ok("XRP") is False
+
+    def test_btc_decline_does_not_block_btc_itself(self, tmp_path):
+        """필터의 근거는 '알트 동반 하락'이므로 BTC 자신에게는 적용하지 않는다"""
+        falling = self._btc_daily(100.0, 80.0)
+        bot = self._make_bot(tmp_path, ohlcv={("BTC", "day"): falling},
+                             btc_regime_filter=True)
+        assert bot.btc_regime_ok("BTC") is True
+
+    def test_btc_uptrend_allows_altcoin(self, tmp_path):
+        rising = self._btc_daily(80.0, 100.0)
+        bot = self._make_bot(tmp_path, ohlcv={("BTC", "day"): rising},
+                             btc_regime_filter=True)
+        assert bot.btc_regime_ok("XRP") is True
+
+    def test_btc_filter_threshold_is_configurable(self, tmp_path):
+        mild = self._btc_daily(100.0, 93.0)          # 약 -7%
+        assert self._make_bot(tmp_path, ohlcv={("BTC", "day"): mild},
+                              btc_regime_filter=True,
+                              btc_decline_threshold=-0.10).btc_regime_ok("XRP") is True
+        assert self._make_bot(tmp_path, ohlcv={("BTC", "day"): mild},
+                              btc_regime_filter=True,
+                              btc_decline_threshold=-0.03).btc_regime_ok("XRP") is False
+
+    # -- 매매 로직 연결 -------------------------------------------------
+    def test_blocked_ticker_is_not_bought(self, tmp_path):
+        falling = self._btc_daily(100.0, 80.0)
+        bot = self._make_bot(tmp_path, ohlcv={("BTC", "day"): falling},
+                             btc_regime_filter=True)
+        bot.entry_allowed = {"BTC": True, "XRP": False}
+        bot.target_prices = {"BTC": 500.0, "XRP": 500.0}
+        bot.is_above_ma = {"BTC": True, "XRP": True}
+
+        bot.monitor_market()
+
+        bought = [p["market"] for p in bot.exchange.placed]
+        assert "BTC" in bought and "XRP" not in bought
+
+    def test_filters_evaluated_once_per_day_not_per_tick(self, tmp_path):
+        """
+        필터는 일일 루틴에서만 평가해야 한다.
+        1초 감시 루프에서 매번 조회하면 거래소 API 호출량이 폭증한다.
+        """
+        bot = self._make_bot(tmp_path, higher_timeframe_filter="week")
+        bot.entry_allowed = {t: True for t in bot.tickers}
+        bot.target_prices = {"BTC": 500.0, "XRP": 500.0}
+        bot.is_above_ma = {"BTC": True, "XRP": True}
+
+        bot.exchange.ohlcv_calls.clear()
+        for _ in range(5):
+            bot.monitor_market()
+
+        weekly_calls = [c for c in bot.exchange.ohlcv_calls if c[1] == "week"]
+        assert weekly_calls == []
+
+    def test_daily_settings_populates_filter_state(self, tmp_path):
+        falling = self._btc_daily(100.0, 80.0)
+        bot = self._make_bot(tmp_path, ohlcv={("BTC", "day"): falling},
+                             btc_regime_filter=True)
+        bot.update_daily_settings()
+
+        assert bot.entry_allowed["XRP"] is False
+        assert "BTC 하락" in bot.filter_reason["XRP"]
+        assert bot.entry_allowed["BTC"] is True
+
+    def test_status_report_shows_block_reason(self, tmp_path):
+        bot = self._make_bot(tmp_path)
+        bot.entry_allowed["XRP"] = False
+        bot.filter_reason["XRP"] = "BTC 하락 국면"
+        assert "진입차단" in bot.get_status_report()
+
+    def test_filter_failure_does_not_block_trading(self, tmp_path, monkeypatch):
+        """필터 평가 중 예외가 나도 매매를 막지 않는다 (조용한 거래 중단 방지)"""
+        bot = self._make_bot(tmp_path, higher_timeframe_filter="week",
+                             btc_regime_filter=True)
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("API 장애")
+
+        monkeypatch.setattr(bot.exchange, "get_ohlcv", boom)
+        assert bot.higher_timeframe_ok("XRP") is True
+        assert bot.btc_regime_ok("XRP") is True
+
+
+# ======================================================================
+# 14. 아이콘 생성 (Seed + Trading)
 # ======================================================================
 class TestIconGeneration:
 
@@ -1557,7 +1745,7 @@ class TestIconGeneration:
 
 
 # ======================================================================
-# 14. 트레이 GUI (위젯 생성 없이 로직만 검증)
+# 15. 트레이 GUI (위젯 생성 없이 로직만 검증)
 # ======================================================================
 class TestTrayGui:
 

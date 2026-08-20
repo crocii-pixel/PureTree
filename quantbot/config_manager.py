@@ -76,9 +76,20 @@ def ensure_data_dir() -> Path:
 DEFAULT_CONFIG: Dict[str, Any] = {
     "exchange": "bithumb",
     "tickers": ["BTC", "ETH", "SOL"],
-    "ma_window": 5,
+    # 워크포워드 검증에서 MA5보다 OOS 성과가 나았던 값 (31개 구간 중 19개 우위)
+    "ma_window": 10,
     "use_dynamic_k": True,
     "fixed_k": 0.5,
+
+    # 상위 시간대 추세 필터. None이면 미적용, "week"이면 주봉 추세가 상승일 때만 진입.
+    # 수익률 개선 근거는 약하지만(3/8 구간) 낙폭은 일관되게 줄었습니다(7/8 구간).
+    "higher_timeframe_filter": None,
+    "higher_timeframe_ma": 4,
+
+    # BTC 하락 국면(20일 수익률 < -5%)에 알트코인 진입을 차단.
+    # 수익률 개선은 확인되지 않았고(15/29 구간) 낙폭만 줄었습니다(25/29 구간).
+    "btc_regime_filter": False,
+    "btc_decline_threshold": -0.05,
     "force_simulation": False,
     # 기동 시 정지 상태로 대기. 텔레그램 /실행 또는 트레이 메뉴로 승인해야 주문이 나갑니다.
     "start_paused": True,

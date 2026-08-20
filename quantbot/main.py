@@ -155,6 +155,9 @@ class QuantBot:
         self.has_bought: Dict[str, bool] = {t: False for t in self.tickers}
         # 잔고 부족으로 당일 매수 대상에서 제외된 종목 (매초 재시도 방지)
         self.skipped_today: Dict[str, bool] = {t: False for t in self.tickers}
+        # 진입 필터 판정 결과 (일일 루틴에서 1회 평가 -> 감시 루프에서 재사용)
+        self.entry_allowed: Dict[str, bool] = {t: True for t in self.tickers}
+        self.filter_reason: Dict[str, str] = {t: "" for t in self.tickers}
 
         # GUI(트레이) 제어용 이벤트. pause_event가 set이면 매매 감시를 일시 중단합니다.
         self.pause_event = threading.Event()
@@ -236,6 +239,82 @@ class QuantBot:
         settings_time = schedule_cfg.get("settings_time") or derived["settings_time"]
         is_auto = not schedule_cfg.get("liquidate_time") and not schedule_cfg.get("settings_time")
         return liquidate_time, settings_time, is_auto
+
+    # ------------------------------------------------------------------
+    # 진입 필터 (백테스트/워크포워드로 검증된 항목만)
+    # ------------------------------------------------------------------
+    def higher_timeframe_ok(self, ticker: str) -> bool:
+        """
+        상위 시간대(주봉 등) 추세가 상승인지 판정합니다.
+
+        진행 중인 봉은 아직 마감되지 않아 값이 바뀌므로 **제외**하고,
+        직전에 마감된 봉의 종가가 이동평균을 상회하는지만 봅니다.
+
+        :return: 필터 미설정이거나 데이터 부족 시 True (진입을 막지 않음)
+        """
+        interval = self.config.get("higher_timeframe_filter")
+        if not interval:
+            return True
+
+        ma_len = int(self.config.get("higher_timeframe_ma", 4))
+        try:
+            df = self.exchange.get_ohlcv(ticker, count=ma_len * 4 + 5, interval=interval)
+            if df is None or len(df) < ma_len + 2:
+                logger.warning(f"[{ticker}] {interval} 데이터 부족 - 상위 시간대 필터 미적용")
+                return True
+
+            closed = df["close"].iloc[:-1]          # 진행 중인 봉 제외
+            ma = float(closed.iloc[-ma_len:].mean())
+            return float(closed.iloc[-1]) > ma
+        except Exception as e:
+            logger.error(f"[{ticker}] 상위 시간대 필터 평가 실패: {e}")
+            return True
+
+    def btc_regime_ok(self, ticker: str) -> bool:
+        """
+        BTC 하락 국면에서 알트코인 진입을 차단합니다.
+
+        검증 결과 수익률 개선 근거는 없었고(29개 구간 중 15개) 낙폭만 일관되게
+        줄었으므로(25개), 기본값은 꺼져 있습니다. BTC 자신에게는 적용하지 않습니다.
+
+        :return: 필터가 꺼져 있거나 BTC이거나 데이터 부족 시 True
+        """
+        if not self.config.get("btc_regime_filter", False):
+            return True
+        if ExchangeBase.to_symbol(ticker) == "BTC":
+            return True
+
+        threshold = float(self.config.get("btc_decline_threshold", -0.05))
+        try:
+            df = self.exchange.get_ohlcv("BTC", count=40, interval="day")
+            if df is None or len(df) < 25:
+                logger.warning("BTC 데이터 부족 - 국면 필터 미적용")
+                return True
+
+            closed = df["close"].iloc[:-1]          # 진행 중인 일봉 제외
+            ret20 = float(closed.iloc[-1]) / float(closed.iloc[-21]) - 1.0
+            if ret20 < threshold:
+                logger.info(
+                    f"[{ticker}] BTC 하락 국면(20일 {ret20 * 100:+.1f}%) - 진입 차단")
+                return False
+            return True
+        except Exception as e:
+            logger.error(f"BTC 국면 필터 평가 실패: {e}")
+            return True
+
+    def evaluate_entry_filters(self, ticker: str) -> Tuple[bool, str]:
+        """
+        진입 허용 여부를 종합 판정합니다.
+
+        1초 감시 루프가 아니라 **일일 루틴에서 1회만** 호출해 API 호출량을 억제합니다.
+
+        :return: (진입 허용 여부, 차단 사유)
+        """
+        if not self.higher_timeframe_ok(ticker):
+            return False, f"{self.config.get('higher_timeframe_filter')} 추세 하락"
+        if not self.btc_regime_ok(ticker):
+            return False, "BTC 하락 국면"
+        return True, ""
 
     def restore_daily_state(self) -> None:
         """
@@ -446,10 +525,15 @@ class QuantBot:
             bought = self.has_bought.get(ticker, False)
             cur_price = self.exchange.get_current_price(ticker) or 0.0
 
+            blocked = ""
+            if not self.entry_allowed.get(ticker, True):
+                blocked = f"\n  - ⛔ 진입차단: {self.filter_reason.get(ticker, '')}"
+
             lines.append(
                 f"• <b>{ticker}</b> (현재가: {cur_price:,.0f}원)\n"
                 f"  - 당일 목표가: {tp:,.0f}원 (적용K: {eff_k:.4f})\n"
-                f"  - MA{self.ma_window} 상회: {ma_ok} | 당일 체결여부: <b>{'완료(True)' if bought else '대기(False)'}</b>"
+                f"  - MA{self.ma_window} 상회: {ma_ok} | "
+                f"당일 체결여부: <b>{'완료(True)' if bought else '대기(False)'}</b>{blocked}"
             )
 
         return "\n".join(lines)
@@ -504,9 +588,15 @@ class QuantBot:
                         close_price=eval_res.get("current_price"),
                     )
 
+                allowed, reason = self.evaluate_entry_filters(ticker)
+                self.entry_allowed[ticker] = allowed
+                self.filter_reason[ticker] = reason
+
+                filter_note = "" if allowed else f" | <b>진입차단</b>({reason})"
                 summary_lines.append(
                     f"• <b>{ticker}</b> -> 목표가: {self.target_prices[ticker]:,.0f}원 | "
-                    f"적용K: {self.effective_ks[ticker]:.4f} | MA{self.ma_window}상회: {self.is_above_ma[ticker]}"
+                    f"적용K: {self.effective_ks[ticker]:.4f} | "
+                    f"MA{self.ma_window}상회: {self.is_above_ma[ticker]}{filter_note}"
                 )
                 logger.info(
                     f"[{ticker}] 세팅 완료: 목표가 {self.target_prices[ticker]:,.0f}원 "
@@ -644,6 +734,10 @@ class QuantBot:
                 has_bought = self.has_bought.get(ticker, False)
 
                 if target_price <= 0 or has_bought or self.skipped_today.get(ticker, False):
+                    continue
+
+                # 진입 필터에 걸린 종목은 당일 매수하지 않음 (일일 루틴에서 판정 완료)
+                if not self.entry_allowed.get(ticker, True):
                     continue
 
                 # 저장소에 당일 체결 기록이 있으면 메모리 상태와 무관하게 재매수 차단
