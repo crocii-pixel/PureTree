@@ -780,6 +780,7 @@ class TestQuantBotIntegration:
             "use_dynamic_k": True,
             "fixed_k": 0.5,
             "force_simulation": True,
+            "start_paused": False,   # 매매 경로 검증이 목적이므로 정지 해제 상태로 생성
             "schedule": {"liquidate_time": "08:59:50", "settings_time": "09:00:05"},
         }
         # 실제 사용자 DB를 오염시키지 않도록 테스트마다 임시 DB 사용
@@ -1053,6 +1054,7 @@ class TestRestartRecovery:
         config = {
             "exchange": "dummy", "tickers": ["BTC", "ETH"], "ma_window": 5,
             "use_dynamic_k": True, "fixed_k": 0.5, "force_simulation": False,
+            "start_paused": False,   # 매매 경로 검증이 목적이므로 정지 해제 상태로 생성
             "schedule": {"liquidate_time": "08:59:50", "settings_time": "09:00:05"},
         }
         return QuantBot(config=config, exchange=exchange,
@@ -1178,7 +1180,209 @@ class TestRestartRecovery:
 
 
 # ======================================================================
-# 12. 아이콘 생성 (Seed + Trading)
+# 12. 기동 시 정지 대기 / 평가 후 포지션 재조정 (실전 안전장치)
+# ======================================================================
+class TestStartPausedSafety:
+    """기동만으로는 주문이 나가지 않아야 한다"""
+
+    def _make_bot(self, tmp_path, **overrides):
+        from main import QuantBot
+        from trade_store import TradeStore
+
+        exchange = DummyExchange(price=1000.0, krw=100_000.0, coin=10.0,
+                                 api_key="k", secret_key="s")
+        config = {
+            "exchange": "dummy", "tickers": ["BTC", "ETH"], "ma_window": 5,
+            "use_dynamic_k": True, "fixed_k": 0.5, "force_simulation": False,
+            "schedule": {},
+        }
+        config.update(overrides)
+        return QuantBot(config=config, exchange=exchange,
+                        notifier=FakeNotifier(), store=TradeStore(tmp_path / "t.db"))
+
+    def test_starts_paused_by_default(self, tmp_path):
+        bot = self._make_bot(tmp_path)
+        assert bot.start_paused is True
+        assert bot.is_paused is True
+
+    def test_paused_bot_places_no_buy_orders(self, tmp_path):
+        bot = self._make_bot(tmp_path)
+        bot.target_prices = {"BTC": 500.0, "ETH": 500.0}   # 현재가(1000) > 목표가
+        bot.is_above_ma = {"BTC": True, "ETH": True}
+
+        bot.monitor_market()
+
+        assert bot.exchange.placed == []          # 주문 없음
+        assert bot.store.get_trades() == []       # 기록도 없음
+
+    def test_paused_bot_does_not_rebalance(self, tmp_path):
+        """정지 상태에서는 청산도 하지 않는다 (보유 포지션 보호)"""
+        bot = self._make_bot(tmp_path)
+        bot.is_above_ma = {"BTC": False, "ETH": False}   # 청산 조건
+
+        bot.rebalance_positions()
+
+        assert bot.exchange.placed == []
+
+    def test_telegram_resume_starts_trading(self, tmp_path):
+        bot = self._make_bot(tmp_path)
+        reply = bot.command_resume()
+
+        assert bot.is_paused is False
+        assert "매매를 시작" in reply
+
+        bot.target_prices = {"BTC": 500.0, "ETH": 500.0}
+        bot.is_above_ma = {"BTC": True, "ETH": True}
+        bot.monitor_market()
+        assert len(bot.exchange.placed) == 2      # 승인 후에는 정상 매수
+
+    def test_telegram_pause_blocks_further_orders(self, tmp_path):
+        bot = self._make_bot(tmp_path, start_paused=False)
+        reply = bot.command_pause()
+
+        assert bot.is_paused is True
+        assert "중단" in reply
+
+        bot.target_prices = {"BTC": 500.0}
+        bot.is_above_ma = {"BTC": True}
+        bot.monitor_market()
+        assert bot.exchange.placed == []
+
+    def test_repeated_commands_are_idempotent(self, tmp_path):
+        bot = self._make_bot(tmp_path)
+        assert "이미" in bot.command_pause()      # 이미 정지 상태
+        bot.command_resume()
+        assert "이미" in bot.command_resume()     # 이미 가동 상태
+
+    def test_init_message_requests_approval(self, tmp_path):
+        bot = self._make_bot(tmp_path)
+        first = bot.notifier.messages[0]
+
+        assert "/실행" in first
+        assert "정지 상태로 대기" in first
+
+    def test_status_report_shows_paused(self, tmp_path):
+        bot = self._make_bot(tmp_path)
+        assert "정지" in bot.get_status_report()
+
+        bot.resume()
+        assert "가동 중" in bot.get_status_report()
+
+    def test_start_paused_can_be_disabled(self, tmp_path):
+        bot = self._make_bot(tmp_path, start_paused=False)
+        assert bot.is_paused is False
+
+    def test_default_config_starts_paused(self):
+        assert config_manager.DEFAULT_CONFIG["start_paused"] is True
+
+
+class TestEvaluateThenRebalance:
+    """무조건 청산 후 재매수하지 않고, 평가 결과를 반영해 보유/청산을 결정"""
+
+    def _make_bot(self, tmp_path, coin=10.0):
+        from main import QuantBot
+        from trade_store import TradeStore
+
+        exchange = DummyExchange(price=1000.0, krw=100_000.0, coin=coin,
+                                 api_key="k", secret_key="s")
+        config = {
+            "exchange": "dummy", "tickers": ["BTC", "ETH"], "ma_window": 5,
+            "use_dynamic_k": True, "fixed_k": 0.5, "force_simulation": False,
+            "start_paused": False, "schedule": {},
+        }
+        return QuantBot(config=config, exchange=exchange,
+                        notifier=FakeNotifier(), store=TradeStore(tmp_path / "t.db"))
+
+    def test_momentum_intact_holds_position(self, tmp_path):
+        """MA 상회 종목은 팔지 않고 보유 유지 (재매수 churn 제거)"""
+        bot = self._make_bot(tmp_path)
+        bot.is_above_ma = {"BTC": True, "ETH": True}
+
+        bot.rebalance_positions()
+
+        assert bot.exchange.placed == []                    # 매도 주문 없음
+        assert bot.has_bought == {"BTC": True, "ETH": True}  # 당일 재매수도 차단
+
+    def test_momentum_lost_exits_position(self, tmp_path):
+        bot = self._make_bot(tmp_path)
+        bot.is_above_ma = {"BTC": False, "ETH": False}
+
+        bot.rebalance_positions()
+
+        sells = [p for p in bot.exchange.placed if p["side"] == "sell"]
+        assert len(sells) == 2
+        assert all(p["order_code"] for p in sells)          # 주문코드 부여
+        assert bot.has_bought == {"BTC": False, "ETH": False}
+
+    def test_mixed_signals_are_handled_per_ticker(self, tmp_path):
+        bot = self._make_bot(tmp_path)
+        bot.is_above_ma = {"BTC": True, "ETH": False}       # BTC 보유 / ETH 청산
+
+        bot.rebalance_positions()
+
+        sells = [p for p in bot.exchange.placed if p["side"] == "sell"]
+        assert len(sells) == 1
+        assert bot.has_bought["BTC"] is True
+        assert bot.has_bought["ETH"] is False
+
+    def test_dust_holdings_are_skipped(self, tmp_path):
+        """최소 주문금액 미만 보유분은 매도 시도조차 하지 않음"""
+        bot = self._make_bot(tmp_path, coin=0.001)          # 평가 1원
+        bot.is_above_ma = {"BTC": False, "ETH": False}
+
+        bot.rebalance_positions()
+        assert bot.exchange.placed == []
+
+    def test_held_position_is_not_rebought(self, tmp_path):
+        """보유 유지로 판정된 종목은 같은 날 추가 매수되지 않는다"""
+        bot = self._make_bot(tmp_path)
+        bot.is_above_ma = {"BTC": True, "ETH": True}
+        bot.rebalance_positions()
+
+        bot.target_prices = {"BTC": 500.0, "ETH": 500.0}    # 돌파 조건 충족
+        bot.monitor_market()
+
+        assert bot.exchange.placed == []
+
+    def test_daily_routine_evaluates_before_acting(self, tmp_path, monkeypatch):
+        """평가 -> 반영 순서가 지켜지는지 (순서가 뒤바뀌면 잘못된 판단으로 매매)"""
+        bot = self._make_bot(tmp_path)
+        calls = []
+
+        monkeypatch.setattr(bot, "update_daily_settings", lambda: calls.append("evaluate"))
+        monkeypatch.setattr(bot, "rebalance_positions", lambda: calls.append("act"))
+
+        bot.daily_routine()
+        assert calls == ["evaluate", "act"]
+
+    def test_liquidate_position_still_available_for_manual_use(self, tmp_path):
+        """자동 스케줄에서는 빠졌지만 수동 전량 청산은 계속 가능"""
+        bot = self._make_bot(tmp_path)
+        bot.liquidate_position()
+
+        sells = [p for p in bot.exchange.placed if p["side"] == "sell"]
+        assert len(sells) == 2
+
+    def test_schedule_registers_only_daily_routine(self, tmp_path, monkeypatch):
+        """일봉 경계 직전 무조건 청산 스케줄이 제거되었는지 확인"""
+        import schedule as schedule_lib
+
+        bot = self._make_bot(tmp_path)
+        schedule_lib.clear()
+        monkeypatch.setattr(bot, "update_daily_settings", lambda: None)
+        monkeypatch.setattr(bot, "reconcile_with_exchange", lambda: None)
+        monkeypatch.setattr(bot, "restore_daily_state", lambda: None)
+
+        bot.stop_event.set()      # 루프에 진입하지 않고 즉시 종료
+        bot.run()
+
+        jobs = [j.job_func.__name__ for j in schedule_lib.get_jobs()]
+        assert jobs == ["daily_routine"]
+        schedule_lib.clear()
+
+
+# ======================================================================
+# 13. 아이콘 생성 (Seed + Trading)
 # ======================================================================
 class TestIconGeneration:
 
@@ -1232,7 +1436,7 @@ class TestIconGeneration:
 
 
 # ======================================================================
-# 13. 트레이 GUI (위젯 생성 없이 로직만 검증)
+# 14. 트레이 GUI (위젯 생성 없이 로직만 검증)
 # ======================================================================
 class TestTrayGui:
 

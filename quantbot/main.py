@@ -161,17 +161,37 @@ class QuantBot:
         self.stop_event = threading.Event()
         self.last_error: Optional[str] = None
 
+        # 기동 즉시 매매하지 않고 **정지 상태로 대기**합니다.
+        # 사용자가 텔레그램 /실행 또는 트레이 메뉴로 승인해야 주문이 나갑니다.
+        self.start_paused: bool = bool(self.config.get("start_paused", True))
+        if self.start_paused:
+            self.pause_event.set()
+
         mode_str = "실전 매매" if not self.exchange.is_simulation else "시뮬레이션(Dry-Run)"
+        state_line = (
+            "⏸️ <b>정지 상태로 대기 중</b> — 주문이 나가지 않습니다."
+            if self.start_paused else "▶️ <b>가동 중</b>"
+        )
         init_msg = (
-            f"[QuantBot v2.1 Multi-Exchange 초기화]\n"
+            f"[QuantBot v2.1 초기화]\n"
             f"• 거래소: <b>{self.exchange.DISPLAY_NAME}</b>\n"
             f"• 모드: <b>{mode_str}</b>\n"
             f"• 대상 종목({len(self.tickers)}개): {', '.join(self.tickers)}\n"
             f"• 전략: {'동적 K (20일 노이즈 비율)' if self.use_dynamic_k else f'고정 K({self.k})'} + MA{self.ma_window} 모멘텀\n"
-            f"• 텔레그램 명령어 수신 가동 완료 (<b>/자산</b>, <b>/상태</b>)"
+            f"----------------------------------\n"
+            f"{state_line}"
         )
+        if self.start_paused:
+            init_msg += (
+                f"\n\n매매를 시작하려면 <b>/실행</b> 을 보내주세요.\n"
+                f"• <b>/실행</b> : 매매 시작\n"
+                f"• <b>/정지</b> : 매매 중단 (주문만 멈추고 감시는 유지)\n"
+                f"• <b>/자산</b> : 실시간 잔고\n"
+                f"• <b>/상태</b> : 종목별 목표가·체결 현황"
+            )
         logger.info(
-            f"QuantBot 초기화 완료 | 거래소: {self.exchange.NAME} | 종목: {self.tickers} | 모드: {mode_str}"
+            f"QuantBot 초기화 완료 | 거래소: {self.exchange.NAME} | 종목: {self.tickers} | "
+            f"모드: {mode_str} | 시작 상태: {'정지(대기)' if self.start_paused else '가동'}"
         )
         self.notifier.send_message(init_msg)
 
@@ -342,14 +362,44 @@ class QuantBot:
         )
 
     def _setup_telegram_command_handlers(self):
-        """텔레그램 /자산, /상태 명령어 핸들러 매핑 및 Polling 스레드 가동"""
+        """텔레그램 명령어 핸들러 매핑 및 Polling 스레드 가동"""
         handlers = {
             "/자산": self.get_balance_report,
             "/balance": self.get_balance_report,
             "/상태": self.get_status_report,
-            "/status": self.get_status_report
+            "/status": self.get_status_report,
+            "/실행": self.command_resume,
+            "/start": self.command_resume,
+            "/정지": self.command_pause,
+            "/stop": self.command_pause,
         }
         self.notifier.start_polling(handlers)
+
+    def command_resume(self) -> str:
+        """텔레그램 /실행 - 매매 시작 (사용자 승인)"""
+        if not self.is_paused:
+            return "▶️ 이미 <b>가동 중</b>입니다."
+
+        self.resume()
+        mode = "실전 매매" if not self.exchange.is_simulation else "시뮬레이션"
+        return (
+            f"▶️ <b>매매를 시작합니다.</b> ({mode})\n"
+            f"• 거래소: {self.exchange.DISPLAY_NAME}\n"
+            f"• 감시 종목: {', '.join(self.tickers)}\n"
+            f"중단하려면 <b>/정지</b> 를 보내주세요."
+        )
+
+    def command_pause(self) -> str:
+        """텔레그램 /정지 - 매매 중단 (감시는 유지, 주문만 차단)"""
+        if self.is_paused:
+            return "⏸️ 이미 <b>정지 상태</b>입니다. 시작하려면 <b>/실행</b>."
+
+        self.pause()
+        return (
+            "⏸️ <b>매매를 중단했습니다.</b>\n"
+            "새로운 주문이 나가지 않습니다. 보유 포지션은 그대로 유지됩니다.\n"
+            "다시 시작하려면 <b>/실행</b> 을 보내주세요."
+        )
 
     def get_balance_report(self) -> str:
         """텔레그램 /자산 명령어 요청 시 실시간 계좌 잔고 리포트 생성"""
@@ -380,11 +430,12 @@ class QuantBot:
     def get_status_report(self) -> str:
         """텔레그램 /상태 명령어 요청 시 실시간 봇 작동 상태 리포트 생성"""
         mode_str = "실전 매매" if not self.exchange.is_simulation else "시뮬레이션 모드"
+        state = "정지 (주문 차단)" if self.is_paused else "가동 중 (24시간 무인)"
         lines = [
             f"📊 <b>[QuantBot 가동 상태 보고서]</b>",
             f"• <b>거래소</b>: {self.exchange.DISPLAY_NAME}",
             f"• <b>실행 모드</b>: <b>{mode_str}</b>",
-            f"• <b>상태</b>: 정상 가동 중 (24시간 무인)",
+            f"• <b>상태</b>: <b>{state}</b>",
             "----------------------------------"
         ]
 
@@ -474,10 +525,85 @@ class QuantBot:
         self.restore_daily_state()
         logger.info("=" * 65)
 
+    def daily_routine(self):
+        """
+        [일일 루틴] 일봉 갱신 직후 실행.
+
+        **평가 -> 반영** 순서로 처리합니다.
+        예전에는 일봉 경계 직전에 무조건 전량 청산하고 다음 날 다시 매수했는데,
+        모멘텀이 유지되는 종목까지 팔았다가 되사면서 수수료와 슬리피지만 발생했습니다.
+        이제는 먼저 새 세션의 지표를 산출한 뒤, 그 결과로 보유/청산을 결정합니다.
+        """
+        self.update_daily_settings()   # 1) 평가 (읽기 전용)
+        self.rebalance_positions()     # 2) 결과 반영 (매도/보유 결정)
+
+    def rebalance_positions(self):
+        """
+        [포지션 재조정] 평가 결과를 반영해 보유 종목을 유지할지 청산할지 결정합니다.
+
+        - 모멘텀 조건(MA 상회) 유지 -> **보유 지속**, 당일 추가 매수는 하지 않음
+        - 모멘텀 이탈 -> 시장가 청산
+
+        일시정지 상태에서는 어떤 주문도 내지 않습니다.
+        """
+        if self.pause_event.is_set():
+            logger.info("[포지션 재조정] 일시정지 상태이므로 주문을 실행하지 않습니다.")
+            return
+
+        logger.info("=" * 65)
+        logger.info(f"[포지션 재조정] 평가 결과 반영 - {self.exchange.DISPLAY_NAME}")
+
+        held, exited = [], []
+
+        for ticker in self.tickers:
+            try:
+                units = self.exchange.get_balance(ticker, use_available=True)
+                price = self.exchange.get_current_price(ticker) or 0.0
+                value = units * price
+
+                # 보유분이 최소 주문금액 미만이면 매도 자체가 불가능하므로 건너뜀
+                if units <= 0 or value < self.exchange.MIN_ORDER_KRW:
+                    continue
+
+                if self.is_above_ma.get(ticker, False):
+                    # 모멘텀 유지 -> 보유 지속. 당일 재매수를 막기 위해 체결 상태로 표시
+                    self.has_bought[ticker] = True
+                    if self.store is not None:
+                        self.store.upsert_daily_state(
+                            self.exchange.NAME, ticker, self.trade_date(), has_bought=True)
+                    held.append(f"• <b>{ticker}</b>: 보유 유지 ({value:,.0f}원, MA 상회)")
+                    logger.info(f"[{ticker}] 모멘텀 유지 -> 보유 지속 (평가 {value:,.0f}원)")
+                else:
+                    order_code = None
+                    if self.store is not None:
+                        order_code = self.store.next_order_code(
+                            self.exchange.NAME, ticker, self.trade_date())
+
+                    result = self.exchange.sell_market(ticker, order_code=order_code)
+                    if result:
+                        self._record_order(result, "sell", ticker)
+                        exited.append(f"• <b>{ticker}</b>: 청산 ({value:,.0f}원, MA 이탈)")
+                        logger.info(f"[{ticker}] 모멘텀 이탈 -> 청산 (주문코드: {order_code})")
+                    self.has_bought[ticker] = False
+
+            except Exception as e:
+                logger.error(f"[{ticker}] 포지션 재조정 예외: {e}", exc_info=True)
+
+        if held or exited:
+            lines = [f"🔄 <b>[{self.exchange.DISPLAY_NAME} 포지션 재조정]</b>"]
+            lines.extend(held + exited)
+            self.notifier.send_message("\n".join(lines))
+        else:
+            logger.info("[포지션 재조정] 재조정할 보유 포지션이 없습니다.")
+
+        logger.info("=" * 65)
+
     def liquidate_position(self):
         """
-        [청산 루틴] 매일 아침 08:59:50 실행 (일봉 갱신 직전).
-        관리 중인 모든 보유 코인을 전량 시장가 매도합니다.
+        [전량 청산] 관리 중인 모든 보유 코인을 조건 없이 전량 시장가 매도합니다.
+
+        자동 스케줄에서는 더 이상 호출하지 않으며(daily_routine이 대체),
+        수동 개입이 필요할 때만 사용합니다.
         """
         logger.info("=" * 65)
         logger.info(
@@ -506,7 +632,11 @@ class QuantBot:
         """
         [실시간 감시 루틴] 1초 간격 호출.
         실시간 시세를 확인하고, 돌파 조건 충족 시 균등 분산 매수를 집행합니다.
+        정지 상태에서는 어떤 주문도 내지 않습니다.
         """
+        if self.pause_event.is_set():
+            return
+
         for ticker in self.tickers:
             try:
                 target_price = self.target_prices.get(ticker, 0.0)
@@ -593,6 +723,11 @@ class QuantBot:
         """
         logger.info("=" * 70)
         logger.info(f"QuantBot ({self.exchange.DISPLAY_NAME} 자동매매) 가동 | 대상: {self.tickers}")
+        if self.is_paused:
+            logger.warning(
+                "⏸️ 정지 상태로 시작합니다. 텔레그램 /실행 또는 트레이 메뉴로 시작하기 전까지 "
+                "주문이 나가지 않습니다."
+            )
         logger.info("=" * 70)
 
         # 1. 거래소 주문 이력과 로컬 DB 대사 (DB에 없는 주문을 먼저 반영)
@@ -602,10 +737,11 @@ class QuantBot:
         self.update_daily_settings()
 
         # 3. 스케줄러 등록
+        #    일봉 갱신 직후 '평가 -> 포지션 재조정' 순서로 한 번에 처리합니다.
+        #    (무조건 청산 후 재매수하던 방식을 대체)
         liquidate_time, settings_time, is_auto = self.resolve_schedule()
 
-        schedule.every().day.at(settings_time).do(self.update_daily_settings)
-        schedule.every().day.at(liquidate_time).do(self.liquidate_position)
+        schedule.every().day.at(settings_time).do(self.daily_routine)
 
         source = "자동 유도" if is_auto else "config.json 지정"
         logger.info(

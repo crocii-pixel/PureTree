@@ -80,6 +80,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "use_dynamic_k": True,
     "fixed_k": 0.5,
     "force_simulation": False,
+    # 기동 시 정지 상태로 대기. 텔레그램 /실행 또는 트레이 메뉴로 승인해야 주문이 나갑니다.
+    "start_paused": True,
     # 비워두면 거래소의 일봉 갱신 시각에서 자동 유도합니다.
     # (빗썸 23:59:50/00:00:05, 업비트/코인원 08:59:50/09:00:05)
     # 특정 시각을 강제하려면 liquidate_time / settings_time을 직접 지정하세요.
