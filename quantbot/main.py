@@ -24,13 +24,22 @@ logger = logging.getLogger("QuantBot")
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 
 
-def setup_logging() -> Optional[str]:
+# 로그 회전 주기 -> (TimedRotatingFileHandler 인자, 파일명 접미사, 보관 개수)
+LOG_ROTATIONS: Dict[str, Tuple[str, str, int]] = {
+    "daily": ("midnight", "%Y-%m-%d", 60),     # 60일
+    "weekly": ("W0", "%Y-W%W", 52),            # 1년 (월요일 회전)
+    "monthly": ("midnight", "%Y-%m", 24),      # 2년
+}
+
+
+def setup_logging(config: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """
     콘솔 + 파일 로깅을 구성합니다.
 
     `--windowed`로 빌드한 .exe는 sys.stderr가 None이라 기본 StreamHandler가 동작하지 않습니다.
     이 경우 로그를 볼 방법이 없어지므로 실행파일 옆 `logs/quantbot.log`에 항상 기록합니다.
 
+    :param config: config.json 설정 (log_rotation 항목으로 회전 주기 지정)
     :return: 로그 파일 경로 (생성 실패 시 None)
     """
     root = logging.getLogger()
@@ -42,17 +51,23 @@ def setup_logging() -> Optional[str]:
             if isinstance(handler, logging.StreamHandler):
                 root.removeHandler(handler)
 
+    rotation = str((config or {}).get("log_rotation", "monthly")).lower()
+    when, suffix, backups = LOG_ROTATIONS.get(rotation, LOG_ROTATIONS["monthly"])
+
     try:
         from logging.handlers import TimedRotatingFileHandler
 
         config_manager.ensure_data_dir()
         log_path = config_manager.LOG_DIR / "quantbot.log"
 
-        # 자정마다 회전하며 지난 파일은 quantbot-2026-08-20.log 형태로 보관 (30일치)
+        # 지난 로그는 quantbot-2026-08.log 형태로 보관
         file_handler = TimedRotatingFileHandler(
-            log_path, when="midnight", interval=1, backupCount=30, encoding="utf-8"
+            log_path, when=when, interval=1, backupCount=backups, encoding="utf-8"
         )
-        file_handler.suffix = "%Y-%m-%d"
+        file_handler.suffix = suffix
+
+        # 월별은 TimedRotatingFileHandler가 직접 지원하지 않아 자정 회전 + 접미사로 처리.
+        # 같은 달에는 파일명이 같으므로 회전이 일어나도 같은 파일에 계속 누적됩니다.
         file_handler.namer = lambda name: str(
             config_manager.LOG_DIR / f"quantbot-{Path(name).name.rsplit('.', 1)[-1]}.log"
         )
@@ -126,7 +141,13 @@ class QuantBot:
         self.use_dynamic_k: bool = bool(self.config.get("use_dynamic_k", True))
         self.k: Optional[float] = None if self.use_dynamic_k else float(self.config.get("fixed_k", 0.5))
 
-        self.notifier = notifier or TelegramNotifier()
+        # 인스턴스를 여러 개 띄울 때 같은 봇 토큰으로 폴링하면 명령이 뒤섞이므로,
+        # 설정으로 인스턴스별 텔레그램 사용 여부를 제어합니다.
+        if notifier is not None:
+            self.notifier = notifier
+        else:
+            self.notifier = TelegramNotifier(
+                enabled=bool(self.config.get("telegram_enabled", True)))
 
         # 거래소 어댑터 동적 로딩 (config.json -> importlib)
         self.exchange: ExchangeBase = exchange or create_exchange(
@@ -952,19 +973,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     setup_console_encoding()
     args = parse_args(argv)
 
-    log_path = setup_logging()
+    # 로그 회전 주기가 설정에 있으므로 설정을 먼저 읽습니다.
+    config = config_manager.load_config(args.config_path)
+
+    log_path = setup_logging(config)
     if log_path:
         logger.info(f"로그 파일: {log_path}")
+    logger.info(f"데이터 폴더: {config_manager.DATA_DIR}")
+    logger.info(f"API 키(.env): {config_manager.ENV_PATH}")
 
-    # .exe로 실행될 경우를 대비해 실행파일 위치의 .env를 명시적으로 로딩합니다.
     config_manager.load_env_file()
 
     if args.config:
         from config_gui import run_config_gui
         run_config_gui()
         return 0
-
-    config = config_manager.load_config(args.config_path)
     if args.exchange:
         config["exchange"] = args.exchange.strip().lower()
         logger.info(f"[CLI 오버라이드] 거래소를 '{config['exchange']}'(으)로 지정합니다.")

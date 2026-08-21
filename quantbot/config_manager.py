@@ -41,25 +41,45 @@ def _data_dir() -> Path:
     """
     실행 기록(SQLite DB, 로그) 저장 디렉토리.
 
-    config.json/.env과 달리 봇이 계속 쓰는 파일이므로 **동기화 폴더 밖**에 둡니다.
-    프로젝트가 OneDrive 안에 있으면 동기화 클라이언트가 파일을 잠그거나
-    충돌 사본을 만들어 SQLite DB가 손상될 수 있기 때문입니다.
+    **실행파일과 같은 폴더**를 씁니다. 폴더를 나누는 것만으로 인스턴스가 분리되어,
+    서로 다른 설정(예: 균등 사이징 vs ATR 사이징)을 동시에 돌려 비교할 수 있습니다.
 
-    우선순위: 환경변수 QUANTBOT_DATA_DIR > %LOCALAPPDATA%/QuantBot > ~/.quantbot
+    환경변수 QUANTBOT_DATA_DIR로 다른 위치를 지정할 수 있습니다.
     """
     override = os.getenv("QUANTBOT_DATA_DIR")
     if override:
         return Path(override).expanduser()
+    return _base_dir()
 
-    local_appdata = os.getenv("LOCALAPPDATA")
-    if local_appdata:
-        return Path(local_appdata) / "QuantBot"
-    return Path.home() / ".quantbot"
+
+def _env_path() -> Path:
+    """
+    API Key(.env) 위치.
+
+    **실행파일의 상위 폴더**에 둡니다. 인스턴스 폴더를 여러 개 만들어도
+    키는 한 곳에서 공유되므로, 설정을 바꿀 때마다 키를 다시 넣을 필요가 없습니다.
+
+        상위폴더/
+        ├── .env              <- 공유 API 키
+        ├── 인스턴스A/QuantBot.exe, config.json, logs/
+        └── 인스턴스B/QuantBot.exe, config.json, logs/
+
+    상위 폴더에 없으면 실행파일 폴더도 확인합니다(구버전 호환).
+    """
+    base = _base_dir()
+    parent_env = base.parent / ".env"
+    if parent_env.exists():
+        return parent_env
+
+    local_env = base / ".env"
+    if local_env.exists():
+        return local_env
+    return parent_env          # 신규 생성 시에도 상위 폴더 기준
 
 
 BASE_DIR = _base_dir()
 CONFIG_PATH = BASE_DIR / "config.json"
-ENV_PATH = BASE_DIR / ".env"
+ENV_PATH = _env_path()
 
 DATA_DIR = _data_dir()
 DB_PATH = DATA_DIR / "quantbot.db"
@@ -91,6 +111,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "btc_regime_filter": False,
     "btc_decline_threshold": -0.05,
     "force_simulation": False,
+
+    # 로그 파일 회전 주기: "monthly" | "weekly" | "daily"
+    # 가동 중 로그량이 적어(하루 50~100줄) 월별이면 파일 하나가 300KB 수준입니다.
+    "log_rotation": "monthly",
+
+    # 인스턴스를 여러 개 띄울 때, 텔레그램은 한 곳에서만 켜야 합니다.
+    # 같은 봇 토큰으로 여러 인스턴스가 폴링하면 명령이 뒤섞이고 응답이 중복됩니다.
+    "telegram_enabled": True,
+
     # 기동 시 정지 상태로 대기. 텔레그램 /실행 또는 트레이 메뉴로 승인해야 주문이 나갑니다.
     "start_paused": True,
     # 비워두면 거래소의 일봉 갱신 시각에서 자동 유도합니다.

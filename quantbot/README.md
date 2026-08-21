@@ -45,8 +45,9 @@ base/                            # (상위) C++ PureTree 프로젝트 - 봇과 �
     ├── tests/                   # pytest 단위 테스트
     ├── build.bat                # PyInstaller 빌드
     │
-    ├── .env                     # API Key (git 추적 제외)
     ├── config.json              # 거래소/종목/전략 설정 (git 추적 제외)
+    ├── quantbot.db              # 매매 이력 (git 추적 제외)
+    ├── logs/                    # 실행 로그 (git 추적 제외)
     └── requirements.txt
 ```
 
@@ -69,6 +70,7 @@ python main.py --config
 ```
 거래소를 선택하면 API Key 입력란과 `.env` 저장 키값이 자동으로 바뀝니다.
 CLI로 설정하려면 `.env.example`을 `.env`로 복사해 직접 입력해도 됩니다.
+**`.env`는 실행 폴더의 상위 폴더에 둡니다** (아래 "데이터 저장 위치" 참고).
 
 | 거래소 | `.env` 키값 |
 |---|---|
@@ -112,7 +114,7 @@ build.bat
 
 | 옵션 | 설명 |
 |---|---|
-| `build.bat` | **트레이 GUI 빌드 (기본)** — 콘솔 창 없음, 로그는 `%LOCALAPPDATA%\QuantBot\logs\` |
+| `build.bat` | **트레이 GUI 빌드 (기본)** — 콘솔 창 없음, 로그는 `exe폴더\logs\` |
 | `build.bat --clean` | `build/`, `dist/`, `*.spec` 정리 후 빌드 |
 | `build.bat --console` | 콘솔 창을 띄우는 디버그 빌드 |
 
@@ -124,9 +126,10 @@ dist\QuantBot.exe --test --dry-run
 ```
 
 > [!IMPORTANT]
-> **`.env`는 보안상 exe에 포함되지 않습니다.** 빌드 후 `.env`를 `dist\` 폴더에 복사하거나,
-> `dist\QuantBot.exe --config`로 설정 창을 열어 키를 입력하세요.
-> `config.json`과 `.env`는 **exe와 같은 폴더**에서 읽고 씁니다.
+> **`.env`는 보안상 exe에 포함되지 않습니다.** `.env.example`이 빌드 시 `dist\`에
+> 복사되므로, 이를 참고해 `.env`를 만들어 **exe 폴더의 상위 폴더**에 두세요.
+> 또는 `QuantBot.exe --config`로 설정 창을 열어 입력하면 자동 저장됩니다.
+> `config.json`·`quantbot.db`·`logs/`는 exe와 같은 폴더에 생성됩니다.
 
 > [!NOTE]
 > 빌드 로직은 `tools/build_exe.py`에 있고 `build.bat`은 이를 호출하는 ASCII 전용 런처입니다.
@@ -203,23 +206,43 @@ dist\QuantBot.exe --test --dry-run
 
 직접 지정한 값이 거래소의 일봉 경계와 어긋나면 기동 로그에 경고가 출력됩니다.
 
-## 💾 매매 이력 저장 (재시작 안전장치)
+## 💾 데이터 저장 위치 · 인스턴스 분리
 
 봇은 체결 이력과 당일 상태를 SQLite에 남깁니다. 장중에 재시작되어도 **이미 매수한 종목을
 그날 다시 사지 않습니다.**
 
+파일은 **실행파일과 같은 폴더**에 생기고, **API 키만 상위 폴더**에 둡니다.
+
 ```
-%LOCALAPPDATA%\QuantBot\
-├── quantbot.db                   # trades / daily_state / equity_snapshot / signals
-└── logs\
-    ├── quantbot.log              # 오늘 로그
-    └── quantbot-2026-08-20.log   # 자정마다 회전 (30일 보관)
+QuantBot/
+├── .env                      # API 키 (모든 인스턴스 공유, git 추적 제외)
+├── 실전/
+│   ├── QuantBot.exe
+│   ├── .env.example
+│   ├── config.json           # 이 인스턴스의 설정
+│   ├── quantbot.db           # 이 인스턴스의 매매 이력
+│   └── logs/quantbot.log
+└── 검증/
+    ├── QuantBot.exe
+    ├── config.json           # 다른 설정 (예: 시뮬레이션)
+    ├── quantbot.db
+    └── logs/
 ```
 
-> [!NOTE]
-> DB와 로그를 프로젝트 폴더가 아닌 `%LOCALAPPDATA%`에 두는 이유는, 이 저장소가 OneDrive
-> 동기화 폴더 안에 있기 때문입니다. 동기화 클라이언트가 파일을 잠그거나 충돌 사본을 만들면
-> SQLite DB가 손상될 수 있습니다. `QUANTBOT_DATA_DIR` 환경변수로 위치를 바꿀 수 있습니다.
+**폴더를 나누는 것만으로 인스턴스가 분리됩니다.** 서로 다른 설정을 동시에 돌려 비교할 수
+있고, API 키는 상위 폴더에서 공유하므로 한 번만 입력하면 됩니다.
+`QUANTBOT_DATA_DIR` 환경변수로 데이터 위치를 따로 지정할 수도 있습니다.
+
+> [!WARNING]
+> 인스턴스를 여러 개 띄울 때 지켜야 할 두 가지입니다.
+> 1. **텔레그램은 한 곳에서만** 켜세요. 같은 봇 토큰으로 여러 개가 폴링하면 명령이
+>    뒤섞이고 응답이 중복됩니다. 나머지는 `"telegram_enabled": false`.
+> 2. **실전 매매는 한 계좌에 한 인스턴스만.** 같은 API 키로 두 봇이 돌면 서로 잔고를
+>    뺏고 주문이 충돌합니다. 비교는 `"force_simulation": true`로 하세요.
+
+**로그 회전**: `"log_rotation"` 설정으로 `monthly`(기본) / `weekly` / `daily` 중 선택.
+가동 중 로그량이 하루 50~100줄 수준이라 월별이면 파일 하나가 300KB 정도입니다.
+지난 로그는 `quantbot-2026-08.log` 형태로 보관됩니다.
 
 **주문 코드**: 모든 주문에 `QB-20260821-BTC-01` 형태의 코드가 붙어 텔레그램·로그·DB에서
 동일하게 추적됩니다. 코인원은 이 코드를 `user_order_id`로 거래소에도 전달합니다.

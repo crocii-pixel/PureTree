@@ -1332,11 +1332,45 @@ class TestRestartRecovery:
         bot.reconcile_with_exchange()      # DummyExchange는 기본 None 반환
         assert bot.store.get_trades() == []
 
-    def test_data_dir_is_outside_sync_folder(self):
-        """DB/로그는 OneDrive 동기화 폴더 밖에 있어야 손상 위험이 없음"""
-        assert "OneDrive" not in str(config_manager.DATA_DIR)
+    def test_data_dir_follows_executable_folder(self):
+        """
+        DB/로그는 실행파일과 같은 폴더에 둔다.
+        폴더를 나누는 것만으로 인스턴스가 분리되어 서로 다른 설정을 동시에 돌릴 수 있다.
+        """
+        assert config_manager.DATA_DIR == config_manager.BASE_DIR
         assert config_manager.DB_PATH.parent == config_manager.DATA_DIR
         assert config_manager.LOG_DIR.parent == config_manager.DATA_DIR
+        assert config_manager.CONFIG_PATH.parent == config_manager.BASE_DIR
+
+    def test_env_lives_in_parent_folder(self):
+        """API 키는 상위 폴더에 두어 여러 인스턴스가 공유한다"""
+        parent_env = config_manager.BASE_DIR.parent / ".env"
+        local_env = config_manager.BASE_DIR / ".env"
+        # 상위 폴더 우선, 없으면 실행파일 폴더 (구버전 호환)
+        assert config_manager.ENV_PATH in (parent_env, local_env)
+
+    def test_log_rotation_options(self):
+        from main import LOG_ROTATIONS
+
+        assert set(LOG_ROTATIONS) == {"daily", "weekly", "monthly"}
+        assert config_manager.DEFAULT_CONFIG["log_rotation"] == "monthly"
+        for when, suffix, backups in LOG_ROTATIONS.values():
+            assert backups > 0 and suffix.startswith("%Y")
+
+    def test_telegram_can_be_disabled_per_instance(self, tmp_path):
+        """인스턴스를 여러 개 띄울 때 텔레그램은 한 곳에서만 켜야 명령이 안 뒤섞인다"""
+        from main import QuantBot
+        from trade_store import TradeStore
+
+        exchange = DummyExchange(api_key="k", secret_key="s")
+        config = {
+            "exchange": "dummy", "tickers": ["BTC"], "ma_window": 10,
+            "force_simulation": True, "start_paused": True,
+            "telegram_enabled": False, "schedule": {},
+        }
+        bot = QuantBot(config=config, exchange=exchange,
+                       store=TradeStore(tmp_path / "t.db"))
+        assert bot.notifier.is_enabled is False
 
 
 # ======================================================================

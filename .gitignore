@@ -11,6 +11,11 @@ _CProps/
 .env
 apiKey.txt
 config.json
+
+# Runtime data (DB는 이제 실행파일 폴더에 생성됨)
+*.db
+*.db-wal
+*.db-shm
 __pycache__/
 *.pyc
 .pytest_cache/

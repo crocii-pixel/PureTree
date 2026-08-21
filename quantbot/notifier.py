@@ -18,11 +18,22 @@ class TelegramNotifier:
     텔레그램 메신저 알림 발송 및 대화형 명령어(/자산, /status) 수신 백그라운드 스레드 모듈.
     """
 
-    def __init__(self, bot_token: Optional[str] = None, chat_id: Optional[str] = None):
+    def __init__(self, bot_token: Optional[str] = None, chat_id: Optional[str] = None,
+                 enabled: bool = True):
+        """
+        :param enabled: False면 토큰이 있어도 알림/명령 수신을 사용하지 않습니다.
+            인스턴스를 여러 개 띄울 때 같은 봇 토큰으로 폴링하면 명령이 뒤섞이므로,
+            한 인스턴스에서만 켜기 위한 스위치입니다.
+        """
         load_dotenv()
         self.bot_token = bot_token or os.getenv("TELEGRAM_BOT_TOKEN")
         self.chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID")
         self.is_enabled = True
+
+        if not enabled:
+            logger.info("텔레그램이 설정으로 비활성화되었습니다. (telegram_enabled=false)")
+            self.is_enabled = False
+            return
 
         self.is_polling = False
         self.polling_thread: Optional[threading.Thread] = None

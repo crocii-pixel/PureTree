@@ -174,13 +174,12 @@ def main(argv: List[str] | None = None) -> int:
     size_mb = exe_path.stat().st_size / (1024 * 1024)
     _print(f"  - {exe_path}  ({size_mb:,.1f} MB)")
     _print("\n빌드 완료!")
-    _print("  1) .env 파일을 dist 폴더에 복사하세요. (보안상 exe에 포함하지 않습니다)")
-    _print(f"  2) 트레이 실행: dist\\{APP_NAME}.exe   (더블클릭 - 트레이 아이콘 상주)")
-    _print(f"  3) 설정 창    : dist\\{APP_NAME}.exe --config")
-    _print(f"  4) 연동 검증  : dist\\{APP_NAME}.exe --test --dry-run")
-    if windowed:
-        _print("  * 콘솔이 없는 빌드이므로 로그는 %LOCALAPPDATA%\\QuantBot\\logs\\ 에 날짜별로 기록됩니다.")
-        _print("  * 매매 이력 DB: %LOCALAPPDATA%\\QuantBot\\quantbot.db")
+    _print("  1) .env 파일은 **exe 폴더의 상위 폴더**에 두세요.")
+    _print("     (인스턴스 폴더를 여러 개 만들어도 키를 한 곳에서 공유합니다)")
+    _print(f"  2) 트레이 실행: {APP_NAME}.exe   (더블클릭 - 트레이 아이콘 상주)")
+    _print(f"  3) 설정 창    : {APP_NAME}.exe --config")
+    _print(f"  4) 연동 검증  : {APP_NAME}.exe --test --dry-run")
+    _print("  * DB와 로그는 exe와 같은 폴더에 생성됩니다 (quantbot.db, logs/)")
     _print("=" * 70)
     return 0
 
