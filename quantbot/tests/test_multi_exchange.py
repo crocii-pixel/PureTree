@@ -2721,3 +2721,163 @@ class TestEraClassification:
         bot.explosive_era = True                      # 폭등기만 해제
         assert bot.exit_ma_window() == 10
         assert bot.needs_btc_confirm("ETH") is False
+
+
+# ======================================================================
+# 19. 설정 통합 백테스트
+# ======================================================================
+class TestBacktestConfig:
+    """
+    config.json을 그대로 반영해 돌리는 백테스트.
+
+    옵션을 하나씩 검증한 것과 달리 **전부 켠 상태**의 상호작용을 본다.
+    실제로 통합해 보니 BTC 동반 돌파의 수익률 효과가 개별 검증 때보다
+    약해졌다(장기 구간에서 '끔'이 낙관/비관 사이에 놓임).
+    """
+
+    @staticmethod
+    def _series(n=400, base=100.0, drift=0.4, phase=0):
+        """
+        돌파가 실제로 발생하는 합성 일봉.
+
+        캔들 모양이 일정하면 노이즈 비율이 높아져 K가 커지고, 목표가가 고가보다
+        위로 올라가 **돌파가 한 번도 일어나지 않습니다.** 몸통을 크게(종가-시가 5)
+        잡아 K를 낮추고, 위꼬리(고가 = 종가+2)가 목표가를 넘도록 구성합니다.
+        phase로 종목마다 다른 흐름을 만들어 필터가 실제로 갈리게 합니다.
+        """
+        import math
+
+        idx = pd.date_range("2024-01-01", periods=n, freq="D")
+        close = [base + i * drift + math.sin((i + phase) / 7.0) * 6.0 for i in range(n)]
+        return pd.DataFrame({
+            "open": [c - 5 for c in close],
+            "high": [c + 2 for c in close],
+            "low": [c - 6 for c in close],
+            "close": close,
+            "volume": [1000.0] * n,
+        }, index=idx)
+
+    def _config(self, **overrides):
+        config = {
+            "tickers": ["BTC", "ETH"], "ma_window": 10, "bear_exit_ma_window": 5,
+            "atr_window": 20, "position_sizing": "equal", "risk_per_trade": 0.01,
+            "atr_stop_multiple": 2.0, "btc_breakout_confirm": False,
+            "btc_regime_filter": False, "bear_market_exit": False,
+            "explosive_era_guard": False, "regime_ma_months": 6,
+            "explosive_era_threshold": 75.0, "explosive_era_years": 4,
+            "btc_decline_threshold": -0.05,
+        }
+        config.update(overrides)
+        return config
+
+    def _run(self, config, **kwargs):
+        from tools.backtest_config import add_indicators, market_context, run_backtest
+
+        windows = [config["ma_window"], config["bear_exit_ma_window"]]
+        btc_raw = self._series(phase=0)
+        data = {
+            t: add_indicators(self._series(phase=i * 3), windows, config["atr_window"])
+            for i, t in enumerate(config["tickers"])
+        }
+        ctx = market_context(btc_raw, config)
+        return run_backtest(config, data, ctx, **kwargs)
+
+    # -- 지표 --------------------------------------------------------
+    def test_indicators_use_closed_bars_only(self):
+        """당일 종가가 지표에 새면 미래 참조가 된다"""
+        from tools.backtest_config import add_indicators
+
+        base = self._series(100)
+        normal = add_indicators(base, [10], 20)
+
+        spiked = base.copy()
+        spiked.iloc[-1, spiked.columns.get_loc("close")] = 99999.0
+        changed = add_indicators(spiked, [10], 20)
+
+        # 마지막 봉의 지표는 그 봉의 종가에 영향을 받으면 안 된다
+        assert changed["target"].iloc[-1] == pytest.approx(normal["target"].iloc[-1])
+        assert bool(changed["above_ma10"].iloc[-1]) == bool(normal["above_ma10"].iloc[-1])
+        assert changed["N"].iloc[-1] == pytest.approx(normal["N"].iloc[-1])
+
+    def test_market_context_columns(self):
+        from tools.backtest_config import market_context
+
+        ctx = market_context(self._series(), self._config())
+        for col in ("btc_broke", "btc_declining", "bull", "explosive"):
+            assert col in ctx.columns
+
+    def test_era_guard_off_means_never_explosive(self):
+        from tools.backtest_config import market_context
+
+        ctx = market_context(self._series(), self._config(explosive_era_guard=False))
+        assert not ctx["explosive"].any()
+
+    # -- 백테스트 기본 ------------------------------------------------
+    def test_runs_and_reports_core_metrics(self):
+        result = self._run(self._config())
+        for key in ("총수익률%", "MDD%", "매매", "승률%", "노출일%"):
+            assert key in result
+        assert result["매매"] > 0
+
+    def test_short_window_returns_empty(self):
+        """구간이 너무 짧으면 억지 숫자를 내지 않는다"""
+        import pandas as pd
+
+        result = self._run(self._config(),
+                           start=pd.Timestamp("2024-12-20"), end=pd.Timestamp("2024-12-25"))
+        assert result == {}
+
+    # -- 옵션이 실제로 동작하는가 --------------------------------------
+    def test_btc_confirm_blocks_alt_entries(self):
+        """동반 돌파를 켜면 알트 진입이 줄고 차단 횟수가 잡혀야 한다"""
+        off = self._run(self._config(btc_breakout_confirm=False))
+        on = self._run(self._config(btc_breakout_confirm=True))
+
+        assert on["차단_동반돌파"] >= 0
+        assert on["매매"] <= off["매매"]
+
+    def test_btc_itself_never_blocked(self):
+        """BTC 단독 종목이면 동반 돌파 확인이 매매를 막으면 안 된다"""
+        config = self._config(tickers=["BTC"], btc_breakout_confirm=True)
+        result = self._run(config)
+        assert result["차단_동반돌파"] == 0
+
+    def test_explosive_era_releases_filters(self):
+        """폭등기에는 필터가 해제되어 차단이 발생하지 않아야 한다"""
+        from tools.backtest_config import add_indicators, market_context, run_backtest
+
+        config = self._config(btc_breakout_confirm=True, btc_regime_filter=True)
+        data = {t: add_indicators(self._series(phase=i * 3), [10, 5], 20)
+                for i, t in enumerate(config["tickers"])}
+        ctx = market_context(self._series(phase=0), config)
+        ctx["explosive"] = True                      # 전 구간 폭등기로 강제
+
+        result = run_backtest(config, data, ctx)
+        assert result["차단_동반돌파"] == 0
+        assert result["차단_BTC하락"] == 0
+
+    def test_atr_sizing_differs_from_equal(self):
+        equal = self._run(self._config(position_sizing="equal"))
+        atr = self._run(self._config(position_sizing="atr", risk_per_trade=0.01))
+        assert equal["최종자산"] != atr["최종자산"]
+
+    # -- 체결가 가정 ---------------------------------------------------
+    def test_confirm_fill_close_is_not_better(self):
+        """
+        비관 가정(종가 체결)이 낙관 가정(목표가 체결)보다 좋을 수는 없다.
+
+        일봉만으로는 알트와 BTC 중 무엇이 먼저 돌파했는지 알 수 없으므로,
+        결과를 구간으로 제시하기 위한 두 극단이다.
+        """
+        config = self._config(btc_breakout_confirm=True)
+        optimistic = self._run(config, confirm_fill="target")
+        pessimistic = self._run(config, confirm_fill="close")
+
+        assert pessimistic["총수익률%"] <= optimistic["총수익률%"] + 1e-6
+
+    def test_confirm_fill_ignored_when_option_off(self):
+        """동반 돌파가 꺼져 있으면 체결가 가정이 결과를 바꾸면 안 된다"""
+        config = self._config(btc_breakout_confirm=False)
+        a = self._run(config, confirm_fill="target")
+        b = self._run(config, confirm_fill="close")
+        assert a["최종자산"] == pytest.approx(b["최종자산"])

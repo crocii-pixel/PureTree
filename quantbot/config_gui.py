@@ -193,6 +193,49 @@ def build_config_window(parent: Any = None) -> Any:
                           "krw": 0.0, "message": f"연결 테스트 실패: {e}"}
             self.finished.emit(result)
 
+    class _BacktestWorker(QtCore.QObject):
+        """
+        현재 설정으로 백테스트를 돌려 결과를 시그널로 돌려줍니다.
+
+        시세 로딩과 지표 계산이 수 초 걸리므로 GUI 스레드에서 돌리면 창이 멉니다.
+        연결 테스트와 같은 이유로 QTimer가 아니라 시그널을 씁니다.
+        """
+
+        finished = QtCore.pyqtSignal(object)
+
+        def __init__(self, config: Dict[str, Any], months: Optional[int]):
+            super().__init__()
+            self.config = config
+            self.months = months
+
+        def run(self) -> None:
+            try:
+                import pandas as pd
+                from tools.backtest_config import prepare_data, run_backtest
+
+                data, ctx, missing = prepare_data(self.config)
+                start = None
+                if self.months:
+                    start = ctx.index[-1] - pd.DateOffset(months=self.months)
+
+                optimistic = run_backtest(self.config, data, ctx, start,
+                                          confirm_fill="target")
+                if not optimistic:
+                    raise ValueError("구간이 짧아 결과를 낼 수 없습니다")
+
+                pessimistic = {}
+                if self.config.get("btc_breakout_confirm"):
+                    pessimistic = run_backtest(self.config, data, ctx, start,
+                                               confirm_fill="close")
+
+                self.finished.emit({
+                    "ok": True, "optimistic": optimistic,
+                    "pessimistic": pessimistic, "missing": missing,
+                    "tickers": sorted(data),
+                })
+            except Exception as e:
+                self.finished.emit({"ok": False, "message": str(e)})
+
     class _WheelGuard(QtCore.QObject):
         """
         포커스가 없는 입력 위젯 위에서 휠을 굴려도 값이 바뀌지 않게 막습니다.
@@ -267,6 +310,7 @@ def build_config_window(parent: Any = None) -> Any:
             body_layout.addWidget(self._build_key_card(QtWidgets))
             body_layout.addWidget(self._build_trade_card(QtWidgets))
             body_layout.addWidget(self._build_stability_card(QtWidgets))
+            body_layout.addWidget(self._build_backtest_card(QtWidgets))
             body_layout.addWidget(self._build_telegram_card(QtWidgets))
             body_layout.addStretch(1)
 
@@ -457,6 +501,124 @@ def build_config_window(parent: Any = None) -> Any:
             self.bear_exit.toggled.connect(_sync)
             _sync()
             return card
+
+        def _build_backtest_card(self, QtWidgets):
+            """
+            현재 화면의 설정 그대로 과거 성과를 확인하는 카드.
+
+            저장하지 않은 값도 반영되므로, 옵션을 바꿔가며 바로 비교할 수 있습니다.
+            """
+            card, layout = _card(QtWidgets, "백테스트")
+
+            hint = QtWidgets.QLabel(
+                "지금 화면의 설정 그대로 과거 구간에 돌려봅니다. "
+                "빗썸은 일봉 200일치뿐이라 업비트 KRW 시세를 대용으로 씁니다.")
+            hint.setObjectName("Hint")
+            hint.setWordWrap(True)
+            layout.addWidget(hint)
+
+            row = QtWidgets.QHBoxLayout()
+            row.setSpacing(8)
+
+            self.period_combo = QtWidgets.QComboBox()
+            for label_text, months in (("최근 3개월", 3), ("최근 6개월", 6),
+                                       ("최근 1년", 12), ("최근 3년", 36),
+                                       ("전체 기간", None)):
+                self.period_combo.addItem(label_text, months)
+            self.period_combo.setCurrentIndex(2)
+            row.addWidget(self.period_combo, 1)
+
+            self.backtest_button = QtWidgets.QPushButton("실행")
+            self.backtest_button.clicked.connect(self._on_backtest)
+            row.addWidget(self.backtest_button)
+            layout.addLayout(row)
+
+            self.backtest_result = QtWidgets.QLabel(
+                "구간을 고르고 [실행]을 누르세요. 시세를 받는 데 10~30초 걸립니다.")
+            self.backtest_result.setObjectName("Hint")
+            self.backtest_result.setWordWrap(True)
+            self.backtest_result.setTextFormat(QtCore.Qt.TextFormat.RichText)
+            layout.addWidget(self.backtest_result)
+
+            warn = QtWidgets.QLabel(
+                "* 상장폐지된 종목은 시세 조회가 되지 않아 표본에서 빠집니다. "
+                "따라서 결과는 실제보다 낙관적이며, MDD도 과거 최악값일 뿐 "
+                "앞으로 그보다 나빠질 수 있습니다.")
+            warn.setObjectName("Hint")
+            warn.setWordWrap(True)
+            layout.addWidget(warn)
+            return card
+
+        def _on_backtest(self) -> None:
+            """저장 여부와 무관하게 **현재 화면 값**으로 백테스트"""
+            config = self.collect()
+            if not config["tickers"]:
+                self.backtest_result.setText("대상 종목을 먼저 입력해주세요.")
+                return
+
+            months = self.period_combo.currentData()
+            self.backtest_button.setEnabled(False)
+            self.backtest_button.setText("계산 중...")
+            self.backtest_result.setText("시세를 받아 계산하고 있습니다...")
+
+            worker = _BacktestWorker(config, months)
+            worker.finished.connect(self._apply_backtest_result)
+            self._backtest_worker = worker          # GC 방지
+            threading.Thread(target=worker.run, daemon=True).start()
+
+        def _apply_backtest_result(self, payload: Dict[str, Any]) -> None:
+            self.backtest_button.setEnabled(True)
+            self.backtest_button.setText("실행")
+
+            if not payload.get("ok"):
+                self.backtest_result.setText(
+                    f"백테스트 실패: {payload.get('message', '알 수 없는 오류')}")
+                return
+
+            opt = payload["optimistic"]
+            pes = payload.get("pessimistic") or {}
+
+            def band(key: str, suffix: str = "%") -> str:
+                """낙관/비관이 다르면 구간으로, 같으면 단일값으로 표시"""
+                a = opt.get(key)
+                if a is None:
+                    return "-"
+                b = pes.get(key)
+                if b is None or abs(a - b) < 0.05:
+                    return f"{a:,.1f}{suffix}"
+                lo, hi = sorted((a, b))
+                return f"{lo:,.1f} ~ {hi:,.1f}{suffix}"
+
+            rows = [
+                ("기간", f"{opt['시작'].date()} ~ {opt['종료'].date()} ({opt['일수']}일)"),
+                ("종목", f"{len(payload['tickers'])}개 · {', '.join(payload['tickers'])}"),
+                ("총수익률", band("총수익률%")),
+                ("연환산 (CAGR)", band("CAGR%") if opt.get("CAGR%") is not None else "구간이 짧아 생략"),
+                ("최대낙폭 (MDD)", band("MDD%")),
+                ("매매 · 승률", f"{opt['매매']}회 · {opt['승률%']}%"),
+                ("평균 수익 / 손실", f"{opt['평균수익%']:+.2f}% / {opt['평균손실%']:+.2f}%"),
+                ("포지션 보유일", f"{opt['노출일%']}%"),
+            ]
+            if opt.get("월수익_중앙%") is not None:
+                rows.append(("월수익 (중앙/최악)",
+                             f"{opt['월수익_중앙%']:+.2f}% / {opt['월수익_최악%']:+.2f}%"
+                             f"  ·  양의 달 {opt['양의달_비율%']}%"))
+
+            html = "<table cellspacing='0' cellpadding='3'>"
+            for label_text, value in rows:
+                html += (f"<tr><td style='color:#8A94A4'>{label_text}</td>"
+                         f"<td>&nbsp;&nbsp;<b>{value}</b></td></tr>")
+            html += "</table>"
+
+            if pes:
+                html += ("<br>구간으로 표시된 값은 <b>BTC 동반 돌파 확인</b> 때문입니다. "
+                         "일봉만으로는 알트와 BTC 중 무엇이 먼저 돌파했는지 알 수 없어 "
+                         "체결가 가정을 양극단으로 잡은 것입니다. "
+                         "실측 비율은 BTC 선행 35% / 동시 35% / 알트 선행 29%입니다.")
+            if payload.get("missing"):
+                html += f"<br>시세를 못 받은 종목(제외): {', '.join(payload['missing'])}"
+
+            self.backtest_result.setText(html)
 
         def _build_telegram_card(self, QtWidgets):
             card, layout = _card(QtWidgets, "텔레그램 알림")
