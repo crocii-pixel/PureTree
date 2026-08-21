@@ -255,6 +255,84 @@ class QuantBot:
         self.notifier.send_message(init_msg)
 
         self._setup_telegram_command_handlers()
+        self.start_startup_backtest()
+
+    # ------------------------------------------------------------------
+    # 기동 시 자동 백테스트
+    # ------------------------------------------------------------------
+    def start_startup_backtest(self) -> Optional[threading.Thread]:
+        """
+        기동 직후 현재 설정으로 최근 구간을 백테스트해 알립니다.
+
+        시세를 받는 데 10~30초 걸리므로 **별도 스레드**에서 돌립니다.
+        기동과 매매 스케줄은 이 작업을 기다리지 않습니다.
+        실패해도 봇 동작에는 영향이 없습니다 (참고 정보일 뿐).
+
+        :return: 시작된 스레드. 옵션이 꺼져 있으면 None
+        """
+        months = int(self.config.get("startup_backtest_months", 0) or 0)
+        if months <= 0:
+            return None
+
+        thread = threading.Thread(
+            target=self._run_startup_backtest, args=(months,), daemon=True)
+        thread.start()
+        return thread
+
+    def _run_startup_backtest(self, months: int) -> None:
+        try:
+            import pandas as pd
+            from tools.backtest_config import prepare_data, run_backtest
+
+            logger.info(f"[기동 백테스트] 최근 {months}개월 계산 시작...")
+            data, ctx, missing = prepare_data(self.config)
+            start = ctx.index[-1] - pd.DateOffset(months=months)
+
+            optimistic = run_backtest(self.config, data, ctx, start, confirm_fill="target")
+            if not optimistic:
+                logger.warning("[기동 백테스트] 구간이 짧아 결과를 낼 수 없습니다")
+                return
+
+            pessimistic = {}
+            if self.config.get("btc_breakout_confirm"):
+                pessimistic = run_backtest(self.config, data, ctx, start,
+                                           confirm_fill="close")
+
+            self.notifier.send_message(self._format_startup_backtest(
+                months, optimistic, pessimistic, missing))
+        except Exception as e:
+            logger.error(f"[기동 백테스트] 실패: {e}")
+
+    @staticmethod
+    def _format_startup_backtest(months: int, opt: Dict[str, Any],
+                                 pes: Dict[str, Any],
+                                 missing: List[str]) -> str:
+        """낙관/비관이 갈리는 값은 구간으로 표기"""
+        def band(key: str, suffix: str = "%") -> str:
+            a = opt.get(key)
+            if a is None:
+                return "-"
+            b = pes.get(key)
+            if b is None or abs(a - b) < 0.05:
+                return f"{a:,.1f}{suffix}"
+            lo, hi = sorted((a, b))
+            return f"{lo:,.1f} ~ {hi:,.1f}{suffix}"
+
+        lines = [
+            f"📈 <b>[기동 백테스트] 최근 {months}개월</b>",
+            f"• 기간: {opt['시작'].date()} ~ {opt['종료'].date()}",
+            f"• 총수익률: <b>{band('총수익률%')}</b>",
+            f"• 최대낙폭: <b>{band('MDD%')}</b>",
+            f"• 매매: {opt['매매']}회 · 승률 {opt['승률%']}%",
+            f"• 평균 수익/손실: {opt['평균수익%']:+.2f}% / {opt['평균손실%']:+.2f}%",
+        ]
+        if pes:
+            lines.append("• 구간 표기는 BTC 동반 돌파의 체결 시점을 "
+                         "일봉으로 알 수 없어 양극단을 잡은 것입니다.")
+        if missing:
+            lines.append(f"• 시세 미수신(제외): {', '.join(missing)}")
+        lines.append("<i>과거 성과이며, 상장폐지 종목이 표본에 없어 낙관적입니다.</i>")
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # 매매 이력 / 당일 상태 (재시작 복구)

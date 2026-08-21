@@ -540,6 +540,28 @@ def build_config_window(parent: Any = None) -> Any:
             self.backtest_result.setTextFormat(QtCore.Qt.TextFormat.RichText)
             layout.addWidget(self.backtest_result)
 
+            self.startup_bt = QtWidgets.QComboBox()
+            for label_text, months in (("사용 안 함", 0), ("최근 3개월", 3),
+                                       ("최근 6개월", 6), ("최근 1년", 12)):
+                self.startup_bt.addItem(label_text, months)
+            current = int(self.config.get("startup_backtest_months", 0) or 0)
+            index = self.startup_bt.findData(current)
+            self.startup_bt.setCurrentIndex(index if index >= 0 else 0)
+
+            startup_form = QtWidgets.QFormLayout()
+            startup_form.setSpacing(10)
+            startup_form.setFieldGrowthPolicy(
+                QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+            startup_form.addRow(QtWidgets.QLabel("기동 시 자동 실행"), self.startup_bt)
+            layout.addLayout(startup_form)
+
+            startup_hint = QtWidgets.QLabel(
+                "* 봇을 켤 때마다 백그라운드로 계산해 텔레그램으로 보냅니다. "
+                "기동이나 매매가 이 계산을 기다리지는 않습니다.")
+            startup_hint.setObjectName("Hint")
+            startup_hint.setWordWrap(True)
+            layout.addWidget(startup_hint)
+
             warn = QtWidgets.QLabel(
                 "* 상장폐지된 종목은 시세 조회가 되지 않아 표본에서 빠집니다. "
                 "따라서 결과는 실제보다 낙관적이며, MDD도 과거 최악값일 뿐 "
@@ -693,6 +715,7 @@ def build_config_window(parent: Any = None) -> Any:
                 "bear_market_exit": bool(self.bear_exit.isChecked()),
                 "bear_exit_ma_window": int(self.bear_exit_spin.value()),
                 "btc_breakout_confirm": bool(self.btc_confirm.isChecked()),
+                "startup_backtest_months": int(self.startup_bt.currentData() or 0),
             })
             return config
 

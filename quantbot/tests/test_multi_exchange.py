@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import types
 from typing import Any, Dict, List, Optional
 
@@ -2881,3 +2882,105 @@ class TestBacktestConfig:
         a = self._run(config, confirm_fill="target")
         b = self._run(config, confirm_fill="close")
         assert a["최종자산"] == pytest.approx(b["최종자산"])
+
+
+# ======================================================================
+# 20. 기동 시 자동 백테스트
+# ======================================================================
+class TestStartupBacktest:
+    """
+    기동 직후 최근 구간을 백테스트해 알리는 옵션.
+
+    참고 정보일 뿐이므로 **실패해도 봇 동작에 영향이 없어야** 하고,
+    시세를 받는 동안 기동이나 매매가 막혀서도 안 된다.
+    """
+
+    def _make_bot(self, tmp_path, **overrides):
+        from main import QuantBot
+        from trade_store import TradeStore
+
+        exchange = DummyExchange(price=1000.0, krw=1_000_000.0,
+                                 api_key="k", secret_key="s")
+        config = {
+            "exchange": "dummy", "tickers": ["BTC", "ETH"], "ma_window": 10,
+            "force_simulation": False, "start_paused": True,
+            "telegram_enabled": False, "schedule": {},
+            "explosive_era_guard": False,
+        }
+        config.update(overrides)
+        return QuantBot(config=config, exchange=exchange,
+                        notifier=FakeNotifier(), store=TradeStore(tmp_path / "t.db"))
+
+    def test_disabled_by_default(self, tmp_path):
+        assert config_manager.DEFAULT_CONFIG["startup_backtest_months"] == 0
+
+        bot = self._make_bot(tmp_path)
+        assert bot.start_startup_backtest() is None
+
+    def test_zero_months_does_not_start(self, tmp_path):
+        bot = self._make_bot(tmp_path, startup_backtest_months=0)
+        assert bot.start_startup_backtest() is None
+
+    def test_runs_in_background_thread(self, tmp_path, monkeypatch):
+        """기동이 계산을 기다리면 안 된다 - 데몬 스레드로 떠야 한다"""
+        bot = self._make_bot(tmp_path, startup_backtest_months=6)
+
+        started = threading.Event()
+        monkeypatch.setattr(bot, "_run_startup_backtest",
+                            lambda months: started.set())
+
+        thread = bot.start_startup_backtest()
+        assert thread is not None
+        assert thread.daemon is True
+        thread.join(timeout=5)
+        assert started.is_set()
+
+    def test_failure_is_contained(self, tmp_path, monkeypatch):
+        """시세 수집이 실패해도 예외가 밖으로 나가면 안 된다"""
+        bot = self._make_bot(tmp_path, startup_backtest_months=6)
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("시세 서버 장애")
+
+        monkeypatch.setattr("tools.backtest_config.prepare_data", boom)
+        bot._run_startup_backtest(6)          # 예외가 나면 테스트 실패
+
+    def test_message_shows_band_when_confirm_on(self, tmp_path):
+        """체결 가정이 갈리면 단일값이 아니라 구간으로 알려야 한다"""
+        bot = self._make_bot(tmp_path)
+        opt = {"시작": pd.Timestamp("2026-01-01"), "종료": pd.Timestamp("2026-06-30"),
+               "총수익률%": 30.0, "MDD%": 8.0, "매매": 40, "승률%": 42.0,
+               "평균수익%": 5.0, "평균손실%": -2.0}
+        pes = dict(opt, **{"총수익률%": 8.0, "MDD%": 10.0})
+
+        message = bot._format_startup_backtest(6, opt, pes, [])
+        assert "8.0 ~ 30.0%" in message
+        assert "8.0 ~ 10.0%" in message
+
+    def test_message_single_value_when_confirm_off(self, tmp_path):
+        bot = self._make_bot(tmp_path)
+        opt = {"시작": pd.Timestamp("2026-01-01"), "종료": pd.Timestamp("2026-06-30"),
+               "총수익률%": 30.0, "MDD%": 8.0, "매매": 40, "승률%": 42.0,
+               "평균수익%": 5.0, "평균손실%": -2.0}
+
+        message = bot._format_startup_backtest(6, opt, {}, [])
+        assert "30.0%" in message and "~" not in message.split("총수익률")[1][:20]
+
+    def test_message_warns_about_survivorship(self, tmp_path):
+        """생존 편향 경고가 빠지면 안 된다 - 낙관적인 수치이므로"""
+        bot = self._make_bot(tmp_path)
+        opt = {"시작": pd.Timestamp("2026-01-01"), "종료": pd.Timestamp("2026-06-30"),
+               "총수익률%": 30.0, "MDD%": 8.0, "매매": 40, "승률%": 42.0,
+               "평균수익%": 5.0, "평균손실%": -2.0}
+
+        message = bot._format_startup_backtest(6, opt, {}, [])
+        assert "상장폐지" in message
+
+    def test_message_lists_missing_tickers(self, tmp_path):
+        bot = self._make_bot(tmp_path)
+        opt = {"시작": pd.Timestamp("2026-01-01"), "종료": pd.Timestamp("2026-06-30"),
+               "총수익률%": 30.0, "MDD%": 8.0, "매매": 40, "승률%": 42.0,
+               "평균수익%": 5.0, "평균손실%": -2.0}
+
+        message = bot._format_startup_backtest(6, opt, {}, ["FOO", "BAR"])
+        assert "FOO" in message and "BAR" in message
