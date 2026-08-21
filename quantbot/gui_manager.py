@@ -110,6 +110,7 @@ class LogBuffer(logging.Handler):
         super().__init__()
         # (시각, 레벨, 아이콘, 본문) 튜플로 보관해 화면에서 색/아이콘을 자유롭게 조합
         self.records: Deque[Tuple[str, int, str, str]] = deque(maxlen=capacity)
+        self.revision = 0          # 새 로그가 쌓일 때마다 증가 (화면 갱신 필요 여부 판단)
         self.setFormatter(logging.Formatter("%(message)s"))
 
     def emit(self, record: logging.LogRecord) -> None:
@@ -118,6 +119,9 @@ class LogBuffer(logging.Handler):
             icon, body = self.split_icon(message, record.levelno)
             timestamp = time.strftime("%H:%M:%S", time.localtime(record.created))
             self.records.append((timestamp, record.levelno, icon, body))
+            # 화면이 '내용이 바뀐 경우에만' 다시 그리도록 하는 판단 근거.
+            # 매번 다시 그리면 사용자가 스크롤한 위치가 초기화됩니다.
+            self.revision += 1
         except Exception:
             pass  # 로그 표시 실패가 매매를 중단시키지 않도록 무시
 
@@ -190,6 +194,17 @@ class BalanceWorker(QObject):
             self.finished.emit(f"잔고 조회 실패: {e}")
 
 
+def pause_label(is_paused: bool) -> str:
+    """
+    정지/가동 상태에 대응하는 버튼·메뉴 라벨.
+
+    '지금 상태'가 아니라 **누르면 일어날 일**을 표시합니다.
+    (정지 중이면 "매매 시작", 가동 중이면 "매매 중단")
+    대시보드 버튼과 트레이 메뉴가 같은 문구를 쓰도록 한 곳에서 만듭니다.
+    """
+    return "▶  매매 시작" if is_paused else "⏸  매매 중단"
+
+
 def _color(hex_value: str) -> "QBrush":
     """QSS로 지정할 수 없는 테이블 셀 글자색을 위한 QBrush 생성"""
     return QBrush(QColor(hex_value))
@@ -220,6 +235,7 @@ class Dashboard(QWidget):
         self.bot = bot
         self.log_buffer = log_buffer
         self._price_cache: Dict[str, float] = {}
+        self._log_revision = -1        # 마지막으로 화면에 그린 로그 리비전
 
         self.setWindowTitle("QuantBot")
         self.resize(780, 660)
@@ -312,7 +328,7 @@ class Dashboard(QWidget):
         # --- 버튼 ---
         button_row = QHBoxLayout()
         button_row.setSpacing(8)
-        self.pause_button = QPushButton("일시정지")
+        self.pause_button = QPushButton(pause_label(True))
         self.pause_button.setObjectName("Primary")
         self.pause_button.clicked.connect(self.toggle_pause)
         button_row.addWidget(self.pause_button)
@@ -377,7 +393,7 @@ class Dashboard(QWidget):
         self.metric_labels["tickers"].setText(str(len(self.bot.tickers)))
         self.metric_labels["filled"].setText(f"{filled} / {len(self.bot.tickers)}")
 
-        self.pause_button.setText("재개" if self.bot.is_paused else "일시정지")
+        self.pause_button.setText(pause_label(self.bot.is_paused))
 
         # --- 테이블 ---
         self.table.setRowCount(len(self.bot.tickers))
@@ -414,10 +430,29 @@ class Dashboard(QWidget):
                     item.setToolTip(tip)
                 self.table.setItem(row, col, item)
 
-        # 로그는 스크롤이 맨 아래일 때만 자동 추적 (사용자가 위로 올려 읽는 중이면 유지)
+        self._refresh_log_view()
+
+    def _refresh_log_view(self) -> None:
+        """
+        로그 영역 갱신.
+
+        setHtml()은 문서를 통째로 교체하므로 스크롤이 맨 위로 초기화됩니다.
+        그래서 두 가지를 지킵니다.
+          1) **새 로그가 없으면 아예 다시 그리지 않는다** — 읽는 중에 화면이 흔들리지 않음
+          2) 다시 그릴 때는 스크롤 위치를 복원한다
+             (맨 아래를 보고 있었으면 계속 최신 줄을 따라가고, 위로 올려 읽는 중이면 그 자리 유지)
+        """
+        revision = self.log_buffer.revision
+        if revision == self._log_revision:
+            return
+        self._log_revision = revision
+
         scrollbar = self.log_view.verticalScrollBar()
         at_bottom = scrollbar.value() >= scrollbar.maximum() - 4
+        previous = scrollbar.value()
+
         self.log_view.setHtml(self.log_buffer.tail_html())
+
         if at_bottom:
             # setHtml 직후에는 문서 레이아웃이 끝나지 않아 maximum()이 아직 0일 수 있으므로
             # 커서를 문서 끝으로 옮겨 확실하게 최신 줄이 보이도록 합니다.
@@ -425,6 +460,8 @@ class Dashboard(QWidget):
             cursor.movePosition(QTextCursor.MoveOperation.End)
             self.log_view.setTextCursor(cursor)
             self.log_view.ensureCursorVisible()
+        else:
+            scrollbar.setValue(previous)   # 읽던 위치 유지
 
     def closeEvent(self, event) -> None:
         """창을 닫아도 앱은 트레이에 계속 상주"""
@@ -480,7 +517,7 @@ class TrayApplication:
 
         menu.addSeparator()
 
-        self.pause_action = QAction("일시정지")
+        self.pause_action = QAction(pause_label(self.bot.is_paused))
         self.pause_action.triggered.connect(self.toggle_pause)
         menu.addAction(self.pause_action)
 
@@ -494,6 +531,7 @@ class TrayApplication:
         self.quit_action.triggered.connect(self.quit)
         menu.addAction(self.quit_action)
 
+        menu.aboutToShow.connect(self.sync_pause_label)   # 열릴 때마다 실제 상태 반영
         self.menu = menu
         self.tray.setContextMenu(menu)
 
@@ -531,13 +569,23 @@ class TrayApplication:
     def toggle_pause(self) -> None:
         if self.bot.is_paused:
             self.bot.resume()
-            self.pause_action.setText("일시정지")
-            self.notify("QuantBot", "매매 감시를 재개했습니다.")
+            self.notify("QuantBot", "매매를 시작했습니다.")
         else:
             self.bot.pause()
-            self.pause_action.setText("재개")
-            self.notify("QuantBot", "매매 감시를 일시정지했습니다.")
+            self.notify("QuantBot", "매매를 중단했습니다. 보유 포지션은 유지됩니다.")
+
+        self.sync_pause_label()
         self.dashboard.refresh()
+
+    def sync_pause_label(self) -> None:
+        """
+        트레이 메뉴 라벨을 실제 봇 상태와 맞춥니다.
+
+        메뉴는 대시보드처럼 주기적으로 갱신되지 않으므로, 열리기 직전(aboutToShow)에
+        동기화하지 않으면 텔레그램 /실행 등 외부 경로로 상태가 바뀌었을 때
+        라벨이 실제와 어긋납니다.
+        """
+        self.pause_action.setText(pause_label(self.bot.is_paused))
 
     def open_config(self) -> None:
         """설정 창 표시 (동일 Qt 이벤트 루프 안에서 별도 창으로 동작)"""

@@ -1864,6 +1864,48 @@ class TestTrayGui:
         else:
             assert rule == ""
 
+    def test_pause_label_shows_next_action(self):
+        """
+        버튼/메뉴는 '현재 상태'가 아니라 **누르면 일어날 일**을 표시해야 한다.
+        정지 상태인데 '일시정지'라고 쓰여 있으면 무엇을 하는 버튼인지 알 수 없다.
+        """
+        gui_manager = pytest.importorskip("gui_manager")
+
+        paused = gui_manager.pause_label(True)
+        running = gui_manager.pause_label(False)
+
+        assert "시작" in paused        # 정지 중 -> 누르면 시작
+        assert "중단" in running       # 가동 중 -> 누르면 중단
+        assert paused != running
+
+    def test_log_buffer_tracks_revision(self):
+        """
+        새 로그가 없으면 화면을 다시 그리지 않기 위한 근거값.
+        매번 다시 그리면 setHtml()이 문서를 교체하면서 사용자가 스크롤한 위치가
+        맨 위로 초기화된다.
+        """
+        gui_manager = pytest.importorskip("gui_manager")
+
+        buffer = gui_manager.LogBuffer()
+        logger = logging.getLogger("revision-test")
+        logger.addHandler(buffer)
+        logger.setLevel(logging.INFO)
+        try:
+            start = buffer.revision
+            logger.info("첫 줄")
+            after_one = buffer.revision
+            logger.info("둘째 줄")
+            after_two = buffer.revision
+        finally:
+            logger.removeHandler(buffer)
+
+        assert after_one == start + 1
+        assert after_two == start + 2
+
+        # 로그가 추가되지 않으면 리비전도 그대로 -> 화면 갱신 생략
+        idle = buffer.revision
+        assert buffer.revision == idle
+
     def test_main_routes_cli_flags_to_console_mode(self):
         from main import parse_args
 
