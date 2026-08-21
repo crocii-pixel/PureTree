@@ -830,6 +830,45 @@ class TestConfigGuiHelpers:
         payload = config_gui.build_env_payload("upbit", {"api_key": "  ", "secret_key": "S"})
         assert payload == {"UPBIT_SECRET_KEY": "S"}
 
+    def test_saving_with_empty_key_fields_preserves_stored_keys(self, tmp_path):
+        """
+        설정창에서 Key 칸이 비어 있는 채로 저장해도 기존 키가 지워지면 안 된다.
+        (화면에 키를 표시하지 않으므로, 빈 칸 = '변경 없음'으로 해석해야 함)
+        """
+        env = tmp_path / ".env"
+        env.write_text(
+            "# 주석 보존\n"
+            "BITHUMB_CONNECT_KEY=REAL-CONNECT\n"
+            "BITHUMB_SECRET_KEY=REAL-SECRET\n"
+            "TELEGRAM_BOT_TOKEN=REAL-TOKEN\n",
+            encoding="utf-8",
+        )
+
+        payload = config_gui.build_env_payload(
+            "bithumb", {"api_key": "", "secret_key": "   "})
+        assert payload == {}                      # 빈 값은 저장 대상에서 제외
+
+        config_manager.update_env(payload, env)
+        values = config_manager.read_env(env)
+
+        assert values["BITHUMB_CONNECT_KEY"] == "REAL-CONNECT"
+        assert values["BITHUMB_SECRET_KEY"] == "REAL-SECRET"
+        assert values["TELEGRAM_BOT_TOKEN"] == "REAL-TOKEN"
+        assert "# 주석 보존" in env.read_text(encoding="utf-8")
+
+    def test_saving_one_key_leaves_the_other_untouched(self, tmp_path):
+        env = tmp_path / ".env"
+        env.write_text("BITHUMB_CONNECT_KEY=OLD-C\nBITHUMB_SECRET_KEY=OLD-S\n",
+                       encoding="utf-8")
+
+        payload = config_gui.build_env_payload(
+            "bithumb", {"api_key": "NEW-C", "secret_key": ""})
+        config_manager.update_env(payload, env)
+
+        values = config_manager.read_env(env)
+        assert values["BITHUMB_CONNECT_KEY"] == "NEW-C"
+        assert values["BITHUMB_SECRET_KEY"] == "OLD-S"   # 손대지 않음
+
     @pytest.mark.parametrize("text,expected", [
         ("BTC, ETH, SOL", ["BTC", "ETH", "SOL"]),
         (" krw-btc , eth ", ["BTC", "ETH"]),

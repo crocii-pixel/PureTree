@@ -169,6 +169,49 @@ def build_config_window(parent: Any = None) -> Any:
     import ui_theme
     from app_icon import ICO_PATH, ensure_icon
 
+    class _TestWorker(QtCore.QObject):
+        """
+        연결 테스트를 GUI 스레드 밖에서 수행하고 결과를 시그널로 돌려줍니다.
+
+        시그널은 Qt가 자동으로 GUI 스레드 큐에 넣어주므로, 워커 스레드에
+        이벤트 루프가 없어도 결과가 안전하게 전달됩니다.
+        """
+
+        finished = QtCore.pyqtSignal(object)
+
+        def __init__(self, exchange: str, api_key: str, secret_key: str):
+            super().__init__()
+            self.exchange = exchange
+            self.api_key = api_key
+            self.secret_key = secret_key
+
+        def run(self) -> None:
+            try:
+                result = test_connection(self.exchange, self.api_key, self.secret_key)
+            except Exception as e:  # 워커에서 예외가 나도 버튼이 잠기지 않도록
+                result = {"ok": False, "is_simulation": True, "price": None,
+                          "krw": 0.0, "message": f"연결 테스트 실패: {e}"}
+            self.finished.emit(result)
+
+    class _WheelGuard(QtCore.QObject):
+        """
+        포커스가 없는 입력 위젯 위에서 휠을 굴려도 값이 바뀌지 않게 막습니다.
+
+        QSpinBox/QComboBox는 기본적으로 휠 이벤트를 삼켜서, 창을 스크롤하려다
+        포인터가 걸치면 MA나 K값이 조용히 바뀝니다. 값 변경은 막되 휠 이벤트는
+        스크롤 영역으로 넘겨 화면은 정상적으로 스크롤되도록 합니다.
+        """
+
+        def __init__(self, viewport: Any):
+            super().__init__(viewport)
+            self._viewport = viewport
+
+        def eventFilter(self, obj: Any, event: Any) -> bool:
+            if event.type() == QtCore.QEvent.Type.Wheel and not obj.hasFocus():
+                QtWidgets.QApplication.sendEvent(self._viewport, event)
+                return True
+            return False
+
     class ConfigWindow(QtWidgets.QWidget):
         """거래소 선택에 따라 API Key 입력란이 동적으로 재구성되는 설정 창"""
 
@@ -189,6 +232,10 @@ def build_config_window(parent: Any = None) -> Any:
 
             self._build()
             self._on_exchange_changed()
+
+            # 창을 열자마자 숫자 입력칸에 포커스가 있으면 휠/키 입력으로 값이
+            # 실수로 바뀔 수 있어, 거래소 선택으로 포커스를 옮겨둡니다.
+            self.exchange_combo.setFocus()
 
         # -- UI 구성 ------------------------------------------------
         def _build(self) -> None:
@@ -227,6 +274,15 @@ def build_config_window(parent: Any = None) -> Any:
             self.status.setObjectName("Hint")
             self.status.setWordWrap(True)
             outer.addWidget(self.status)
+
+            # 휠로 값이 바뀌는 것을 막고, 휠은 스크롤 영역으로 전달
+            guard = _WheelGuard(scroll.viewport())
+            for widget in body.findChildren((QtWidgets.QSpinBox,
+                                             QtWidgets.QDoubleSpinBox,
+                                             QtWidgets.QComboBox)):
+                widget.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
+                widget.installEventFilter(guard)
+            self._wheel_guard = guard          # GC 방지
 
             # 하단 버튼
             buttons = QtWidgets.QHBoxLayout()
@@ -437,13 +493,16 @@ def build_config_window(parent: Any = None) -> Any:
             secret_key = self.key_rows["secret_key"][1].text().strip()
 
             self.test_button.setEnabled(False)
+            self.test_button.setText("테스트 중...")
             self._set_status(f"{key_to_display(exchange)} 연결 테스트 중...", "")
 
-            def worker() -> None:
-                result = test_connection(exchange, api_key, secret_key)
-                QtCore.QTimer.singleShot(0, lambda: self._apply_test_result(result))
-
-            threading.Thread(target=worker, daemon=True).start()
+            # 결과 전달은 반드시 시그널로 해야 합니다.
+            # 일반 스레드에는 Qt 이벤트 루프가 없어 QTimer.singleShot을 걸면
+            # 타이머가 영영 발화하지 않고 버튼이 '테스트 중'에서 멈춥니다.
+            worker = _TestWorker(exchange, api_key, secret_key)
+            worker.finished.connect(self._apply_test_result)
+            self._test_worker = worker          # GC 방지
+            threading.Thread(target=worker.run, daemon=True).start()
 
         def _apply_test_result(self, result: Dict[str, Any]) -> None:
             if not result["ok"]:
@@ -454,6 +513,7 @@ def build_config_window(parent: Any = None) -> Any:
                 tone = "ok"
             self._set_status(result["message"], tone)
             self.test_button.setEnabled(True)
+            self.test_button.setText("연결 테스트")
 
     return ConfigWindow(parent)
 
