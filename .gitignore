@@ -26,3 +26,6 @@ dist/
 
 # Runtime
 logs/
+
+# 백테스트 시세 캐시
+quantbot/tools/_cache/
