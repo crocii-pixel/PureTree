@@ -197,6 +197,13 @@ class QuantBot:
         self.era_years: int = int(self.config.get("explosive_era_years", 4))
         self.explosive_era: Optional[bool] = None
         self.era_cagr: Optional[float] = None
+        self.era_phase: str = "미판정"
+
+        # BTC 동반 돌파 확인 - 알트는 BTC도 같은 세션에 돌파해야 매수
+        self.btc_breakout_confirm: bool = bool(
+            self.config.get("btc_breakout_confirm", False))
+        self.btc_target: float = 0.0        # 당일 BTC 목표가 (BTC가 종목에 없어도 산출)
+        self.btc_broke_out: bool = False    # 당일 BTC 돌파 여부 (한 번 켜지면 유지)
         # None = 미판정(필터 꺼짐 또는 데이터 부족), True = 상승 국면, False = 하락 국면
         self.market_regime: Optional[bool] = None
         # 청산 판정용 MA 상회 여부. 진입용 is_above_ma와 별도로 관리합니다.
@@ -228,6 +235,8 @@ class QuantBot:
             + (f"• 국면 청산: 하락장 MA{self.bear_exit_ma} "
                f"(판정 월봉 MA{self.regime_ma_months})\n"
                if self.bear_market_exit else "")
+            + ("• BTC 동반 돌파 확인: 켜짐 (알트 한정)\n"
+               if self.btc_breakout_confirm else "")
             + f"----------------------------------\n"
             f"{state_line}"
         )
@@ -488,7 +497,27 @@ class QuantBot:
 
         cagr = ((now / past) ** (1 / self.era_years) - 1) * 100
         self.era_cagr = cagr
+        self.era_phase = self.classify_era(cagr)
         return bool(cagr > self.era_threshold)
+
+    def classify_era(self, cagr: float) -> str:
+        """
+        후행 성장률을 4단계로 분류합니다.
+
+        [주의 - 분류는 4단계, 동작 분기는 1개]
+        11년 측정 구간에서 BTC 후행 4년 성장률은 7.0~247.1%였습니다.
+        '안정'은 361일(9%)뿐이고 **'쇠퇴'는 단 하루도 없었습니다.**
+        따라서 안정/쇠퇴에 별도 동작을 붙일 근거가 없어, 분기는 폭등기 경계
+        하나만 둡니다. 나머지 구간은 모두 필터가 켜진 채로 보수적으로 동작하며,
+        쇠퇴기가 실제로 오더라도 그 방향이 맞습니다.
+        """
+        if cagr > self.era_threshold:
+            return "폭등"
+        if cagr > 25.0:
+            return "성숙"
+        if cagr >= 0.0:
+            return "안정"
+        return "쇠퇴"
 
     def _monthly_closes(self, need: int):
         """
@@ -562,9 +591,85 @@ class QuantBot:
         phase = "상승" if self.market_regime else "하락"
         era = ""
         if self.explosive_era is False and self.era_cagr is not None:
-            era = f" · 성숙기({self.era_cagr:.0f}%/년)"
+            # 저장된 값 대신 매번 분류해 상태가 어긋나지 않게 합니다
+            era = f" · {self.classify_era(self.era_cagr)}기({self.era_cagr:.0f}%/년)"
         return (f"월봉 MA{self.regime_ma_months} {phase} 국면{era} "
                 f"- 청산 MA{self.exit_ma_window()}")
+
+    # ------------------------------------------------------------------
+    # BTC 동반 돌파 확인
+    # ------------------------------------------------------------------
+    def refresh_btc_target(self) -> None:
+        """
+        당일 BTC 목표가를 산출합니다 (일일 루틴에서 1회).
+
+        BTC가 매매 종목에 포함되어 있으면 이미 계산된 값을 재사용하고,
+        없으면 별도로 조회합니다. 세션이 바뀌었으므로 돌파 래치도 초기화합니다.
+        """
+        self.btc_broke_out = False
+        self.btc_target = 0.0
+        if not self.btc_breakout_confirm:
+            return
+
+        btc = ExchangeBase.to_symbol("BTC")
+        if btc in self.target_prices and self.target_prices[btc] > 0:
+            self.btc_target = self.target_prices[btc]
+            return
+
+        try:
+            df = self.exchange.get_ohlcv(btc, count=100, interval="day")
+            if df is None or df.empty:
+                logger.warning("BTC 시세 조회 실패 - 동반 돌파 확인 미적용")
+                return
+            res = self.strategy_engine.evaluate(
+                df, ticker=btc, use_dynamic_k=self.use_dynamic_k)
+            self.btc_target = float(res["target_price"])
+        except Exception as e:
+            logger.error(f"BTC 목표가 산출 실패: {e} - 동반 돌파 확인 미적용")
+
+    def btc_confirmed(self) -> bool:
+        """
+        BTC가 당일 목표가를 돌파했는지. **한 번 켜지면 세션 내내 유지**됩니다.
+
+        업비트 KRW 16종목 9년치 기준, 알트 진입에 이 조건을 걸면
+        성숙기 MAR 0.59 -> 1.07, 낙폭 개선 16/16 종목이었습니다.
+        BTC 없이 알트 혼자 튀는 돌파는 상당수가 가짜라는 뜻입니다.
+        (바이낸스 USDT에서도 재현: CAGR 11/13, MDD 12/13)
+
+        [한계] 백테스트는 알트와 BTC 중 무엇이 먼저 돌파했는지 알 수 없습니다.
+        시간봉 실측으로는 BTC 선행 35% / 동시 35% / 알트 선행 29%였습니다.
+        따라서 낙폭·승률 개선은 신뢰할 수 있으나 수익률 개선은 보장되지 않습니다.
+        """
+        if not self.btc_breakout_confirm or self.btc_target <= 0:
+            return True
+        if self.btc_broke_out:
+            return True
+
+        try:
+            price = self.exchange.get_current_price(ExchangeBase.to_symbol("BTC"))
+            if price and price >= self.btc_target:
+                self.btc_broke_out = True
+                logger.info(
+                    f"[BTC 동반 돌파 확인] {price:,.0f}원 >= 목표가 {self.btc_target:,.0f}원 "
+                    f"- 알트 진입 허용")
+        except Exception as e:
+            logger.error(f"BTC 돌파 확인 실패: {e}")
+        return self.btc_broke_out
+
+    def needs_btc_confirm(self, ticker: str) -> bool:
+        """
+        이 종목이 BTC 동반 돌파 확인을 받아야 하는가.
+
+        BTC 자신은 기준 종목이므로 제외하고, 폭등기에는 해제합니다.
+        폭등기에 눌림목마다 진입을 막으면 상승분을 놓칩니다(3/10 종목만 개선).
+        """
+        if not self.btc_breakout_confirm:
+            return False
+        if ExchangeBase.to_symbol(ticker) == "BTC":
+            return False
+        if self.explosive_era:
+            return False
+        return True
 
     def exit_signal_ok(self, ticker: str) -> bool:
         """
@@ -795,6 +900,16 @@ class QuantBot:
         ]
         if self.bear_market_exit:
             lines.append(f"• <b>국면</b>: {self.regime_summary()}")
+        if self.btc_breakout_confirm:
+            if self.explosive_era:
+                state = "폭등기 - 해제됨"
+            # 정지 상태에서는 감시 루프가 돌지 않아 래치가 갱신되지 않습니다.
+            # 보고서에서 직접 확인해 실제 시장 상태를 보여줍니다 (조회 전용).
+            elif self.btc_confirmed():
+                state = "확인됨 - 알트 진입 가능"
+            else:
+                state = f"대기 (BTC 목표가 {self.btc_target:,.0f}원 미달)"
+            lines.append(f"• <b>BTC 동반 돌파</b>: {state}")
         lines.append("----------------------------------")
 
         for ticker in self.tickers:
@@ -899,6 +1014,13 @@ class QuantBot:
 
             except Exception as e:
                 logger.error(f"[{ticker}] 일일 세팅 갱신 예외 발생: {e}", exc_info=True)
+
+        # 모든 종목 세팅이 끝난 뒤여야 BTC 목표가를 재사용할 수 있습니다
+        self.refresh_btc_target()
+        if self.btc_breakout_confirm and self.btc_target > 0:
+            summary_lines.append(
+                f"<b>BTC 동반 돌파</b>: 목표가 {self.btc_target:,.0f}원"
+                + (" (폭등기 - 해제됨)" if self.explosive_era else ""))
 
         if summary_lines:
             if self.bear_market_exit:
@@ -1055,6 +1177,13 @@ class QuantBot:
 
                 # 매수 조건: 1) 현재가 >= 목표가, 2) 전일 종가 >= MA, 3) 당일 미매수
                 if current_price >= target_price and is_above_ma:
+                    # 4) 알트는 BTC도 같은 세션에 돌파했어야 함 (폭등기에는 해제)
+                    if self.needs_btc_confirm(ticker) and not self.btc_confirmed():
+                        logger.debug(
+                            f"[{ticker}] 돌파했으나 BTC 미확인 "
+                            f"(BTC 목표가 {self.btc_target:,.0f}원) - 대기")
+                        continue
+
                     budget_ratio = 1.0 / len(self.tickers)
 
                     # 잔고 부족은 당일 안에 해소되지 않으므로 주문을 시도하지 않고 종목을 제외합니다.

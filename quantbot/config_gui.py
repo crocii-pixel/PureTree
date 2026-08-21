@@ -437,8 +437,13 @@ def build_config_window(parent: Any = None) -> Any:
             self.bear_exit.setChecked(bool(self.config.get("bear_market_exit", False)))
             layout.addWidget(self.bear_exit)
 
+            self.btc_confirm = QtWidgets.QCheckBox(
+                "알트는 BTC 동반 돌파 시에만 매수")
+            self.btc_confirm.setChecked(bool(self.config.get("btc_breakout_confirm", False)))
+            layout.addWidget(self.btc_confirm)
+
             era = QtWidgets.QLabel(
-                "* 시장이 폭등기(BTC 후행 4년 성장률 75%/년 초과)로 판정되면 위 전환은 "
+                "* 시장이 폭등기(BTC 후행 4년 성장률 75%/년 초과)로 판정되면 위 옵션들은 "
                 "자동으로 해제됩니다. 폭등기에는 들고 있는 편이 낫기 때문입니다.")
             era.setObjectName("Hint")
             era.setWordWrap(True)
@@ -525,6 +530,7 @@ def build_config_window(parent: Any = None) -> Any:
                 "risk_per_trade": round(float(self.risk_spin.value()) / 100, 4),
                 "bear_market_exit": bool(self.bear_exit.isChecked()),
                 "bear_exit_ma_window": int(self.bear_exit_spin.value()),
+                "btc_breakout_confirm": bool(self.btc_confirm.isChecked()),
             })
             return config
 

@@ -2494,3 +2494,230 @@ class TestBearMarketExit:
     def test_summary_when_option_off(self, tmp_path):
         bot = self._make_bot(tmp_path)
         assert "고정" in bot.regime_summary()
+
+
+# ======================================================================
+# 17. BTC 동반 돌파 확인
+# ======================================================================
+class TestBtcBreakoutConfirm:
+    """
+    알트는 BTC도 같은 세션에 목표가를 돌파해야 매수한다.
+
+    업비트 KRW 16종목 9년치 성숙기: MAR 0.59 -> 1.07, 낙폭 개선 16/16,
+    승률 32.2% -> 37.1%. 바이낸스에서도 재현(11/13, 12/13).
+    폭등기에는 3/10으로 손해라 era 가드가 해제한다.
+    """
+
+    def _make_bot(self, tmp_path, **overrides):
+        from main import QuantBot
+        from trade_store import TradeStore
+
+        exchange = DummyExchange(price=1000.0, krw=1_000_000.0, coin=0.0,
+                                 api_key="k", secret_key="s")
+        config = {
+            "exchange": "dummy", "tickers": ["BTC", "ETH"], "ma_window": 10,
+            "force_simulation": False, "start_paused": False,
+            "telegram_enabled": False, "schedule": {},
+            "explosive_era_guard": False,
+            "btc_breakout_confirm": True,
+        }
+        config.update(overrides)
+        return QuantBot(config=config, exchange=exchange,
+                        notifier=FakeNotifier(), store=TradeStore(tmp_path / "t.db"))
+
+    # -- 기본값 --------------------------------------------------------
+    def test_disabled_by_default(self, tmp_path):
+        assert config_manager.DEFAULT_CONFIG["btc_breakout_confirm"] is False
+
+        bot = self._make_bot(tmp_path, btc_breakout_confirm=False)
+        assert bot.needs_btc_confirm("ETH") is False
+        assert bot.btc_confirmed() is True          # 꺼져 있으면 항상 통과
+
+    # -- 적용 대상 -----------------------------------------------------
+    def test_btc_itself_is_exempt(self, tmp_path):
+        """BTC는 기준 종목이므로 자기 자신에게 확인을 요구하지 않는다"""
+        bot = self._make_bot(tmp_path)
+        assert bot.needs_btc_confirm("BTC") is False
+        assert bot.needs_btc_confirm("ETH") is True
+
+    def test_released_in_explosive_era(self, tmp_path):
+        bot = self._make_bot(tmp_path)
+        bot.explosive_era = True
+        assert bot.needs_btc_confirm("ETH") is False
+
+        bot.explosive_era = False
+        assert bot.needs_btc_confirm("ETH") is True
+
+    # -- 돌파 래치 -----------------------------------------------------
+    def test_confirms_when_btc_crosses_target(self, tmp_path):
+        bot = self._make_bot(tmp_path)
+        bot.btc_target = 1200.0
+
+        bot.exchange.price = 1100.0
+        assert bot.btc_confirmed() is False          # 아직 미달
+
+        bot.exchange.price = 1250.0
+        assert bot.btc_confirmed() is True
+
+    def test_latch_survives_price_pullback(self, tmp_path):
+        """한 번 돌파하면 BTC가 되밀려도 세션 내내 확인 상태를 유지한다"""
+        bot = self._make_bot(tmp_path)
+        bot.btc_target = 1200.0
+
+        bot.exchange.price = 1250.0
+        assert bot.btc_confirmed() is True
+
+        bot.exchange.price = 900.0                   # 급락
+        assert bot.btc_confirmed() is True           # 래치 유지
+
+    def test_no_target_means_pass(self, tmp_path):
+        """BTC 목표가를 못 구했으면 막지 않는다 (조용한 매매 중단 방지)"""
+        bot = self._make_bot(tmp_path)
+        bot.btc_target = 0.0
+        assert bot.btc_confirmed() is True
+
+    def test_api_failure_does_not_confirm(self, tmp_path):
+        bot = self._make_bot(tmp_path)
+        bot.btc_target = 1200.0
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("API 장애")
+
+        bot.exchange.get_current_price = boom
+        assert bot.btc_confirmed() is False          # 확인 실패 -> 진입 보류
+
+    # -- 목표가 산출 ---------------------------------------------------
+    def test_reuses_target_when_btc_is_traded(self, tmp_path):
+        """BTC가 매매 종목이면 이미 계산된 목표가를 재사용 (추가 조회 없음)"""
+        bot = self._make_bot(tmp_path)
+        bot.target_prices["BTC"] = 777.0
+
+        calls = []
+        bot.exchange.get_ohlcv = lambda *a, **k: calls.append(1) or make_ohlcv()
+
+        bot.refresh_btc_target()
+        assert bot.btc_target == 777.0
+        assert calls == []
+
+    def test_fetches_target_when_btc_not_traded(self, tmp_path):
+        """BTC를 매매하지 않아도 기준 목표가는 따로 산출한다"""
+        bot = self._make_bot(tmp_path, tickers=["ETH", "SOL"])
+        bot.refresh_btc_target()
+        assert bot.btc_target > 0
+
+    def test_refresh_resets_latch(self, tmp_path):
+        """새 세션이 시작되면 전일 돌파 상태가 남아 있으면 안 된다"""
+        bot = self._make_bot(tmp_path)
+        bot.btc_broke_out = True
+
+        bot.target_prices["BTC"] = 500.0
+        bot.refresh_btc_target()
+        assert bot.btc_broke_out is False
+
+    def test_daily_routine_refreshes_target(self, tmp_path):
+        """
+        일일 루틴이 BTC 목표가를 실제로 갱신해야 한다.
+
+        메서드는 구현했는데 **호출을 빠뜨려** 목표가가 0으로 남는 배선 누락이
+        있었다. 그러면 btc_confirmed()가 무조건 True를 반환해 필터가
+        조용히 무력화된다.
+        """
+        bot = self._make_bot(tmp_path)
+        assert bot.btc_target == 0.0
+
+        bot.update_daily_settings()
+
+        assert bot.btc_target > 0, "일일 루틴에서 refresh_btc_target()이 호출되지 않았습니다"
+
+    def test_status_report_shows_confirm_state(self, tmp_path):
+        bot = self._make_bot(tmp_path)
+        bot.btc_target = 1200.0
+        assert "BTC 동반 돌파" in bot.get_status_report()
+
+    # -- 매매 경로 연결 -------------------------------------------------
+    def test_alt_buy_blocked_until_btc_confirms(self, tmp_path):
+        bot = self._make_bot(tmp_path)
+        bot.target_prices = {"BTC": 5000.0, "ETH": 500.0}   # BTC는 멀리 있음
+        bot.is_above_ma = {"BTC": True, "ETH": True}
+        bot.btc_target = 5000.0
+        bot.exchange.price = 1000.0                          # ETH 돌파, BTC 미달
+
+        bot.monitor_market()
+
+        bought = [o["market"] for o in bot.exchange.placed if o["side"] == "buy"]
+        assert "ETH" not in bought                           # BTC 확인 전이라 보류
+
+    def test_alt_buy_allowed_after_btc_confirms(self, tmp_path):
+        bot = self._make_bot(tmp_path)
+        bot.target_prices = {"BTC": 900.0, "ETH": 500.0}
+        bot.is_above_ma = {"BTC": True, "ETH": True}
+        bot.btc_target = 900.0
+        bot.exchange.price = 1000.0                          # 둘 다 돌파
+
+        bot.monitor_market()
+
+        bought = [o["market"] for o in bot.exchange.placed if o["side"] == "buy"]
+        assert "ETH" in bought
+
+    def test_btc_buys_without_confirmation(self, tmp_path):
+        """BTC 자신은 확인 없이도 매수되어야 한다"""
+        bot = self._make_bot(tmp_path, tickers=["BTC"])
+        bot.target_prices = {"BTC": 500.0}
+        bot.is_above_ma = {"BTC": True}
+        bot.btc_target = 99999.0                             # 확인 불가 상태
+        bot.exchange.price = 1000.0
+
+        bot.monitor_market()
+
+        assert [o["market"] for o in bot.exchange.placed if o["side"] == "buy"] == ["BTC"]
+
+
+# ======================================================================
+# 18. 시장 국면 4단계 분류
+# ======================================================================
+class TestEraClassification:
+    """
+    분류는 4단계지만 **동작 분기는 폭등기 경계 하나뿐**이다.
+    11년 측정 구간에서 후행 4년 성장률은 7.0~247.1%였고,
+    '안정'은 361일(9%), '쇠퇴'는 0일이라 별도 동작을 붙일 근거가 없다.
+    """
+
+    def _bot(self, tmp_path, **overrides):
+        from main import QuantBot
+        from trade_store import TradeStore
+
+        exchange = DummyExchange(price=1000.0, krw=1_000_000.0, api_key="k", secret_key="s")
+        config = {
+            "exchange": "dummy", "tickers": ["BTC"], "ma_window": 10,
+            "force_simulation": False, "start_paused": False,
+            "telegram_enabled": False, "schedule": {},
+            "explosive_era_threshold": 75.0,
+        }
+        config.update(overrides)
+        return QuantBot(config=config, exchange=exchange,
+                        notifier=FakeNotifier(), store=TradeStore(tmp_path / "t.db"))
+
+    @pytest.mark.parametrize("cagr,expected", [
+        (250.0, "폭등"), (100.0, "폭등"), (75.1, "폭등"),
+        (75.0, "성숙"), (50.0, "성숙"), (25.1, "성숙"),
+        (25.0, "안정"), (10.0, "안정"), (0.0, "안정"),
+        (-0.1, "쇠퇴"), (-40.0, "쇠퇴"),
+    ])
+    def test_four_phases(self, tmp_path, cagr, expected):
+        assert self._bot(tmp_path).classify_era(cagr) == expected
+
+    def test_only_explosive_changes_behavior(self, tmp_path):
+        """안정·쇠퇴는 성숙기와 동일하게 필터가 켜진 채로 동작해야 한다"""
+        bot = self._bot(tmp_path, bear_market_exit=True, btc_breakout_confirm=True,
+                        bear_exit_ma_window=5, explosive_era_guard=False)
+        bot.market_regime = False
+
+        for cagr in (50.0, 10.0, -30.0):             # 성숙 / 안정 / 쇠퇴
+            bot.era_cagr = cagr
+            bot.explosive_era = False
+            assert bot.exit_ma_window() == 5
+            assert bot.needs_btc_confirm("ETH") is True
+
+        bot.explosive_era = True                      # 폭등기만 해제
+        assert bot.exit_ma_window() == 10
+        assert bot.needs_btc_confirm("ETH") is False
