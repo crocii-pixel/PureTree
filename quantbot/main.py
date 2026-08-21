@@ -180,6 +180,13 @@ class QuantBot:
         self.entry_allowed: Dict[str, bool] = {t: True for t in self.tickers}
         self.filter_reason: Dict[str, str] = {t: "" for t in self.tickers}
 
+        # 주문 사이징 (equal = 1/N 균등, atr = 변동성 기반 리스크 사이징)
+        self.position_sizing: str = str(self.config.get("position_sizing", "equal")).lower()
+        self.risk_per_trade: float = float(self.config.get("risk_per_trade", 0.01))
+        self.atr_window: int = int(self.config.get("atr_window", 20))
+        self.atr_stop_multiple: float = float(self.config.get("atr_stop_multiple", 2.0))
+        self.atr_values: Dict[str, float] = {t: 0.0 for t in self.tickers}
+
         # GUI(트레이) 제어용 이벤트. pause_event가 set이면 매매 감시를 일시 중단합니다.
         self.pause_event = threading.Event()
         self.stop_event = threading.Event()
@@ -202,6 +209,7 @@ class QuantBot:
             f"• 모드: <b>{mode_str}</b>\n"
             f"• 대상 종목({len(self.tickers)}개): {', '.join(self.tickers)}\n"
             f"• 전략: {'동적 K (20일 노이즈 비율)' if self.use_dynamic_k else f'고정 K({self.k})'} + MA{self.ma_window} 모멘텀\n"
+            f"• 사이징: {self.sizing_summary()}\n"
             f"----------------------------------\n"
             f"{state_line}"
         )
@@ -243,6 +251,68 @@ class QuantBot:
         if self.exchange.is_simulation:
             return TradeStore.SIMULATION_STATUSES
         return TradeStore.LIVE_STATUSES
+
+    # ------------------------------------------------------------------
+    # 주문 사이징
+    # ------------------------------------------------------------------
+    def sizing_summary(self) -> str:
+        """현재 주문 사이징 방식을 한 줄로 설명 (상태 리포트/기동 메시지용)"""
+        if self.position_sizing == "atr":
+            return (f"ATR 리스크 {self.risk_per_trade * 100:.1f}% "
+                    f"(손절폭 {self.atr_stop_multiple:g}N, ATR{self.atr_window})")
+        return f"균등 1/{len(self.tickers)} 분할"
+
+    def total_equity(self) -> float:
+        """
+        사이징 기준이 되는 총 평가 자산(원화 + 보유 코인).
+
+        조회 실패 시 주문가능 원화로 대체합니다. 사이징이 조금 보수적으로 잡힐 뿐
+        매매가 중단되지는 않습니다.
+        """
+        try:
+            report = self.exchange.get_total_balance_krw(self.tickers)
+            return float(report["total_eval"])
+        except Exception as e:
+            logger.warning(f"총자산 조회 실패({e}). 주문가능 원화로 대체합니다.")
+            return self.exchange.get_balance("KRW", use_available=True)
+
+    def atr_budget(self, ticker: str) -> float:
+        """
+        ATR 기반 주문 금액 산출 (수수료 안전마진 적용 **전** 금액).
+
+            수량 = 총자산 x 리스크비율 / (손절배수 x N)
+            금액 = 수량 x 현재가
+
+        손절폭(2N)만큼 불리하게 움직였을 때 잃는 금액이 총자산의 risk_per_trade가
+        되도록 맞춥니다. 변동성이 큰 종목일수록 적게 사게 됩니다.
+
+        :return: 주문 금액 (산출 불가 시 0.0)
+        """
+        atr = self.atr_values.get(ticker, 0.0)
+        price = self.exchange.get_current_price(ticker) or 0.0
+        if atr <= 0 or price <= 0:
+            logger.warning(f"[{ticker}] ATR({atr}) 또는 현재가({price}) 이상 - 사이징 불가")
+            return 0.0
+
+        stop_distance = self.atr_stop_multiple * atr
+        units = (self.total_equity() * self.risk_per_trade) / stop_distance
+        return units * price
+
+    def plan_order_budget(self, ticker: str) -> Tuple[float, Optional[float]]:
+        """
+        설정된 사이징 방식으로 이번 주문의 예산을 계산합니다.
+
+        :return: (수수료 안전마진이 반영된 예상 투입액, buy_market에 넘길 budget_krw)
+            budget_krw가 None이면 균등 분할(budget_ratio) 방식을 사용합니다.
+        """
+        if self.position_sizing == "atr":
+            raw = self.atr_budget(ticker)
+            # buy_market이 안전마진을 다시 곱하므로 raw를 그대로 넘기고,
+            # 최소주문금액 비교에는 마진이 반영된 값을 씁니다.
+            return raw * self.exchange.ORDER_SAFETY_RATIO, raw
+
+        ratio = 1.0 / max(len(self.tickers), 1)
+        return self.exchange.estimate_order_budget(ratio), None
 
     def resolve_schedule(self) -> Tuple[str, str, bool]:
         """
@@ -536,6 +606,7 @@ class QuantBot:
             f"• <b>거래소</b>: {self.exchange.DISPLAY_NAME}",
             f"• <b>실행 모드</b>: <b>{mode_str}</b>",
             f"• <b>상태</b>: <b>{state}</b>",
+            f"• <b>사이징</b>: {self.sizing_summary()}",
             "----------------------------------"
         ]
 
@@ -608,6 +679,10 @@ class QuantBot:
                         ma_value=eval_res.get("ma_value"),
                         close_price=eval_res.get("current_price"),
                     )
+
+                # ATR은 사이징에 쓰이므로 일일 루틴에서 함께 갱신 (추가 API 호출 없음)
+                self.atr_values[ticker] = self.strategy_engine.calculate_atr(
+                    df, self.atr_window)
 
                 allowed, reason = self.evaluate_entry_filters(ticker)
                 self.entry_allowed[ticker] = allowed
@@ -781,7 +856,7 @@ class QuantBot:
 
                     # 잔고 부족은 당일 안에 해소되지 않으므로 주문을 시도하지 않고 종목을 제외합니다.
                     # (매초 주문 시도 -> 거부 로그 반복 및 거래소 API 과다 호출 방지)
-                    budget = self.exchange.estimate_order_budget(budget_ratio)
+                    budget, explicit_budget = self.plan_order_budget(ticker)
                     if budget < self.exchange.MIN_ORDER_KRW:
                         self.skipped_today[ticker] = True
                         skip_msg = (
@@ -812,8 +887,12 @@ class QuantBot:
                         order_code = self.store.next_order_code(
                             self.exchange.NAME, ticker, self.trade_date())
 
-                    buy_result = self.exchange.buy_market(
-                        ticker, budget_ratio=budget_ratio, order_code=order_code)
+                    if explicit_budget is not None:
+                        buy_result = self.exchange.buy_market(
+                            ticker, budget_krw=explicit_budget, order_code=order_code)
+                    else:
+                        buy_result = self.exchange.buy_market(
+                            ticker, budget_ratio=budget_ratio, order_code=order_code)
 
                     if buy_result:
                         self.has_bought[ticker] = True

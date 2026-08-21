@@ -91,6 +91,33 @@ class StrategyEngine:
 
         return float(target_price)
 
+    @staticmethod
+    def calculate_atr(df: pd.DataFrame, window: int = 20) -> float:
+        """
+        N(ATR, Average True Range) 산출 - 변동성 기반 주문 사이징의 기준값.
+
+        True Range = max(고가-저가, |고가-전일종가|, |저가-전일종가|)
+        Data Leakage 방지를 위해 **당일 미확정 봉을 제외**하고 계산합니다.
+
+        :param df: OHLCV DataFrame
+        :param window: 평균 기간 (기본 20일)
+        :return: ATR (산출 불가 시 0.0)
+        """
+        if df is None or len(df) < window + 2:
+            logger.warning(f"ATR 계산 데이터 부족 ({len(df) if df is not None else 0}/{window + 2})")
+            return 0.0
+
+        closed = df.iloc[:-1]          # 진행 중인 봉 제외
+        prev_close = closed["close"].shift(1)
+        true_range = pd.concat([
+            closed["high"] - closed["low"],
+            (closed["high"] - prev_close).abs(),
+            (closed["low"] - prev_close).abs(),
+        ], axis=1).max(axis=1)
+
+        atr = true_range.iloc[-window:].mean()
+        return float(atr) if pd.notna(atr) else 0.0
+
     def calculate_ma(self, df: pd.DataFrame, window: Optional[int] = None) -> float:
         """
         전일 마감 종가 기준 이동평균선(MA) 계산 (Data Leakage 방지)

@@ -1764,7 +1764,147 @@ class TestEntryFilters:
 
 
 # ======================================================================
-# 14. 아이콘 생성 (Seed + Trading)
+# 14. 주문 사이징 (균등 / ATR 리스크)
+# ======================================================================
+class TestPositionSizing:
+    """
+    ATR 사이징은 백테스트에서 수익률을 다소 낮추는 대신 낙폭을 일관되게 줄였다.
+    (8종목 기준 OOS 최악 MDD 27.8% -> 18.1%)
+    """
+
+    def _make_bot(self, tmp_path, **overrides):
+        from main import QuantBot
+        from trade_store import TradeStore
+
+        exchange = DummyExchange(price=1000.0, krw=1_000_000.0, coin=0.0,
+                                 api_key="k", secret_key="s")
+        config = {
+            "exchange": "dummy", "tickers": ["BTC", "ETH"], "ma_window": 10,
+            "force_simulation": False, "start_paused": False,
+            "telegram_enabled": False, "schedule": {},
+        }
+        config.update(overrides)
+        bot = QuantBot(config=config, exchange=exchange,
+                       notifier=FakeNotifier(), store=TradeStore(tmp_path / "t.db"))
+        return bot
+
+    # -- 기본값 --------------------------------------------------------
+    def test_default_is_equal_split(self, tmp_path):
+        assert config_manager.DEFAULT_CONFIG["position_sizing"] == "equal"
+
+        bot = self._make_bot(tmp_path)
+        assert bot.position_sizing == "equal"
+        assert "균등" in bot.sizing_summary()
+
+    def test_equal_sizing_uses_one_over_n(self, tmp_path):
+        bot = self._make_bot(tmp_path)
+        planned, explicit = bot.plan_order_budget("BTC")
+
+        # 종목 2개 -> 주문가능 원화의 1/2 (수수료 안전마진 반영)
+        expected = 1_000_000.0 * 0.5 * bot.exchange.ORDER_SAFETY_RATIO
+        assert planned == pytest.approx(expected)
+        assert explicit is None          # budget_ratio 경로 사용
+
+    # -- ATR 사이징 -----------------------------------------------------
+    def test_atr_sizing_scales_with_volatility(self, tmp_path):
+        """변동성이 2배면 주문 금액은 절반이 되어야 한다"""
+        bot = self._make_bot(tmp_path, position_sizing="atr", risk_per_trade=0.01)
+        bot.exchange.krw = 0.0           # 총자산은 코인 평가로만
+        bot.exchange.coin = 1000.0       # 1000 x 1000원 = 100만원
+
+        bot.atr_values["BTC"] = 10.0
+        low_vol = bot.atr_budget("BTC")
+
+        bot.atr_values["BTC"] = 20.0
+        high_vol = bot.atr_budget("BTC")
+
+        assert low_vol == pytest.approx(high_vol * 2)
+
+    def test_atr_budget_formula(self, tmp_path):
+        """수량 = 총자산 x 리스크 / (손절배수 x N),  금액 = 수량 x 현재가"""
+        bot = self._make_bot(tmp_path, position_sizing="atr",
+                             risk_per_trade=0.02, atr_stop_multiple=2.0)
+        bot.atr_values["BTC"] = 50.0
+
+        equity = bot.total_equity()
+        expected_units = equity * 0.02 / (2.0 * 50.0)
+        assert bot.atr_budget("BTC") == pytest.approx(expected_units * 1000.0)
+
+    def test_atr_sizing_passes_explicit_budget(self, tmp_path):
+        bot = self._make_bot(tmp_path, position_sizing="atr")
+        bot.atr_values["BTC"] = 50.0
+
+        planned, explicit = bot.plan_order_budget("BTC")
+        assert explicit is not None                      # budget_krw 경로 사용
+        # planned는 안전마진이 반영된 값 (최소주문금액 비교용)
+        assert planned == pytest.approx(explicit * bot.exchange.ORDER_SAFETY_RATIO)
+
+    def test_atr_sizing_without_atr_returns_zero(self, tmp_path):
+        """ATR 산출 전에는 주문 금액 0 -> 최소주문금액 미달로 자연히 건너뜀"""
+        bot = self._make_bot(tmp_path, position_sizing="atr")
+        assert bot.atr_budget("BTC") == 0.0
+
+    def test_equity_falls_back_to_krw_on_error(self, tmp_path, monkeypatch):
+        """총자산 조회가 실패해도 매매가 멈추지 않아야 한다"""
+        bot = self._make_bot(tmp_path, position_sizing="atr")
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("API 장애")
+
+        monkeypatch.setattr(bot.exchange, "get_total_balance_krw", boom)
+        assert bot.total_equity() == pytest.approx(1_000_000.0)   # 주문가능 원화로 대체
+
+    # -- 매매 경로 연결 -------------------------------------------------
+    def test_atr_sizing_actually_used_on_buy(self, tmp_path):
+        bot = self._make_bot(tmp_path, position_sizing="atr", risk_per_trade=0.01)
+        bot.atr_values = {"BTC": 50.0, "ETH": 50.0}
+        bot.target_prices = {"BTC": 500.0, "ETH": 500.0}
+        bot.is_above_ma = {"BTC": True, "ETH": True}
+
+        bot.monitor_market()
+
+        assert len(bot.exchange.placed) == 2
+        # 균등 분할(50만원)이 아니라 ATR 기준 금액이어야 함
+        for order in bot.exchange.placed:
+            assert order["budget"] < 500_000
+
+    def test_atr_sizing_skips_when_below_minimum(self, tmp_path):
+        """ATR이 매우 커서 주문금액이 최소주문금액 미만이면 당일 제외"""
+        bot = self._make_bot(tmp_path, position_sizing="atr", risk_per_trade=0.0001)
+        bot.atr_values = {"BTC": 500.0, "ETH": 500.0}
+        bot.target_prices = {"BTC": 500.0, "ETH": 500.0}
+        bot.is_above_ma = {"BTC": True, "ETH": True}
+
+        bot.monitor_market()
+
+        assert bot.exchange.placed == []
+        assert bot.skipped_today["BTC"] is True
+
+    def test_sizing_summary_shows_mode(self, tmp_path):
+        atr_bot = self._make_bot(tmp_path, position_sizing="atr", risk_per_trade=0.02)
+        summary = atr_bot.sizing_summary()
+        assert "ATR" in summary and "2.0%" in summary
+        assert "사이징" in atr_bot.get_status_report()
+
+    def test_atr_indicator_excludes_in_progress_candle(self):
+        """진행 중인 봉은 값이 계속 바뀌므로 ATR 계산에서 제외해야 한다"""
+        from strategy_engine import StrategyEngine
+
+        base = make_ohlcv(40)
+        normal = StrategyEngine.calculate_atr(base, 20)
+
+        spiked = base.copy()
+        spiked.iloc[-1, spiked.columns.get_loc("high")] = 99999.0   # 마지막 봉만 급등
+        assert StrategyEngine.calculate_atr(spiked, 20) == pytest.approx(normal)
+
+    def test_atr_indicator_insufficient_data(self):
+        from strategy_engine import StrategyEngine
+
+        assert StrategyEngine.calculate_atr(make_ohlcv(5), 20) == 0.0
+
+
+# ======================================================================
+# 15. 아이콘 생성 (Seed + Trading)
 # ======================================================================
 class TestIconGeneration:
 
@@ -1818,7 +1958,7 @@ class TestIconGeneration:
 
 
 # ======================================================================
-# 15. 트레이 GUI (위젯 생성 없이 로직만 검증)
+# 16. 트레이 GUI (위젯 생성 없이 로직만 검증)
 # ======================================================================
 class TestTrayGui:
 

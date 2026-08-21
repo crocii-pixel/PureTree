@@ -110,6 +110,16 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # 수익률 개선은 확인되지 않았고(15/29 구간) 낙폭만 줄었습니다(25/29 구간).
     "btc_regime_filter": False,
     "btc_decline_threshold": -0.05,
+    # 주문 사이징 방식
+    #   "equal" : 종목당 자본의 1/N 균등 투입 (기본)
+    #   "atr"   : 리스크 비율 x 총자산 / (손절폭 2N).  변동성이 큰 종목은 적게 삼
+    # 백테스트에서 ATR 사이징은 수익률을 다소 낮추는 대신 낙폭을 일관되게 줄였습니다.
+    # (8종목 기준 OOS 최악 MDD 27.8% -> 18.1%)
+    "position_sizing": "equal",
+    "risk_per_trade": 0.01,
+    "atr_window": 20,
+    "atr_stop_multiple": 2.0,
+
     "force_simulation": False,
 
     # 로그 파일 회전 주기: "monthly" | "weekly" | "daily"
