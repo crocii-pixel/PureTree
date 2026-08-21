@@ -2430,6 +2430,56 @@ class TestBearMarketExit:
         assert bot.explosive_era is not None      # 같은 조회로 era도 판정됨
         assert bot.era_cagr is not None
 
+
+    def test_btc_filter_released_in_explosive_era(self, tmp_path):
+        """
+        폭등기에는 BTC 하락 필터도 해제해야 한다.
+
+        업비트 9년치 기준 이 필터는 성숙기에만 유효하다.
+          성숙기 2021~2026 : CAGR 우세 12/14 · MDD 우세 11/14
+          폭등기 2017~2021 : CAGR 우세  1/8  · MDD 우세  4/8
+        폭등기에는 눌림목마다 진입을 막아 상승분을 놓치기 때문이다.
+        """
+        falling = [200.0 - i for i in range(40)]         # BTC 20일 수익률 급락
+        daily = pd.DataFrame(
+            {"open": falling, "high": falling, "low": falling,
+             "close": falling, "volume": [1.0] * len(falling)},
+            index=pd.date_range("2026-01-01", periods=len(falling), freq="D"))
+
+        bot = self._make_bot(tmp_path, btc_regime_filter=True)
+        bot.exchange.get_ohlcv = lambda *a, **k: daily
+
+        bot.explosive_era = False                        # 성숙기 -> 필터 작동
+        assert bot.btc_regime_ok("ETH") is False
+
+        bot.explosive_era = True                         # 폭등기 -> 해제
+        assert bot.btc_regime_ok("ETH") is True
+
+    def test_btc_filter_never_blocks_btc_itself(self, tmp_path):
+        bot = self._make_bot(tmp_path, btc_regime_filter=True)
+        bot.explosive_era = False
+        assert bot.btc_regime_ok("BTC") is True
+
+    def test_era_computed_for_btc_filter_alone(self, tmp_path):
+        """국면 전환이 꺼져 있어도 BTC 필터를 쓰면 era는 산출되어야 한다"""
+        rising = [100.0 * (1.02 ** i) for i in range(60)]
+        bot = self._make_bot(tmp_path, monthly=self._monthly(rising),
+                             bear_market_exit=False, btc_regime_filter=True,
+                             explosive_era_guard=True, explosive_era_years=4)
+
+        assert bot.detect_market_regime() is None        # 국면 전환은 꺼짐
+        assert bot.explosive_era is not None             # era는 산출됨
+
+    def test_no_monthly_fetch_when_nothing_needs_it(self, tmp_path):
+        """두 옵션 모두 꺼져 있으면 월봉을 조회하지 않는다 (불필요한 API 호출 방지)"""
+        bot = self._make_bot(tmp_path, bear_market_exit=False, btc_regime_filter=False,
+                             explosive_era_guard=True)
+        calls = []
+        bot.exchange.get_ohlcv = lambda *a, **k: calls.append(k) or make_ohlcv()
+
+        assert bot.detect_market_regime() is None
+        assert calls == []
+
     # -- 표시 ----------------------------------------------------------
     def test_summary_reports_regime(self, tmp_path):
         bot = self._make_bot(tmp_path, bear_market_exit=True, bear_exit_ma_window=5,

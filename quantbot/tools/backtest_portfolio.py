@@ -54,11 +54,11 @@ def add_atr(df: pd.DataFrame) -> pd.DataFrame:
 
 def prepare(tickers: List[str], days: int, ma_window: int) -> Dict[str, pd.DataFrame]:
     """종목별 지표가 계산된 데이터 준비"""
-    import pyupbit
+    from tools.market_data import fetch_upbit
 
     prepared: Dict[str, pd.DataFrame] = {}
     for ticker in tickers:
-        raw = pyupbit.get_ohlcv(f"KRW-{ticker}", interval="day", count=days)
+        raw = fetch_upbit(ticker, count=days)
         if raw is None or len(raw) < 200:
             continue
         prepared[ticker] = add_atr(add_daily_indicators(raw, ma_window))
@@ -202,7 +202,8 @@ def run_portfolio(
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="포트폴리오 ATR 사이징 백테스트")
     parser.add_argument("--tickers", nargs="+", default=None)
-    parser.add_argument("--days", type=int, default=2000)
+    # 업비트 KRW-BTC는 2017-09부터 (tools/market_data.py 참고)
+    parser.add_argument("--days", type=int, default=3500)
     parser.add_argument("--ma", type=int, default=10)
     args = parser.parse_args(argv)
 

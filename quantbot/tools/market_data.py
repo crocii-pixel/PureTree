@@ -114,6 +114,56 @@ def fetch_ohlcv(exchange: str, symbol: str, timeframe: str = "1d",
         return None
 
 
+# 업비트 KRW-BTC는 2017-09부터라 약 3250봉. 넉넉히 요청해 전체를 받습니다.
+UPBIT_FULL_COUNT = 3500
+
+
+def fetch_upbit(ticker: str, count: int = UPBIT_FULL_COUNT,
+                refresh: bool = False) -> Optional[pd.DataFrame]:
+    """
+    업비트 KRW 마켓 일봉을 **전체 기간** 받아옵니다.
+
+    pyupbit는 count를 준 만큼만 돌려줍니다. 관행적으로 쓰던 count=2000은
+    5.5년치에 불과해, 전환이 드문 신호(월봉 국면 등)의 검증 결과를 뒤집을 수
+    있습니다. 백테스트에서는 이 함수를 써서 항상 전체 기간을 받으세요.
+
+    :return: pyupbit 형식의 DataFrame. 실패 시 None
+    """
+    cache = _cache_path("upbit", f"KRW-{ticker}", "1d")
+    if cache.exists() and not refresh:
+        return pd.read_csv(cache, index_col=0, parse_dates=True)
+
+    try:
+        import pyupbit
+    except ImportError:
+        logger.error("pyupbit가 필요합니다")
+        return None
+
+    try:
+        df = pyupbit.get_ohlcv(f"KRW-{ticker}", interval="day", count=count)
+        if df is None or df.empty:
+            return None
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        df.to_csv(cache)
+        logger.info(f"[수집] 업비트 KRW-{ticker} {len(df)}건 ({df.index[0].date()}~)")
+        return df
+    except Exception as e:
+        logger.error(f"업비트 KRW-{ticker} 수집 실패: {e}")
+        return None
+
+
+def load_upbit_many(tickers: List[str], refresh: bool = False,
+                    min_rows: int = 400) -> dict:
+    """업비트 여러 종목을 전체 기간으로 수집. 얕은 종목은 제외합니다."""
+    out = {}
+    for ticker in tickers:
+        df = fetch_upbit(ticker, refresh=refresh)
+        if df is not None and len(df) >= min_rows:
+            out[ticker] = df
+            time.sleep(0.15)
+    return out
+
+
 def load_many(exchange: str, symbols: List[str], refresh: bool = False,
               min_rows: int = 400) -> dict:
     """여러 종목을 한 번에 수집. 데이터가 얕은 종목은 제외합니다."""

@@ -103,11 +103,13 @@ def walk_forward(raw: pd.DataFrame, ticker: str, is_days: int = 365,
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    import pyupbit
+    from tools.market_data import fetch_upbit
 
     parser = argparse.ArgumentParser(description="워크포워드 검증")
     parser.add_argument("--tickers", nargs="+", default=["BTC", "ETH", "SOL", "XRP"])
-    parser.add_argument("--days", type=int, default=2000)
+    # 업비트 KRW-BTC는 2017-09부터 있습니다. count를 적게 주면 그만큼만 돌아오므로
+    # 전체 기간을 받도록 기본값을 넉넉히 잡습니다 (tools/market_data.py 참고).
+    parser.add_argument("--days", type=int, default=3500)
     parser.add_argument("--is-days", type=int, default=365)
     parser.add_argument("--oos-days", type=int, default=180)
     parser.add_argument("--weekly", action="store_true", help="주봉 필터를 적용한 상태로 검증")
@@ -122,7 +124,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     all_records: List[Dict[str, Any]] = []
     for ticker in args.tickers:
-        raw = pyupbit.get_ohlcv(f"KRW-{ticker}", interval="day", count=args.days)
+        raw = fetch_upbit(ticker, count=args.days)
         if raw is None or len(raw) < args.is_days + args.oos_days + WARMUP_DAYS:
             print(f"  [{ticker}] 데이터 부족 - 건너뜀")
             continue

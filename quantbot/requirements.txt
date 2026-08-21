@@ -3,6 +3,7 @@ pybithumb>=1.0.21        # 빗썸 (Bithumb)
 pyupbit>=0.2.31          # 업비트 (Upbit)
 PyJWT>=2.8.0             # 업비트 JWT 인증 (pyupbit 의존성)
 requests>=2.31.0         # 코인원(Coinone) Open API v2.1 직접 연동 / 텔레그램
+websocket-client>=1.6.0  # 빗썸 공개 실시간 체결/호가 그림자 기록기
 
 # --- 데이터 / 전략 ---
 pandas>=2.0.0

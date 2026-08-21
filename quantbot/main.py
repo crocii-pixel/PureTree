@@ -383,14 +383,22 @@ class QuantBot:
         """
         BTC 하락 국면에서 알트코인 진입을 차단합니다.
 
-        검증 결과 수익률 개선 근거는 없었고(29개 구간 중 15개) 낙폭만 일관되게
-        줄었으므로(25개), 기본값은 꺼져 있습니다. BTC 자신에게는 적용하지 않습니다.
+        업비트 KRW 9년치(14종목)로 다시 보면 효과가 **시대에 따라 갈립니다**.
+          성숙기 2021~2026 : CAGR 우세 12/14 · MDD 우세 11/14 · 둘 다 9/14
+          폭등기 2017~2021 : CAGR 우세  1/8  · MDD 우세  4/8  · 둘 다 1/8
+        폭등기에는 눌림목마다 진입을 막아 상승분을 놓칩니다. 그래서 국면 전환과
+        똑같이 **폭등기로 판정되면 필터를 해제**합니다.
 
-        :return: 필터가 꺼져 있거나 BTC이거나 데이터 부족 시 True
+        BTC 자신에게는 적용하지 않습니다(기준이 되는 종목이므로).
+
+        :return: 필터가 꺼져 있거나 폭등기이거나 BTC이거나 데이터 부족 시 True
         """
         if not self.config.get("btc_regime_filter", False):
             return True
         if ExchangeBase.to_symbol(ticker) == "BTC":
+            return True
+        if self.explosive_era:                 # 폭등기 -> 눌림목도 사야 한다
+            logger.info(f"[{ticker}] 폭등기 - BTC 하락 필터 해제")
             return True
 
         threshold = float(self.config.get("btc_decline_threshold", -0.05))
@@ -423,21 +431,26 @@ class QuantBot:
 
         :return: True=상승 국면, False=하락 국면, None=판정 불가(데이터 부족/조회 실패)
         """
-        if not self.bear_market_exit:
-            self.explosive_era = None
+        self.explosive_era = None
+        # era 가드는 BTC 하락 필터도 함께 쓰므로, 국면 전환이 꺼져 있어도 산출합니다
+        wants_era = self.explosive_era_guard and (
+            self.bear_market_exit or bool(self.config.get("btc_regime_filter", False)))
+        if not (self.bear_market_exit or wants_era):
             return None
 
         need = self.regime_ma_months + 2       # MA 계산 + 진행 중인 달 제외
-        if self.explosive_era_guard:
+        if wants_era:
             # 후행 성장률 계산에 필요한 개월 수도 함께 확보 (조회는 한 번만)
             need = max(need, self.era_years * 12 + 2)
 
         closed = self._monthly_closes(need)
         if closed is None:
-            self.explosive_era = None
             return None
 
-        self.explosive_era = self.detect_explosive_era(closed)
+        if wants_era:
+            self.explosive_era = self.detect_explosive_era(closed)
+        if not self.bear_market_exit:
+            return None
 
         ma = float(closed.iloc[-self.regime_ma_months:].mean())
         return bool(float(closed.iloc[-1]) > ma)
