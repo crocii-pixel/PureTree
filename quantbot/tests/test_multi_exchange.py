@@ -2984,3 +2984,42 @@ class TestStartupBacktest:
 
         message = bot._format_startup_backtest(6, opt, {}, ["FOO", "BAR"])
         assert "FOO" in message and "BAR" in message
+
+
+# ======================================================================
+# 21. 시세 캐시 위치
+# ======================================================================
+class TestMarketDataCache:
+    """
+    PyInstaller exe에서 `__file__`은 임시 해제 경로(_MEIPASS)를 가리키고
+    그 폴더는 종료 시 삭제된다. 캐시를 거기에 두면 봇을 켤 때마다 9년치
+    시세를 다시 받아(약 50초) 거래소 API에 불필요한 부하를 준다.
+    """
+
+    def test_dev_uses_tools_cache(self, monkeypatch):
+        from tools import market_data
+
+        monkeypatch.delattr(sys, "frozen", raising=False)
+        assert market_data._cache_dir().name == "_cache"
+
+    def test_frozen_uses_data_dir(self, monkeypatch, tmp_path):
+        from tools import market_data
+
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+        monkeypatch.setattr(config_manager, "DATA_DIR", tmp_path, raising=False)
+
+        cache = market_data._cache_dir()
+        assert cache.parent == tmp_path      # 로그·DB와 같은 폴더
+        assert "MEI" not in str(cache)
+
+    def test_frozen_falls_back_to_exe_folder(self, monkeypatch, tmp_path):
+        """설정 모듈을 못 읽어도 임시 폴더로 돌아가면 안 된다"""
+        from tools import market_data
+
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+        monkeypatch.setattr(sys, "executable", str(tmp_path / "QuantBot.exe"),
+                            raising=False)
+        monkeypatch.setitem(sys.modules, "config_manager", None)
+
+        cache = market_data._cache_dir()
+        assert cache.parent == tmp_path

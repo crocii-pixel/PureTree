@@ -37,8 +37,29 @@ import pandas as pd
 
 logger = logging.getLogger("MarketData")
 
+
+def _cache_dir() -> Path:
+    """
+    시세 캐시 위치.
+
+    PyInstaller로 빌드하면 `__file__`이 임시 해제 경로(_MEIPASS)를 가리키고
+    그 폴더는 **종료 시 삭제**됩니다. 그대로 두면 봇을 켤 때마다 9년치 시세를
+    처음부터 다시 받아(약 50초) 거래소 API에도 불필요한 부하를 줍니다.
+    빌드된 실행파일에서는 로그·DB와 같은 폴더에 두어 재사용합니다.
+
+    개발 환경에서는 기존 경로(tools/_cache)를 그대로 씁니다.
+    """
+    if getattr(sys, "frozen", False):
+        try:
+            import config_manager
+            return config_manager.DATA_DIR / "market_cache"
+        except Exception:
+            return Path(sys.executable).resolve().parent / "market_cache"
+    return Path(__file__).resolve().parent / "_cache"
+
+
 # 캐시는 저장소에 커밋하지 않습니다 (.gitignore 등록)
-CACHE_DIR = Path(__file__).resolve().parent / "_cache"
+CACHE_DIR = _cache_dir()
 
 # 거래소별 시작 시점 (그 이전을 요청하면 빈 응답이 오므로 낭비를 줄임)
 EXCHANGE_START = {
