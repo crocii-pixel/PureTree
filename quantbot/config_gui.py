@@ -437,6 +437,13 @@ def build_config_window(parent: Any = None) -> Any:
             self.bear_exit.setChecked(bool(self.config.get("bear_market_exit", False)))
             layout.addWidget(self.bear_exit)
 
+            era = QtWidgets.QLabel(
+                "* 시장이 폭등기(BTC 후행 4년 성장률 75%/년 초과)로 판정되면 위 전환은 "
+                "자동으로 해제됩니다. 폭등기에는 들고 있는 편이 낫기 때문입니다.")
+            era.setObjectName("Hint")
+            era.setWordWrap(True)
+            layout.addWidget(era)
+
             def _sync(_=None) -> None:
                 self.risk_spin.setEnabled(self.sizing_combo.currentData() == "atr")
                 self.bear_exit_spin.setEnabled(self.bear_exit.isChecked())

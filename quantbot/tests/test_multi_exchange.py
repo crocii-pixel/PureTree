@@ -2137,12 +2137,14 @@ class TestBearMarketExit:
     """
     하락 국면에서만 더 짧은 MA로 청산하는 옵션.
 
-    검증 근거 (업비트 일봉 2000일 / 14종목):
-      - 대조군   : 국면 무시하고 항상 MA5로 청산하면 CAGR 49.2 -> 44.3으로 손해.
-                   하락 국면에 한정할 때만 이득이 남는다 (국면과의 상호작용).
-      - 검증종목 : 개발에 쓰지 않은 10종목에서 CAGR 33.0 -> 38.5, MDD 62.8 -> 58.0
-      - 민감도   : 국면 판정 MA를 3/6/9/12 무엇으로 해도 결론이 같다 (고원)
-    견고한 것은 낙폭 감소이고 수익률 상승은 덤이므로 기본값은 꺼짐이다.
+    검증 근거 (업비트 KRW 일봉 9년치 2017-09~2026-08 / 국면 전환 18회):
+      - 전체 14종목    : CAGR 64.0 -> 66.6,  MDD 58.8 -> 53.7 (MDD 우세 11/14)
+      - 2017~2021 신규 : CAGR 201.9 -> 199.3, MDD 46.1 -> 43.7 (MDD 우세 6/8)
+      - 대조군        : 항상 MA5로 청산하면 손해. 하락 국면 한정일 때만 이득이 남는다.
+      - 민감도        : 국면 판정 MA를 3/6/9/12 무엇으로 해도 결론이 같다 (고원)
+
+    수익률 개선은 처음 5.5년치에서만 보였고 손대지 않은 2017~2021 구간에서 사라졌다
+    (CAGR 우세 4/8). 남는 효과는 낙폭 감소뿐이므로 기본값은 꺼짐이다.
     """
 
     def _make_bot(self, tmp_path, monthly=None, **overrides):
@@ -2163,6 +2165,8 @@ class TestBearMarketExit:
             "exchange": "dummy", "tickers": ["BTC", "ETH"], "ma_window": 10,
             "force_simulation": False, "start_paused": False,
             "telegram_enabled": False, "schedule": {},
+            # 국면 판정만 보는 테스트가 era 가드(월봉 50개 필요)에 흔들리지 않도록
+            "explosive_era_guard": False,
         }
         config.update(overrides)
         return QuantBot(config=config, exchange=exchange,
@@ -2348,6 +2352,83 @@ class TestBearMarketExit:
         # 상승 국면에서는 진입/청산 판정이 같은 MA -> 같은 값
         for ticker in bot.tickers:
             assert bot.is_above_exit_ma[ticker] == bot.is_above_ma[ticker]
+
+
+    # -- 폭등기 가드 ----------------------------------------------------
+    def test_explosive_era_disables_switching(self, tmp_path):
+        """
+        폭등기에는 국면 전환을 꺼야 한다.
+
+        반감기 1·2기(보유 CAGR 200%/96%)에서는 국면 전환이 손해였고
+        3·4기(67%/7%)에서만 이득이었다. 폭등기에 하락 국면마다 빠르게 청산하면
+        상승분을 잘라먹기 때문이다.
+        """
+        bot = self._make_bot(tmp_path, bear_market_exit=True, bear_exit_ma_window=5)
+        bot.market_regime = False                # 하락 국면
+
+        bot.explosive_era = False                # 성숙기 -> 전환 작동
+        assert bot.exit_ma_window() == 5
+
+        bot.explosive_era = True                 # 폭등기 -> 전환 해제
+        assert bot.exit_ma_window() == 10
+
+    def test_detects_explosive_era_from_growth(self, tmp_path):
+        """후행 4년 성장률이 임계를 넘으면 폭등기"""
+        bot = self._make_bot(tmp_path, bear_market_exit=True, explosive_era_guard=True,
+                             explosive_era_threshold=75.0, explosive_era_years=4)
+
+        # 4년간 16배 -> 연 100% -> 폭등기
+        boom = pd.Series([100.0 * (2 ** (i / 12)) for i in range(50)])
+        assert bot.detect_explosive_era(boom) is True
+        assert bot.era_cagr == pytest.approx(100.0, abs=1.0)
+
+        # 4년간 2배 -> 연 약 19% -> 성숙기
+        calm = pd.Series([100.0 * (2 ** (i / 48)) for i in range(50)])
+        assert bot.detect_explosive_era(calm) is False
+
+    def test_era_guard_can_be_turned_off(self, tmp_path):
+        bot = self._make_bot(tmp_path, bear_market_exit=True,
+                             explosive_era_guard=False)
+        boom = pd.Series([100.0 * (2 ** (i / 12)) for i in range(50)])
+        assert bot.detect_explosive_era(boom) is None
+
+    def test_era_guard_needs_enough_history(self, tmp_path):
+        """성장률 산출 기간이 모자라면 가드를 적용하지 않는다"""
+        bot = self._make_bot(tmp_path, bear_market_exit=True, explosive_era_guard=True,
+                             explosive_era_years=4)
+        assert bot.detect_explosive_era(pd.Series([100.0] * 10)) is None
+
+    def test_era_guard_survives_zero_price(self, tmp_path):
+        bot = self._make_bot(tmp_path, bear_market_exit=True, explosive_era_guard=True,
+                             explosive_era_years=4)
+        # 기준 시점(48개월 전)이 0이면 성장률을 낼 수 없다
+        broken = pd.Series([0.0] + [100.0] * 48)
+        assert bot.detect_explosive_era(broken) is None
+
+    def test_summary_reports_explosive_era(self, tmp_path):
+        bot = self._make_bot(tmp_path, bear_market_exit=True)
+        bot.explosive_era = True
+        bot.era_cagr = 120.0
+        summary = bot.regime_summary()
+        assert "폭등기" in summary and "해제" in summary
+
+        bot.explosive_era = False
+        bot.market_regime = False
+        bot.era_cagr = 28.0
+        assert "성숙기" in bot.regime_summary()
+
+    def test_regime_detection_sets_era(self, tmp_path):
+        """국면 판정 한 번으로 era까지 함께 산출 (월봉 조회 1회)"""
+        rising = [100.0 * (1.02 ** i) for i in range(60)]
+        bot = self._make_bot(tmp_path, monthly=self._monthly(rising),
+                             bear_market_exit=True, regime_ma_months=6,
+                             explosive_era_guard=True, explosive_era_years=4)
+
+        bot.market_regime = bot.detect_market_regime()
+
+        assert bot.market_regime is True
+        assert bot.explosive_era is not None      # 같은 조회로 era도 판정됨
+        assert bot.era_cagr is not None
 
     # -- 표시 ----------------------------------------------------------
     def test_summary_reports_regime(self, tmp_path):

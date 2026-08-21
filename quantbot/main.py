@@ -191,6 +191,12 @@ class QuantBot:
         self.bear_market_exit: bool = bool(self.config.get("bear_market_exit", False))
         self.bear_exit_ma: int = int(self.config.get("bear_exit_ma_window", 5))
         self.regime_ma_months: int = int(self.config.get("regime_ma_months", 6))
+        # 폭등기 가드: 장기 성장률이 임계를 넘으면 국면 전환을 끄고 그냥 들고 갑니다
+        self.explosive_era_guard: bool = bool(self.config.get("explosive_era_guard", True))
+        self.era_threshold: float = float(self.config.get("explosive_era_threshold", 75.0))
+        self.era_years: int = int(self.config.get("explosive_era_years", 4))
+        self.explosive_era: Optional[bool] = None
+        self.era_cagr: Optional[float] = None
         # None = 미판정(필터 꺼짐 또는 데이터 부족), True = 상승 국면, False = 하락 국면
         self.market_regime: Optional[bool] = None
         # 청산 판정용 MA 상회 여부. 진입용 is_above_ma와 별도로 관리합니다.
@@ -418,15 +424,58 @@ class QuantBot:
         :return: True=상승 국면, False=하락 국면, None=판정 불가(데이터 부족/조회 실패)
         """
         if not self.bear_market_exit:
+            self.explosive_era = None
             return None
 
         need = self.regime_ma_months + 2       # MA 계산 + 진행 중인 달 제외
+        if self.explosive_era_guard:
+            # 후행 성장률 계산에 필요한 개월 수도 함께 확보 (조회는 한 번만)
+            need = max(need, self.era_years * 12 + 2)
+
         closed = self._monthly_closes(need)
         if closed is None:
+            self.explosive_era = None
             return None
+
+        self.explosive_era = self.detect_explosive_era(closed)
 
         ma = float(closed.iloc[-self.regime_ma_months:].mean())
         return bool(float(closed.iloc[-1]) > ma)
+
+    def detect_explosive_era(self, closed) -> Optional[bool]:
+        """
+        후행 장기 성장률로 '폭등기' 여부를 판정합니다.
+
+        BTC의 장기 성장률은 시장이 커지면서 계속 낮아져 왔습니다.
+        후행 4년 CAGR로 보면 2015~2020년은 매년 84~211%였고, 2021년 이후로는
+        17~56%에 머뭅니다(마지막 75% 돌파는 2024-04).
+
+        폭등기에는 **가만히 들고 있는 것이 최선**이라 하락 국면마다 빠르게 청산하면
+        상승분을 잘라먹습니다. 실제로 반감기 1·2기에서는 국면 전환이 손해였고
+        3·4기에서만 이득이었습니다. 그래서 폭등기로 판정되면 국면 전환을 끕니다.
+
+        수익을 늘리는 장치가 아니라, 시장이 다시 폭등기로 갈 때 국면 전환이
+        해를 끼치는 것을 막는 **보험**입니다. 성숙기에서는 성능 차이가 없습니다.
+
+        :param closed: 마감 월봉 종가 시리즈
+        :return: True=폭등기, False=성숙기, None=판정 불가
+        """
+        if not self.explosive_era_guard:
+            return None
+
+        months = self.era_years * 12
+        if len(closed) < months + 1:
+            logger.warning(f"성장률 산출용 월봉 부족({len(closed)}/{months + 1}) - era 가드 미적용")
+            return None
+
+        past = float(closed.iloc[-(months + 1)])
+        now = float(closed.iloc[-1])
+        if past <= 0:
+            return None
+
+        cagr = ((now / past) ** (1 / self.era_years) - 1) * 100
+        self.era_cagr = cagr
+        return bool(cagr > self.era_threshold)
 
     def _monthly_closes(self, need: int):
         """
@@ -476,8 +525,15 @@ class QuantBot:
 
         하락 국면에서만 더 짧은 MA를 씁니다. 진입 기준(ma_window)은 건드리지 않습니다.
         국면이 미판정(None)이면 안전하게 기존 기준을 유지합니다.
+
+        단 **폭등기로 판정되면 국면 전환을 끕니다**. 폭등기에는 들고 있는 것이 최선이라
+        하락 국면마다 빠르게 청산하면 상승분을 잘라먹기 때문입니다.
         """
-        if self.bear_market_exit and self.market_regime is False:
+        if not self.bear_market_exit:
+            return self.ma_window
+        if self.explosive_era:                 # 폭등기 -> 느린 청산 유지
+            return self.ma_window
+        if self.market_regime is False:
             return self.bear_exit_ma
         return self.ma_window
 
@@ -485,10 +541,16 @@ class QuantBot:
         """현재 국면과 적용 중인 청산 MA를 한 줄로 설명"""
         if not self.bear_market_exit:
             return f"청산 MA{self.ma_window} 고정"
+        if self.explosive_era:
+            growth = f" ({self.era_cagr:.0f}%/년)" if self.era_cagr is not None else ""
+            return (f"폭등기{growth} - 국면 전환 해제, 청산 MA{self.ma_window}")
         if self.market_regime is None:
             return f"국면 미판정 - 청산 MA{self.ma_window}"
         phase = "상승" if self.market_regime else "하락"
-        return (f"월봉 MA{self.regime_ma_months} {phase} 국면 "
+        era = ""
+        if self.explosive_era is False and self.era_cagr is not None:
+            era = f" · 성숙기({self.era_cagr:.0f}%/년)"
+        return (f"월봉 MA{self.regime_ma_months} {phase} 국면{era} "
                 f"- 청산 MA{self.exit_ma_window()}")
 
     def exit_signal_ok(self, ticker: str) -> bool:
