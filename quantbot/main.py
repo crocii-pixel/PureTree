@@ -187,6 +187,15 @@ class QuantBot:
         self.atr_stop_multiple: float = float(self.config.get("atr_stop_multiple", 2.0))
         self.atr_values: Dict[str, float] = {t: 0.0 for t in self.tickers}
 
+        # 월봉 국면별 청산 속도 전환 (하락 국면에서 더 짧은 MA로 빠르게 청산)
+        self.bear_market_exit: bool = bool(self.config.get("bear_market_exit", False))
+        self.bear_exit_ma: int = int(self.config.get("bear_exit_ma_window", 5))
+        self.regime_ma_months: int = int(self.config.get("regime_ma_months", 6))
+        # None = 미판정(필터 꺼짐 또는 데이터 부족), True = 상승 국면, False = 하락 국면
+        self.market_regime: Optional[bool] = None
+        # 청산 판정용 MA 상회 여부. 진입용 is_above_ma와 별도로 관리합니다.
+        self.is_above_exit_ma: Dict[str, bool] = {t: False for t in self.tickers}
+
         # GUI(트레이) 제어용 이벤트. pause_event가 set이면 매매 감시를 일시 중단합니다.
         self.pause_event = threading.Event()
         self.stop_event = threading.Event()
@@ -210,7 +219,10 @@ class QuantBot:
             f"• 대상 종목({len(self.tickers)}개): {', '.join(self.tickers)}\n"
             f"• 전략: {'동적 K (20일 노이즈 비율)' if self.use_dynamic_k else f'고정 K({self.k})'} + MA{self.ma_window} 모멘텀\n"
             f"• 사이징: {self.sizing_summary()}\n"
-            f"----------------------------------\n"
+            + (f"• 국면 청산: 하락장 MA{self.bear_exit_ma} "
+               f"(판정 월봉 MA{self.regime_ma_months})\n"
+               if self.bear_market_exit else "")
+            + f"----------------------------------\n"
             f"{state_line}"
         )
         if self.start_paused:
@@ -392,6 +404,104 @@ class QuantBot:
         except Exception as e:
             logger.error(f"BTC 국면 필터 평가 실패: {e}")
             return True
+
+    # ------------------------------------------------------------------
+    # 월봉 국면 (청산 속도 전환)
+    # ------------------------------------------------------------------
+    def detect_market_regime(self) -> Optional[bool]:
+        """
+        BTC 월봉 기준 상승/하락 국면을 판정합니다.
+
+        **마감된 월봉**만 씁니다. 진행 중인 달의 종가는 계속 바뀌므로 이를 포함하면
+        월중에 판정이 뒤집혀 청산 기준이 오락가락합니다.
+
+        :return: True=상승 국면, False=하락 국면, None=판정 불가(데이터 부족/조회 실패)
+        """
+        if not self.bear_market_exit:
+            return None
+
+        need = self.regime_ma_months + 2       # MA 계산 + 진행 중인 달 제외
+        closed = self._monthly_closes(need)
+        if closed is None:
+            return None
+
+        ma = float(closed.iloc[-self.regime_ma_months:].mean())
+        return bool(float(closed.iloc[-1]) > ma)
+
+    def _monthly_closes(self, need: int):
+        """
+        마감된 BTC 월봉 종가 시리즈를 확보합니다.
+
+        빗썸은 pybithumb가 **일봉 200건(약 7개월)만** 제공해 긴 월봉 MA를 만들 수 없습니다.
+        국면은 거래소가 아니라 시장 전체의 성질이므로, 거래 거래소 데이터가 부족하면
+        업비트 공개 시세로 보완합니다. **조회 전용**이며 주문 경로와는 무관합니다.
+
+        :return: 마감 월봉 종가 시리즈. 확보 실패 시 None
+        """
+        def closed_from(df) -> Optional[Any]:
+            if df is None or len(df) < need:
+                return None
+            return df["close"].iloc[:-1]       # 진행 중인 월봉 제외
+
+        have = 0
+        try:
+            df = self.exchange.get_ohlcv("BTC", count=need + 4, interval="month")
+            closed = closed_from(df)
+            if closed is not None:
+                return closed
+            have = 0 if df is None else len(df)
+        except Exception as e:
+            logger.error(f"[{self.exchange.NAME}] 월봉 조회 실패: {e}")
+
+        try:
+            import pyupbit
+
+            # 월봉 need개를 만들려면 넉넉한 일봉이 필요 (한 달 최대 31일)
+            daily = pyupbit.get_ohlcv("KRW-BTC", interval="day", count=(need + 2) * 31)
+            closed = closed_from(ExchangeBase.resample_ohlcv(daily, "month"))
+            if closed is not None:
+                logger.info(
+                    f"[국면] {self.exchange.DISPLAY_NAME} 월봉 부족({have}/{need}) "
+                    f"-> 업비트 공개 시세로 보완")
+                return closed
+        except Exception as e:
+            logger.error(f"업비트 월봉 보완 실패: {e}")
+
+        logger.warning(f"월봉 데이터 부족({have}/{need}) - 국면 판정 생략 (기존 청산 기준 유지)")
+        return None
+
+    def exit_ma_window(self) -> int:
+        """
+        청산 판정에 쓸 MA 기간.
+
+        하락 국면에서만 더 짧은 MA를 씁니다. 진입 기준(ma_window)은 건드리지 않습니다.
+        국면이 미판정(None)이면 안전하게 기존 기준을 유지합니다.
+        """
+        if self.bear_market_exit and self.market_regime is False:
+            return self.bear_exit_ma
+        return self.ma_window
+
+    def regime_summary(self) -> str:
+        """현재 국면과 적용 중인 청산 MA를 한 줄로 설명"""
+        if not self.bear_market_exit:
+            return f"청산 MA{self.ma_window} 고정"
+        if self.market_regime is None:
+            return f"국면 미판정 - 청산 MA{self.ma_window}"
+        phase = "상승" if self.market_regime else "하락"
+        return (f"월봉 MA{self.regime_ma_months} {phase} 국면 "
+                f"- 청산 MA{self.exit_ma_window()}")
+
+    def exit_signal_ok(self, ticker: str) -> bool:
+        """
+        청산 판정에 쓸 MA 상회 여부.
+
+        청산 MA가 진입 MA와 같으면(옵션 꺼짐 또는 상승 국면) **기존 판정을 그대로** 씁니다.
+        옵션을 껐을 때 동작이 이전과 한 치도 달라지지 않아야 하므로,
+        별도 상태(is_above_exit_ma)에 의존하지 않습니다.
+        """
+        if self.exit_ma_window() == self.ma_window:
+            return self.is_above_ma.get(ticker, False)
+        return self.is_above_exit_ma.get(ticker, False)
 
     def evaluate_entry_filters(self, ticker: str) -> Tuple[bool, str]:
         """
@@ -607,8 +717,10 @@ class QuantBot:
             f"• <b>실행 모드</b>: <b>{mode_str}</b>",
             f"• <b>상태</b>: <b>{state}</b>",
             f"• <b>사이징</b>: {self.sizing_summary()}",
-            "----------------------------------"
         ]
+        if self.bear_market_exit:
+            lines.append(f"• <b>국면</b>: {self.regime_summary()}")
+        lines.append("----------------------------------")
 
         for ticker in self.tickers:
             tp = self.target_prices.get(ticker, 0.0)
@@ -643,6 +755,12 @@ class QuantBot:
 
         summary_lines = []
 
+        # 국면 판정은 종목과 무관하므로 루프 밖에서 1회만 (API 호출 절약)
+        self.market_regime = self.detect_market_regime()
+        exit_ma = self.exit_ma_window()
+        if self.bear_market_exit:
+            logger.info(f"[국면 판정] {self.regime_summary()}")
+
         for ticker in self.tickers:
             try:
                 # 최근 100일 일봉 데이터 수집 (거래소 어댑터 경유)
@@ -658,6 +776,11 @@ class QuantBot:
 
                 self.target_prices[ticker] = eval_res["target_price"]
                 self.is_above_ma[ticker] = eval_res["is_above_ma"]
+                # 하락 국면이면 더 짧은 MA로 청산을 판정 (진입 기준은 그대로)
+                self.is_above_exit_ma[ticker] = (
+                    self.is_above_ma[ticker] if exit_ma == self.ma_window
+                    else eval_res["current_price"] > self.strategy_engine.calculate_ma(df, exit_ma)
+                )
                 self.effective_ks[ticker] = eval_res["effective_k"]
                 self.has_bought[ticker] = False    # 당일 매수 플래그 초기화
                 self.skipped_today[ticker] = False  # 잔고 부족 스킵 플래그 초기화
@@ -703,6 +826,8 @@ class QuantBot:
                 logger.error(f"[{ticker}] 일일 세팅 갱신 예외 발생: {e}", exc_info=True)
 
         if summary_lines:
+            if self.bear_market_exit:
+                summary_lines.append(f"[국면] {self.regime_summary()}")
             self.notifier.send_message(
                 f"🌅 <b>[{self.exchange.DISPLAY_NAME} 일일 세팅 갱신 완료]</b>\n" + "\n".join(summary_lines)
             )
@@ -751,7 +876,7 @@ class QuantBot:
                 if units <= 0 or value < self.exchange.MIN_ORDER_KRW:
                     continue
 
-                if self.is_above_ma.get(ticker, False):
+                if self.exit_signal_ok(ticker):
                     # 모멘텀 유지 -> 보유 지속. 당일 재매수를 막기 위해 체결 상태로 표시
                     self.has_bought[ticker] = True
                     if self.store is not None:
@@ -768,8 +893,11 @@ class QuantBot:
                     result = self.exchange.sell_market(ticker, order_code=order_code)
                     if result:
                         self._record_order(result, "sell", ticker)
-                        exited.append(f"• <b>{ticker}</b>: 청산 ({value:,.0f}원, MA 이탈)")
-                        logger.info(f"[{ticker}] 모멘텀 이탈 -> 청산 (주문코드: {order_code})")
+                        exited.append(
+                            f"• <b>{ticker}</b>: 청산 ({value:,.0f}원, MA{self.exit_ma_window()} 이탈)")
+                        logger.info(
+                            f"[{ticker}] 모멘텀 이탈 -> 청산 "
+                            f"(MA{self.exit_ma_window()}, 주문코드: {order_code})")
                     self.has_bought[ticker] = False
 
             except Exception as e:

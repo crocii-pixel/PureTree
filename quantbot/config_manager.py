@@ -110,6 +110,24 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # 수익률 개선은 확인되지 않았고(15/29 구간) 낙폭만 줄었습니다(25/29 구간).
     "btc_regime_filter": False,
     "btc_decline_threshold": -0.05,
+
+    # 월봉 국면별 청산 속도 전환.
+    #   상승 국면 -> 기존 MA(ma_window) 이탈 시 청산
+    #   하락 국면 -> 더 짧은 MA(bear_exit_ma_window) 이탈 시 청산 (빠르게 빠져나옴)
+    # 진입 기준은 국면과 무관하게 그대로입니다. 청산 속도만 바뀝니다.
+    #
+    # 검증 결과 (업비트 일봉 2000일, 14종목):
+    #   - 대조군 통과 : 항상 MA5로 청산하면 CAGR 49.2 -> 44.3으로 손해.
+    #                   하락 국면에만 적용할 때만 이득이 남습니다 (국면과의 상호작용).
+    #   - 검증 종목   : 개발에 쓰지 않은 10종목에서 CAGR 33.0 -> 38.5, MDD 62.8 -> 58.0
+    #   - 파라미터    : 국면 판정 MA를 3/6/9/12 어느 것으로 해도 결론이 같음 (고원)
+    # 다만 견고한 것은 **낙폭 감소**(10~11/14 종목)이고 수익률 상승은 덤입니다.
+    # 국면 전환이 5.5년간 4~22회뿐이라 표본이 얇으므로 기본값은 꺼져 있습니다.
+    # 빗썸은 pybithumb가 일봉 200건(약 7개월)만 제공해 월봉 MA6를 자체 산출할 수 없습니다.
+    # 이 경우 업비트 공개 시세로 자동 보완합니다 (조회 전용, 주문 경로와 무관).
+    "bear_market_exit": False,
+    "bear_exit_ma_window": 5,
+    "regime_ma_months": 6,
     # 주문 사이징 방식
     #   "equal" : 종목당 자본의 1/N 균등 투입 (기본)
     #   "atr"   : 리스크 비율 x 총자산 / (손절폭 2N).  변동성이 큰 종목은 적게 삼
@@ -328,6 +346,12 @@ if __name__ == "__main__":
     print(f"  - 대상 종목      : {', '.join(cfg['tickers'])}")
     print(f"  - 동적 K 사용    : {cfg['use_dynamic_k']} (MA{cfg['ma_window']})")
     print(f"  - 시뮬레이션 강제: {cfg['force_simulation']}")
+    print(f"  - 주문 사이징    : {cfg['position_sizing']}"
+          + (f" (리스크 {cfg['risk_per_trade'] * 100:.1f}%)"
+             if cfg['position_sizing'] == "atr" else ""))
+    print(f"  - 하락장 청산    : {cfg['bear_market_exit']}"
+          + (f" (MA{cfg['bear_exit_ma_window']}, 판정 월봉 MA{cfg['regime_ma_months']})"
+             if cfg['bear_market_exit'] else ""))
 
     keys = resolve_keys(cfg["exchange"])
     for name, value in keys.items():

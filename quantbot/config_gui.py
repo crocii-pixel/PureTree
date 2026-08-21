@@ -266,6 +266,7 @@ def build_config_window(parent: Any = None) -> Any:
             body_layout.addWidget(self._build_exchange_card(QtWidgets))
             body_layout.addWidget(self._build_key_card(QtWidgets))
             body_layout.addWidget(self._build_trade_card(QtWidgets))
+            body_layout.addWidget(self._build_stability_card(QtWidgets))
             body_layout.addWidget(self._build_telegram_card(QtWidgets))
             body_layout.addStretch(1)
 
@@ -384,6 +385,67 @@ def build_config_window(parent: Any = None) -> Any:
             layout.addWidget(self.simulation)
             return card
 
+        def _build_stability_card(self, QtWidgets):
+            """
+            수익률보다 낙폭을 줄이는 쪽에 무게를 둔 선택 옵션들.
+
+            둘 다 백테스트에서 **낙폭은 일관되게 줄었지만 수익률 개선 근거는 약했으므로**
+            기본값은 꺼짐입니다. 운용 금액이 커져 안정성이 더 중요해지면 켜세요.
+            """
+            card, layout = _card(QtWidgets, "안정성 옵션")
+
+            hint = QtWidgets.QLabel(
+                "낙폭(MDD)을 줄이는 대신 수익률을 일부 포기할 수 있는 옵션입니다. "
+                "기본값은 모두 꺼짐입니다.")
+            hint.setObjectName("Hint")
+            hint.setWordWrap(True)
+            layout.addWidget(hint)
+
+            form = QtWidgets.QFormLayout()
+            form.setSpacing(10)
+            form.setFieldGrowthPolicy(
+                QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+
+            # --- 주문 사이징 ---
+            self.sizing_combo = QtWidgets.QComboBox()
+            for label_text, value in (("균등 분할 (1/N)", "equal"),
+                                      ("ATR 리스크 사이징", "atr")):
+                self.sizing_combo.addItem(label_text, value)
+            current = str(self.config.get("position_sizing", "equal")).lower()
+            index = self.sizing_combo.findData(current)
+            self.sizing_combo.setCurrentIndex(index if index >= 0 else 0)
+            form.addRow(QtWidgets.QLabel("주문 사이징"), self.sizing_combo)
+
+            self.risk_spin = QtWidgets.QDoubleSpinBox()
+            self.risk_spin.setRange(0.1, 5.0)
+            self.risk_spin.setSingleStep(0.1)
+            self.risk_spin.setDecimals(1)
+            self.risk_spin.setSuffix(" %")
+            self.risk_spin.setValue(float(self.config.get("risk_per_trade", 0.01)) * 100)
+            form.addRow(QtWidgets.QLabel("종목당 리스크"), self.risk_spin)
+
+            # --- 하락장 빠른 청산 ---
+            self.bear_exit_spin = QtWidgets.QSpinBox()
+            self.bear_exit_spin.setRange(2, 30)
+            self.bear_exit_spin.setValue(int(self.config.get("bear_exit_ma_window", 5)))
+            form.addRow(QtWidgets.QLabel("하락장 청산 MA"), self.bear_exit_spin)
+
+            layout.addLayout(form)
+
+            self.bear_exit = QtWidgets.QCheckBox(
+                "하락장에서 빠르게 청산 (월봉 국면 판정)")
+            self.bear_exit.setChecked(bool(self.config.get("bear_market_exit", False)))
+            layout.addWidget(self.bear_exit)
+
+            def _sync(_=None) -> None:
+                self.risk_spin.setEnabled(self.sizing_combo.currentData() == "atr")
+                self.bear_exit_spin.setEnabled(self.bear_exit.isChecked())
+
+            self.sizing_combo.currentIndexChanged.connect(_sync)
+            self.bear_exit.toggled.connect(_sync)
+            _sync()
+            return card
+
         def _build_telegram_card(self, QtWidgets):
             card, layout = _card(QtWidgets, "텔레그램 알림")
 
@@ -452,6 +514,10 @@ def build_config_window(parent: Any = None) -> Any:
                 "fixed_k": float(self.k_spin.value()),
                 "use_dynamic_k": bool(self.dynamic_k.isChecked()),
                 "force_simulation": bool(self.simulation.isChecked()),
+                "position_sizing": self.sizing_combo.currentData(),
+                "risk_per_trade": round(float(self.risk_spin.value()) / 100, 4),
+                "bear_market_exit": bool(self.bear_exit.isChecked()),
+                "bear_exit_ma_window": int(self.bear_exit_spin.value()),
             })
             return config
 

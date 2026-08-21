@@ -16,6 +16,8 @@ import hmac
 import json
 import logging
 import os
+import sys
+import types
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -2126,3 +2128,238 @@ class TestTrayGui:
         assert parse_args(["--cli"]).cli is True
         assert parse_args(["--gui"]).gui is True
         assert parse_args(["--config"]).config is True
+
+
+# ======================================================================
+# 16. 월봉 국면별 청산 속도 전환
+# ======================================================================
+class TestBearMarketExit:
+    """
+    하락 국면에서만 더 짧은 MA로 청산하는 옵션.
+
+    검증 근거 (업비트 일봉 2000일 / 14종목):
+      - 대조군   : 국면 무시하고 항상 MA5로 청산하면 CAGR 49.2 -> 44.3으로 손해.
+                   하락 국면에 한정할 때만 이득이 남는다 (국면과의 상호작용).
+      - 검증종목 : 개발에 쓰지 않은 10종목에서 CAGR 33.0 -> 38.5, MDD 62.8 -> 58.0
+      - 민감도   : 국면 판정 MA를 3/6/9/12 무엇으로 해도 결론이 같다 (고원)
+    견고한 것은 낙폭 감소이고 수익률 상승은 덤이므로 기본값은 꺼짐이다.
+    """
+
+    def _make_bot(self, tmp_path, monthly=None, **overrides):
+        from main import QuantBot
+        from trade_store import TradeStore
+
+        exchange = DummyExchange(price=1000.0, krw=1_000_000.0, coin=0.0,
+                                 api_key="k", secret_key="s")
+        if monthly is not None:
+            daily = make_ohlcv(60)
+
+            def routed(ticker, count=100, interval="day"):
+                return monthly if interval == "month" else daily
+
+            exchange.get_ohlcv = routed
+
+        config = {
+            "exchange": "dummy", "tickers": ["BTC", "ETH"], "ma_window": 10,
+            "force_simulation": False, "start_paused": False,
+            "telegram_enabled": False, "schedule": {},
+        }
+        config.update(overrides)
+        return QuantBot(config=config, exchange=exchange,
+                        notifier=FakeNotifier(), store=TradeStore(tmp_path / "t.db"))
+
+    @staticmethod
+    def _monthly(closes):
+        index = pd.date_range("2024-01-01", periods=len(closes), freq="MS")
+        return pd.DataFrame({
+            "open": closes, "high": closes, "low": closes,
+            "close": closes, "volume": [1.0] * len(closes),
+        }, index=index)
+
+    # -- 기본값: 꺼짐 --------------------------------------------------
+    def test_disabled_by_default(self, tmp_path):
+        assert config_manager.DEFAULT_CONFIG["bear_market_exit"] is False
+
+        bot = self._make_bot(tmp_path)
+        assert bot.bear_market_exit is False
+        assert bot.detect_market_regime() is None
+        assert bot.exit_ma_window() == bot.ma_window     # 기존 기준 그대로
+
+    # -- 국면 판정 -----------------------------------------------------
+    def test_detects_bull_regime(self, tmp_path):
+        rising = [100 + i * 10 for i in range(10)]      # 우상향
+        bot = self._make_bot(tmp_path, monthly=self._monthly(rising),
+                             bear_market_exit=True, regime_ma_months=6)
+        assert bot.detect_market_regime() is True
+
+    def test_detects_bear_regime(self, tmp_path):
+        falling = [200 - i * 10 for i in range(10)]     # 우하향
+        bot = self._make_bot(tmp_path, monthly=self._monthly(falling),
+                             bear_market_exit=True, regime_ma_months=6)
+        assert bot.detect_market_regime() is False
+
+    def test_ignores_in_progress_month(self, tmp_path):
+        """진행 중인 달의 종가가 튀어도 판정이 뒤집히면 안 된다"""
+        falling = [200 - i * 10 for i in range(10)]
+        base = self._make_bot(tmp_path, monthly=self._monthly(falling),
+                              bear_market_exit=True, regime_ma_months=6)
+        assert base.detect_market_regime() is False
+
+        spiked = list(falling)
+        spiked[-1] = 99999.0                            # 마지막(진행 중) 달만 급등
+        bot = self._make_bot(tmp_path, monthly=self._monthly(spiked),
+                             bear_market_exit=True, regime_ma_months=6)
+        assert bot.detect_market_regime() is False      # 그대로 하락
+
+    def test_insufficient_data_falls_back_to_upbit(self, tmp_path, monkeypatch):
+        """
+        빗썸은 pybithumb가 일봉 200건(약 7개월)만 주므로 월봉 MA6를 만들 수 없다.
+        이때 업비트 공개 시세로 보완해야 한다 (조회 전용, 주문과 무관).
+        """
+        bot = self._make_bot(tmp_path, monthly=self._monthly([100, 110, 120]),
+                             bear_market_exit=True, regime_ma_months=6)
+
+        rising = [100 + i * 10 for i in range(400)]
+        daily = pd.DataFrame(
+            {"open": rising, "high": rising, "low": rising,
+             "close": rising, "volume": [1.0] * len(rising)},
+            index=pd.date_range("2025-01-01", periods=len(rising), freq="D"))
+
+        fake = types.SimpleNamespace(get_ohlcv=lambda *a, **k: daily)
+        monkeypatch.setitem(sys.modules, "pyupbit", fake)
+
+        assert bot.detect_market_regime() is True      # 보완 데이터로 판정 성공
+
+    def test_returns_none_when_fallback_also_fails(self, tmp_path, monkeypatch):
+        """보완까지 실패하면 판정을 포기하고 기존 청산 기준을 유지해야 한다"""
+        bot = self._make_bot(tmp_path, monthly=self._monthly([100, 110, 120]),
+                             bear_market_exit=True, regime_ma_months=6)
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("업비트 장애")
+
+        monkeypatch.setitem(sys.modules, "pyupbit",
+                            types.SimpleNamespace(get_ohlcv=boom))
+
+        assert bot.detect_market_regime() is None
+        assert bot.exit_ma_window() == bot.ma_window
+
+    def test_exchange_api_failure_falls_back(self, tmp_path, monkeypatch):
+        """거래 거래소 조회가 죽어도 보완 경로로 판정을 이어간다"""
+        bot = self._make_bot(tmp_path, bear_market_exit=True, regime_ma_months=6)
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("API 장애")
+
+        bot.exchange.get_ohlcv = boom
+
+        falling = [5000 - i * 10 for i in range(400)]
+        daily = pd.DataFrame(
+            {"open": falling, "high": falling, "low": falling,
+             "close": falling, "volume": [1.0] * len(falling)},
+            index=pd.date_range("2025-01-01", periods=len(falling), freq="D"))
+        monkeypatch.setitem(sys.modules, "pyupbit",
+                            types.SimpleNamespace(get_ohlcv=lambda *a, **k: daily))
+
+        assert bot.detect_market_regime() is False
+
+    # -- 청산 MA 선택 ---------------------------------------------------
+    def test_bear_regime_uses_shorter_exit_ma(self, tmp_path):
+        bot = self._make_bot(tmp_path, bear_market_exit=True, bear_exit_ma_window=5)
+
+        bot.market_regime = True
+        assert bot.exit_ma_window() == 10                # 상승 -> 기존 유지
+
+        bot.market_regime = False
+        assert bot.exit_ma_window() == 5                 # 하락 -> 빠른 청산
+
+    def test_undetermined_regime_keeps_default(self, tmp_path):
+        """판정 불가일 때 기준을 바꾸면 안 된다 (조용한 오작동 방지)"""
+        bot = self._make_bot(tmp_path, bear_market_exit=True, bear_exit_ma_window=5)
+        bot.market_regime = None
+        assert bot.exit_ma_window() == 10
+
+    def test_exit_falls_back_to_entry_flag_when_off(self, tmp_path):
+        """
+        옵션이 꺼져 있으면 청산 판정이 **기존과 완전히 동일**해야 한다.
+
+        실전 자금이 들어간 봇이므로, 새 상태(is_above_exit_ma)가 비어 있어도
+        기존 경로가 그대로 동작해야 합니다.
+        """
+        bot = self._make_bot(tmp_path)                   # bear_market_exit 기본 꺼짐
+        bot.is_above_ma = {"BTC": True, "ETH": False}
+        bot.is_above_exit_ma = {}                        # 새 상태는 비어 있음
+
+        assert bot.exit_signal_ok("BTC") is True
+        assert bot.exit_signal_ok("ETH") is False
+
+    def test_bull_regime_also_falls_back(self, tmp_path):
+        """옵션이 켜져 있어도 상승 국면이면 기존 판정을 그대로 쓴다"""
+        bot = self._make_bot(tmp_path, bear_market_exit=True)
+        bot.market_regime = True
+        bot.is_above_ma = {"BTC": True}
+        bot.is_above_exit_ma = {"BTC": False}            # 무시되어야 함
+
+        assert bot.exit_signal_ok("BTC") is True
+
+    def test_entry_ma_never_changes(self, tmp_path):
+        """국면과 무관하게 **진입** 기준은 ma_window 그대로여야 한다"""
+        bot = self._make_bot(tmp_path, bear_market_exit=True, bear_exit_ma_window=5)
+        bot.market_regime = False
+        assert bot.strategy_engine.ma_window == 10
+        assert bot.ma_window == 10
+
+    # -- 청산 경로 연결 -------------------------------------------------
+    def test_rebalance_uses_exit_ma_flag(self, tmp_path):
+        """청산 판정은 is_above_ma가 아니라 is_above_exit_ma를 봐야 한다"""
+        bot = self._make_bot(tmp_path, bear_market_exit=True)
+        bot.exchange.coin = 100.0                        # 보유분 존재
+        bot.market_regime = False                        # 하락 국면 -> 짧은 MA 적용
+
+        bot.is_above_ma = {"BTC": True, "ETH": True}     # 진입 MA는 상회
+        bot.is_above_exit_ma = {"BTC": False, "ETH": False}   # 청산 MA는 이탈
+
+        bot.rebalance_positions()
+
+        sells = [o for o in bot.exchange.placed if o["side"] == "sell"]
+        assert len(sells) == 2                           # 청산 기준으로 매도되어야 함
+
+    def test_rebalance_holds_when_exit_ma_ok(self, tmp_path):
+        bot = self._make_bot(tmp_path, bear_market_exit=True)
+        bot.exchange.coin = 100.0
+        bot.market_regime = False
+
+        bot.is_above_ma = {"BTC": False, "ETH": False}
+        bot.is_above_exit_ma = {"BTC": True, "ETH": True}
+
+        bot.rebalance_positions()
+
+        assert [o for o in bot.exchange.placed if o["side"] == "sell"] == []
+        assert bot.has_bought["BTC"] is True              # 보유 유지 -> 당일 재매수 차단
+
+    def test_daily_settings_sets_exit_flag(self, tmp_path):
+        rising = [100 + i * 10 for i in range(10)]
+        bot = self._make_bot(tmp_path, monthly=self._monthly(rising),
+                             bear_market_exit=True, regime_ma_months=6)
+
+        bot.update_daily_settings()
+
+        assert bot.market_regime is True
+        # 상승 국면에서는 진입/청산 판정이 같은 MA -> 같은 값
+        for ticker in bot.tickers:
+            assert bot.is_above_exit_ma[ticker] == bot.is_above_ma[ticker]
+
+    # -- 표시 ----------------------------------------------------------
+    def test_summary_reports_regime(self, tmp_path):
+        bot = self._make_bot(tmp_path, bear_market_exit=True, bear_exit_ma_window=5,
+                             regime_ma_months=6)
+        bot.market_regime = False
+        summary = bot.regime_summary()
+        assert "하락" in summary and "MA5" in summary
+
+        bot.market_regime = None
+        assert "미판정" in bot.regime_summary()
+
+    def test_summary_when_option_off(self, tmp_path):
+        bot = self._make_bot(tmp_path)
+        assert "고정" in bot.regime_summary()
