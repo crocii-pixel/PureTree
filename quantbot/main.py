@@ -181,6 +181,8 @@ class QuantBot:
         self.filter_reason: Dict[str, str] = {t: "" for t in self.tickers}
         # 종목 한글명 (오타 확인용). validate_tickers()에서 채웁니다.
         self.ticker_names: Dict[str, str] = {}
+        # 상장돼 있지 않아 관리에서 제외한 종목. 화면에 경고로 계속 표시합니다.
+        self.invalid_tickers: List[str] = []
 
         # 주문 사이징 (equal = 1/N 균등, atr = 변동성 기반 리스크 사이징)
         self.position_sizing: str = str(self.config.get("position_sizing", "equal")).lower()
@@ -759,11 +761,13 @@ class QuantBot:
         return True
 
     def ticker_list_text(self) -> str:
-        """종목을 한글명과 함께 나열 (오타를 눈에 띄게)"""
+        """종목을 한글명과 함께 나열. 제외된 종목은 경고와 함께 뒤에 붙입니다."""
         parts = []
         for ticker in self.tickers:
             name = self.ticker_names.get(ticker)
             parts.append(f"{ticker}({name})" if name else ticker)
+        for ticker in self.invalid_tickers:
+            parts.append(f"⚠️ {ticker}(관리 제외)")
         return ", ".join(parts)
 
     def validate_tickers(self) -> List[str]:
@@ -793,6 +797,7 @@ class QuantBot:
         for t in valid:
             logger.info(f"[종목 확인] {t} = {markets[t]}")
 
+        self.invalid_tickers = invalid
         if invalid:
             self.tickers = valid
             for key in ("target_prices", "is_above_ma", "effective_ks", "has_bought",

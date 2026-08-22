@@ -38,7 +38,7 @@ try:
     from PyQt6.QtWidgets import (
         QApplication, QFrame, QGridLayout, QHBoxLayout, QLabel, QMenu,
         QMessageBox, QPushButton, QSystemTrayIcon, QTableWidget,
-        QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
+        QSplitter, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
     )
     QT_BINDING = "PyQt6"
 except ImportError:  # pragma: no cover - 설치 환경에 따라 분기
@@ -47,7 +47,7 @@ except ImportError:  # pragma: no cover - 설치 환경에 따라 분기
     from PyQt5.QtWidgets import (
         QAction, QApplication, QFrame, QGridLayout, QHBoxLayout, QLabel,
         QMenu, QMessageBox, QPushButton, QSystemTrayIcon, QTableWidget,
-        QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
+        QSplitter, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
     )
     QT_BINDING = "PyQt5"
 
@@ -337,7 +337,6 @@ class Dashboard(QWidget):
         header.setHighlightSections(False)
         self.table.verticalHeader().setDefaultSectionSize(38)
         table_layout.addWidget(self.table)
-        layout.addWidget(table_card)
 
         # --- 로그 영역 ---
         log_card, log_layout = _card("실행 로그")
@@ -346,7 +345,17 @@ class Dashboard(QWidget):
         self.log_view.setReadOnly(True)
         self.log_view.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
         log_layout.addWidget(self.log_view)
-        layout.addWidget(log_card, stretch=1)
+
+        # 종목 표와 로그 사이를 사용자가 직접 조절할 수 있게 스플리터로 묶습니다.
+        # (Qt 내장이라 별도 비용이 없습니다)
+        self.splitter = QSplitter(Qt.Orientation.Vertical)
+        self.splitter.addWidget(table_card)
+        self.splitter.addWidget(log_card)
+        self.splitter.setChildrenCollapsible(False)
+        self.splitter.setStretchFactor(0, 3)
+        self.splitter.setStretchFactor(1, 2)
+        self.splitter.setSizes([360, 240])
+        layout.addWidget(self.splitter, stretch=1)
 
         # --- 버튼 ---
         button_row = QHBoxLayout()
@@ -419,7 +428,10 @@ class Dashboard(QWidget):
         self.pause_button.setText(pause_label(self.bot.is_paused))
 
         # --- 테이블 ---
-        self.table.setRowCount(len(self.bot.tickers))
+        # 상장돼 있지 않아 제외된 종목도 **경고와 함께 계속 보여줍니다.**
+        # 조용히 사라지면 설정이 잘못된 것을 알아채지 못합니다.
+        invalid = list(getattr(self.bot, "invalid_tickers", []))
+        self.table.setRowCount(len(self.bot.tickers) + len(invalid))
         for row, ticker in enumerate(self.bot.tickers):
             if self.bot.has_bought.get(ticker):
                 status, tone, tip = "체결 완료", ui_theme.COLORS["accent"], "당일 매수 체결 완료"
@@ -443,6 +455,10 @@ class Dashboard(QWidget):
                  ui_theme.COLORS["accent"] if above_ma else ui_theme.COLORS["text_muted"], False),
                 (status, tone, False),
             ]
+            name = getattr(self.bot, "ticker_names", {}).get(ticker) or ""
+            if name:
+                cells[0] = (f"{ticker}  {name}", ui_theme.COLORS["text"], False)
+
             for col, (text, color, numeric) in enumerate(cells):
                 item = QTableWidgetItem(text)
                 item.setForeground(_color(color))
@@ -451,6 +467,21 @@ class Dashboard(QWidget):
                                               | Qt.AlignmentFlag.AlignVCenter))
                 if col == len(cells) - 1:
                     item.setToolTip(tip)
+                self.table.setItem(row, col, item)
+
+        # 제외된 종목 - 붉게, 경고 표시와 함께
+        warn_tip = ("이 거래소에 상장되지 않은 종목입니다. "
+                    "관리 대상에서 제외되었으니 설정에서 종목 코드를 확인해주세요.")
+        for offset, ticker in enumerate(invalid):
+            row = len(self.bot.tickers) + offset
+            cells = [f"⚠  {ticker}", "—", "—", "—", "—", "관리 제외"]
+            for col, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                item.setForeground(_color(ui_theme.COLORS["danger"]))
+                if 0 < col < len(cells) - 1:
+                    item.setTextAlignment(int(Qt.AlignmentFlag.AlignRight
+                                              | Qt.AlignmentFlag.AlignVCenter))
+                item.setToolTip(warn_tip)
                 self.table.setItem(row, col, item)
 
         self._refresh_log_view()

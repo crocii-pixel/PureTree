@@ -3295,6 +3295,27 @@ class TestTickerValidation:
         bot = self._make_bot(tmp_path, None, ["BTC", "ETH"])
         assert bot.ticker_list_text() == "BTC, ETH"
 
+    def test_invalid_tickers_are_kept_for_display(self, tmp_path):
+        """
+        제외된 종목이 화면에서 조용히 사라지면 설정이 잘못된 것을 알아채지 못한다.
+        관리 대상에서는 빼되 **경고 표시용으로는 남겨야** 한다.
+        """
+        bot = self._make_bot(tmp_path, self.MARKETS, ["BTC", "NOTACOIN"])
+
+        assert bot.tickers == ["BTC"]                    # 매매 대상에서는 제외
+        assert bot.invalid_tickers == ["NOTACOIN"]       # 표시용으로는 보존
+
+    def test_ticker_list_text_marks_excluded(self, tmp_path):
+        bot = self._make_bot(tmp_path, self.MARKETS, ["BTC", "NOTACOIN"])
+        text = bot.ticker_list_text()
+
+        assert "BTC(비트코인)" in text
+        assert "NOTACOIN" in text and "관리 제외" in text
+
+    def test_no_invalid_list_when_all_valid(self, tmp_path):
+        bot = self._make_bot(tmp_path, self.MARKETS, ["BTC", "ETH"])
+        assert bot.invalid_tickers == []
+
     def test_all_invalid_leaves_empty(self, tmp_path):
         """전부 잘못된 경우에도 예외 없이 빈 목록으로 남아야 한다"""
         bot = self._make_bot(tmp_path, self.MARKETS, ["NOPE", "ALSONOPE"])
