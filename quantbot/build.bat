@@ -8,8 +8,10 @@ REM       the code page mid-file corrupts the remaining lines. All Korean
 REM       messages and the real build logic live in tools/build_exe.py.
 REM
 REM Usage:
-REM   build.bat              - console build (default)
-REM   build.bat --windowed   - no console window (for future tray GUI)
+REM   build.bat              - onedir build (default, recommended)
+REM   build.bat --onefile    - single exe (extracts to Temp on every run;
+REM                            antivirus can lock .pyd files and break imports)
+REM   build.bat --console    - debug build with a console window
 REM   build.bat --clean      - remove build/ dist/ *.spec first
 REM ---------------------------------------------------------------------
 
