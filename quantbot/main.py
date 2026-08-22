@@ -204,6 +204,10 @@ class QuantBot:
             self.config.get("btc_breakout_confirm", False))
         self.btc_target: float = 0.0        # 당일 BTC 목표가 (BTC가 종목에 없어도 산출)
         self.btc_broke_out: bool = False    # 당일 BTC 돌파 여부 (한 번 켜지면 유지)
+        # 차단 사유를 종목당 하루 한 번만 남기기 위한 기록 (매초 로그 폭주 방지)
+        self.blocked_logged: Dict[str, str] = {}
+        # 잔고 기준 대사로 발견한 외부 매수 (봇이 내지 않은 주문)
+        self.external_positions: Dict[str, float] = {}
         # None = 미판정(필터 꺼짐 또는 데이터 부족), True = 상승 국면, False = 하락 국면
         self.market_regime: Optional[bool] = None
         # 청산 판정용 MA 상회 여부. 진입용 is_above_ma와 별도로 관리합니다.
@@ -749,6 +753,90 @@ class QuantBot:
             return False
         return True
 
+    def sync_positions(self, notify: bool = False) -> str:
+        """
+        **잔고를 기준으로** 봇 상태를 거래소 실물과 맞춥니다.
+
+        기존 reconcile_with_exchange()는 거래소의 주문 이력 API에 의존하는데,
+        빗썸은 그 조회를 제공하지 않아 무력합니다. 이 메서드는 어느 거래소에서도
+        동작하도록 **보유 수량만 보고** 판단합니다.
+
+        잡아내는 상황:
+          - 사용자가 앱에서 직접 매수한 경우
+          - 봇이 주문 직후 종료되어 기록을 남기지 못한 경우
+        둘 다 봇이 모르는 포지션이라, 그대로 두면 **같은 종목을 또 사서**
+        의도보다 큰 포지션이 됩니다.
+
+        [한 방향으로만 작동합니다]
+        보유가 확인되면 has_bought를 켜서 추가 매수를 막을 뿐, 보유가 없다고 해서
+        끄지는 않습니다. 사용자가 직접 판 것을 봇이 다시 사들이면 곤란하기 때문입니다.
+
+        :param notify: 결과를 텔레그램으로도 보낼지
+        :return: 사람이 읽을 요약
+        """
+        trade_date = self.trade_date()
+        found: List[str] = []
+        self.external_positions = {}
+
+        for ticker in self.tickers:
+            try:
+                units = self.exchange.get_balance(ticker, use_available=False)
+                if not units or units <= 0:
+                    continue
+                price = self.exchange.get_current_price(ticker) or 0.0
+                value = units * price
+                if value < self.exchange.MIN_ORDER_KRW:
+                    continue          # 먼지 수준 잔량은 무시
+
+                already = self.has_bought.get(ticker, False)
+                if self.store is not None and not already:
+                    already = self.store.has_trade(
+                        self.exchange.NAME, ticker, "buy", trade_date,
+                        self._trade_statuses())
+
+                if already:
+                    self.has_bought[ticker] = True
+                    continue
+
+                # 봇이 모르는 포지션 발견
+                self.has_bought[ticker] = True
+                self.external_positions[ticker] = value
+                found.append(f"• <b>{ticker}</b>: {units:.8f}개 ({value:,.0f}원)")
+                if self.store is not None:
+                    self.store.upsert_daily_state(
+                        self.exchange.NAME, ticker, trade_date, has_bought=True)
+                logger.info(
+                    f"[잔고 대사] {ticker} 보유 {units:.8f}개({value:,.0f}원) 확인 "
+                    f"- 봇 기록에 없어 추가 매수를 막습니다")
+            except Exception as e:
+                logger.error(f"[잔고 대사] {ticker} 조회 실패: {e}")
+
+        if found:
+            summary = ("🔍 <b>[잔고 대사] 봇이 모르던 보유를 발견했습니다</b>\n"
+                       + "\n".join(found)
+                       + "\n\n오늘은 이 종목들을 추가 매수하지 않습니다. "
+                         "청산은 평소대로 모멘텀 규칙을 따릅니다.")
+        else:
+            summary = "🔍 <b>[잔고 대사]</b> 봇 기록과 거래소 잔고가 일치합니다."
+
+        logger.info(f"[잔고 대사] 완료 - 신규 발견 {len(found)}건")
+        if notify:
+            self.notifier.send_message(summary)
+        return summary
+
+    def log_blocked(self, ticker: str, reason: str) -> None:
+        """
+        매수가 막힌 사유를 **종목당 하루 한 번만** 기록합니다.
+
+        감시 루프가 1초마다 도는데 매번 남기면 로그가 폭주하므로, 사유가 바뀔
+        때만 다시 남깁니다. 이 기록이 없으면 "돌파했는데 왜 안 샀지?"를
+        로그만으로는 알 수 없습니다.
+        """
+        if self.blocked_logged.get(ticker) == reason:
+            return
+        self.blocked_logged[ticker] = reason
+        logger.info(f"[{ticker}] 매수 보류 - {reason}")
+
     def exit_signal_ok(self, ticker: str) -> bool:
         """
         청산 판정에 쓸 MA 상회 여부.
@@ -910,8 +998,19 @@ class QuantBot:
             "/start": self.command_resume,
             "/정지": self.command_pause,
             "/stop": self.command_pause,
+            "/동기화": self.command_sync,
+            "/sync": self.command_sync,
         }
         self.notifier.start_polling(handlers)
+
+    def command_sync(self) -> str:
+        """
+        텔레그램 /동기화 - 거래소 잔고를 다시 읽어 봇 상태에 반영합니다.
+
+        사용자가 앱에서 직접 매수한 경우, 봇은 그 사실을 모르므로 같은 종목을
+        또 살 수 있습니다. 이 명령으로 즉시 맞출 수 있습니다.
+        """
+        return self.sync_positions(notify=False)
 
     def command_resume(self) -> str:
         """텔레그램 /실행 - 매매 시작 (사용자 승인)"""
@@ -1052,6 +1151,7 @@ class QuantBot:
                 self.effective_ks[ticker] = eval_res["effective_k"]
                 self.has_bought[ticker] = False    # 당일 매수 플래그 초기화
                 self.skipped_today[ticker] = False  # 잔고 부족 스킵 플래그 초기화
+                self.blocked_logged.pop(ticker, None)   # 차단 사유 기록도 새 세션 기준으로
 
                 if self.store is not None:
                     # 산출된 지표만 저장 (has_bought/skipped는 체결 시점에 기록)
@@ -1237,6 +1337,8 @@ class QuantBot:
 
                 # 진입 필터에 걸린 종목은 당일 매수하지 않음 (일일 루틴에서 판정 완료)
                 if not self.entry_allowed.get(ticker, True):
+                    self.log_blocked(
+                        ticker, f"진입 필터: {self.filter_reason.get(ticker, '사유 미상')}")
                     continue
 
                 # 저장소에 당일 체결 기록이 있으면 메모리 상태와 무관하게 재매수 차단
@@ -1257,9 +1359,10 @@ class QuantBot:
                 if current_price >= target_price and is_above_ma:
                     # 4) 알트는 BTC도 같은 세션에 돌파했어야 함 (폭등기에는 해제)
                     if self.needs_btc_confirm(ticker) and not self.btc_confirmed():
-                        logger.debug(
-                            f"[{ticker}] 돌파했으나 BTC 미확인 "
-                            f"(BTC 목표가 {self.btc_target:,.0f}원) - 대기")
+                        self.log_blocked(
+                            ticker,
+                            f"목표가는 돌파했으나 BTC 동반 돌파 미확인 "
+                            f"(BTC 목표가 {self.btc_target:,.0f}원)")
                         continue
 
                     budget_ratio = 1.0 / len(self.tickers)
@@ -1346,6 +1449,13 @@ class QuantBot:
         liquidate_time, settings_time, is_auto = self.resolve_schedule()
 
         schedule.every().day.at(settings_time).do(self.daily_routine)
+
+        # 잔고 대사를 주기적으로 돌려, 사용자가 직접 매수한 포지션 위에 봇이
+        # 겹쳐 사는 것을 막습니다. 0이면 사용하지 않습니다.
+        sync_min = int(self.config.get("position_sync_min", 0) or 0)
+        if sync_min > 0:
+            schedule.every(sync_min).minutes.do(self.sync_positions)
+            logger.info(f"⏰ 잔고 대사 {sync_min}분마다 자동 실행")
 
         source = "자동 유도" if is_auto else "config.json 지정"
         logger.info(

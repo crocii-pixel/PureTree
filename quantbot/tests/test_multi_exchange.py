@@ -3023,3 +3023,193 @@ class TestMarketDataCache:
 
         cache = market_data._cache_dir()
         assert cache.parent == tmp_path
+
+
+# ======================================================================
+# 22. 잔고 대사 · 차단 사유 로깅
+# ======================================================================
+class TestPositionSync:
+    """
+    사용자가 거래소 앱에서 직접 매수하면 봇은 그 사실을 모른다.
+    그대로 두면 같은 종목을 또 사서 의도보다 큰 포지션이 된다.
+
+    기존 reconcile_with_exchange()는 거래소의 주문 이력 API에 의존하는데
+    빗썸은 그 조회를 제공하지 않아 무력하다. 그래서 **보유 수량만 보고**
+    판단하는 경로가 따로 필요하다.
+    """
+
+    def _make_bot(self, tmp_path, **overrides):
+        from main import QuantBot
+        from trade_store import TradeStore
+
+        exchange = DummyExchange(price=1000.0, krw=1_000_000.0, coin=0.0,
+                                 api_key="k", secret_key="s")
+        config = {
+            "exchange": "dummy", "tickers": ["BTC", "ETH"], "ma_window": 10,
+            "force_simulation": False, "start_paused": False,
+            "telegram_enabled": False, "schedule": {},
+            "explosive_era_guard": False,
+        }
+        config.update(overrides)
+        return QuantBot(config=config, exchange=exchange,
+                        notifier=FakeNotifier(), store=TradeStore(tmp_path / "t.db"))
+
+    def test_detects_untracked_holding(self, tmp_path):
+        """봇 기록에 없는 보유를 찾아내 추가 매수를 막는다"""
+        bot = self._make_bot(tmp_path)
+        bot.exchange.coin = 100.0                  # 100 x 1000원 = 10만원 보유
+        assert bot.has_bought["BTC"] is False
+
+        summary = bot.sync_positions()
+
+        assert bot.has_bought["BTC"] is True
+        assert "BTC" in bot.external_positions
+        assert "발견" in summary
+
+    def test_ignores_dust(self, tmp_path):
+        """최소 주문금액에 못 미치는 잔량은 포지션으로 보지 않는다"""
+        bot = self._make_bot(tmp_path)
+        bot.exchange.coin = 1.0                    # 1 x 1000원 = 1,000원 (최소 5,000원 미만)
+
+        bot.sync_positions()
+
+        assert bot.has_bought["BTC"] is False
+        assert bot.external_positions == {}
+
+    def test_reports_nothing_when_flat(self, tmp_path):
+        bot = self._make_bot(tmp_path)
+        bot.exchange.coin = 0.0
+
+        summary = bot.sync_positions()
+
+        assert "일치" in summary
+        assert bot.external_positions == {}
+
+    def test_never_clears_has_bought(self, tmp_path):
+        """
+        사용자가 직접 판 것을 봇이 되사면 곤란하다.
+        보유가 없어도 has_bought를 끄면 안 된다.
+        """
+        bot = self._make_bot(tmp_path)
+        bot.has_bought["BTC"] = True
+        bot.exchange.coin = 0.0                    # 보유 없음
+
+        bot.sync_positions()
+
+        assert bot.has_bought["BTC"] is True       # 그대로 유지
+
+    def test_survives_api_failure(self, tmp_path):
+        """한 종목 조회가 실패해도 나머지는 계속 대사한다"""
+        bot = self._make_bot(tmp_path)
+        original = bot.exchange.get_balance
+
+        def flaky(currency="KRW", use_available=True):
+            if currency == "BTC":
+                raise RuntimeError("API 장애")
+            return original(currency, use_available)
+
+        bot.exchange.get_balance = flaky
+        bot.exchange.coin = 100.0
+
+        bot.sync_positions()                        # 예외가 새어나오면 실패
+
+        assert bot.has_bought["ETH"] is True        # BTC는 실패했지만 ETH는 처리됨
+
+    def test_records_daily_state(self, tmp_path):
+        """재시작해도 유지되도록 저장소에 기록한다"""
+        bot = self._make_bot(tmp_path)
+        bot.exchange.coin = 100.0
+
+        bot.sync_positions()
+
+        states = bot.store.load_daily_state(bot.exchange.NAME, bot.trade_date())
+        assert states.get("BTC", {}).get("has_bought")
+
+    def test_telegram_command_wired(self, tmp_path):
+        bot = self._make_bot(tmp_path)
+        bot.exchange.coin = 100.0
+
+        result = bot.command_sync()
+
+        assert "잔고 대사" in result
+        assert bot.has_bought["BTC"] is True
+
+    def test_sync_prevents_second_buy(self, tmp_path):
+        """대사 후에는 돌파해도 추가 매수하지 않는다"""
+        bot = self._make_bot(tmp_path)
+        bot.exchange.coin = 100.0                  # 이미 보유 (사용자가 직접 매수)
+        bot.target_prices = {"BTC": 500.0, "ETH": 500.0}
+        bot.is_above_ma = {"BTC": True, "ETH": True}
+
+        bot.sync_positions()
+        bot.monitor_market()
+
+        bought = [o["market"] for o in bot.exchange.placed if o["side"] == "buy"]
+        assert "BTC" not in bought
+
+
+class TestBlockedLogging:
+    """
+    "돌파했는데 왜 안 샀지?"를 로그만으로 알 수 있어야 한다.
+    감시 루프가 1초마다 도므로 매번 남기면 로그가 폭주한다.
+    """
+
+    def _make_bot(self, tmp_path, **overrides):
+        from main import QuantBot
+        from trade_store import TradeStore
+
+        exchange = DummyExchange(price=1000.0, krw=1_000_000.0,
+                                 api_key="k", secret_key="s")
+        config = {
+            "exchange": "dummy", "tickers": ["BTC", "ETH"], "ma_window": 10,
+            "force_simulation": False, "start_paused": False,
+            "telegram_enabled": False, "schedule": {},
+            "explosive_era_guard": False,
+        }
+        config.update(overrides)
+        return QuantBot(config=config, exchange=exchange,
+                        notifier=FakeNotifier(), store=TradeStore(tmp_path / "t.db"))
+
+    def test_logs_once_per_reason(self, tmp_path, caplog):
+        bot = self._make_bot(tmp_path)
+
+        with caplog.at_level(logging.INFO, logger="QuantBot"):
+            for _ in range(5):
+                bot.log_blocked("ETH", "BTC 동반 돌파 미확인")
+
+        hits = [r for r in caplog.records if "매수 보류" in r.message]
+        assert len(hits) == 1, "같은 사유는 한 번만 남아야 합니다"
+
+    def test_logs_again_when_reason_changes(self, tmp_path, caplog):
+        bot = self._make_bot(tmp_path)
+
+        with caplog.at_level(logging.INFO, logger="QuantBot"):
+            bot.log_blocked("ETH", "BTC 동반 돌파 미확인")
+            bot.log_blocked("ETH", "진입 필터: BTC 하락 국면")
+
+        hits = [r for r in caplog.records if "매수 보류" in r.message]
+        assert len(hits) == 2
+
+    def test_btc_confirm_block_is_logged(self, tmp_path, caplog):
+        """실제 감시 경로에서 차단이 기록되는지"""
+        bot = self._make_bot(tmp_path, btc_breakout_confirm=True)
+        bot.target_prices = {"BTC": 5000.0, "ETH": 500.0}
+        bot.is_above_ma = {"BTC": True, "ETH": True}
+        bot.btc_target = 5000.0                    # BTC는 아직 미달
+        bot.exchange.price = 1000.0
+
+        with caplog.at_level(logging.INFO, logger="QuantBot"):
+            bot.monitor_market()
+
+        messages = [r.message for r in caplog.records]
+        assert any("ETH" in m and "매수 보류" in m for m in messages)
+        assert any("BTC 동반 돌파" in m for m in messages)
+
+    def test_daily_reset_clears_log_memory(self, tmp_path):
+        """새 세션에서는 같은 사유도 다시 기록되어야 한다"""
+        bot = self._make_bot(tmp_path)
+        bot.blocked_logged["ETH"] = "BTC 동반 돌파 미확인"
+
+        bot.update_daily_settings()
+
+        assert "ETH" not in bot.blocked_logged

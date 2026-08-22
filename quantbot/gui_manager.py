@@ -169,6 +169,29 @@ class BotThread(QThread):
             self.crashed.emit(str(e))
 
 
+class SyncWorker(QObject):
+    """
+    잔고 대사를 UI 스레드 밖에서 수행하기 위한 워커.
+
+    종목 수만큼 잔고·시세를 조회하므로 몇 초 걸립니다. UI 스레드에서 돌리면
+    트레이 메뉴가 그동안 멈춥니다.
+    """
+
+    finished = pyqtSignal(str)
+
+    def __init__(self, bot: Any):
+        super().__init__()
+        self.bot = bot
+
+    def run(self) -> None:
+        """별도 스레드에서 호출됩니다."""
+        try:
+            summary = self.bot.sync_positions(notify=False)
+        except Exception as e:
+            summary = f"잔고 대사 실패: {e}"
+        self.finished.emit(re.sub(r"<[^>]+>", "", summary))
+
+
 class BalanceWorker(QObject):
     """잔고 조회(네트워크)를 UI 스레드 밖에서 수행하기 위한 워커"""
 
@@ -515,6 +538,10 @@ class TrayApplication:
         self.balance_action.triggered.connect(self.query_balance)
         menu.addAction(self.balance_action)
 
+        self.sync_action = QAction("잔고 대사")
+        self.sync_action.triggered.connect(self.sync_positions)
+        menu.addAction(self.sync_action)
+
         menu.addSeparator()
 
         self.pause_action = QAction(pause_label(self.bot.is_paused))
@@ -551,6 +578,24 @@ class TrayApplication:
         self.dashboard.show()
         self.dashboard.raise_()
         self.dashboard.activateWindow()
+
+    def sync_positions(self) -> None:
+        """
+        거래소 잔고를 다시 읽어 봇 상태에 반영합니다.
+
+        사용자가 앱에서 직접 매수한 포지션을 봇이 모르면 같은 종목을 또 삽니다.
+        """
+        self.sync_action.setEnabled(False)
+        self.notify("잔고 대사", "거래소 잔고를 확인하는 중입니다...")
+
+        worker = SyncWorker(self.bot)
+        worker.finished.connect(self._on_sync_ready)
+        self._sync_worker = worker          # GC 방지
+        threading.Thread(target=worker.run, daemon=True).start()
+
+    def _on_sync_ready(self, text: str) -> None:
+        self.notify("잔고 대사", text)
+        self.sync_action.setEnabled(True)
 
     def query_balance(self) -> None:
         """잔고 조회를 백그라운드 스레드에서 수행하고 결과를 트레이 알림으로 표시"""
