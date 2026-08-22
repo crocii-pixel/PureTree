@@ -30,6 +30,7 @@ class BithumbAdapter(ExchangeBase):
         KeyField("secret_key", "빗썸 Secret Key", "BITHUMB_SECRET_KEY"),
     )
     MIN_ORDER_KRW = 5000.0      # 빗썸 최소 주문 가능 원화
+    MARKET_ALL_URL = "https://api.bithumb.com/v1/market/all?isDetails=false"
     ORDER_SAFETY_RATIO = 0.9995  # 수수료(0.04~0.25%) 안전 마진
     # 빗썸(pybithumb) 일봉은 자정(00:00 KST)에 갱신됩니다. (업비트/코인원은 09:00 KST)
     DAILY_CANDLE_OPEN_KST = "00:00"

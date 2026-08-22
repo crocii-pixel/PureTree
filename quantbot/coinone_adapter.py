@@ -61,6 +61,9 @@ class CoinoneAdapter(ExchangeBase):
         KeyField("secret_key", "코인원 Secret Key", "COINONE_SECRET_KEY"),
     )
     MIN_ORDER_KRW = 1000.0       # 코인원 최소 주문 가능 원화
+
+    # 코인원은 한글명을 제공하지 않아 심볼만 반환합니다 (list_markets 재정의)
+    MARKETS_URL = "https://api.coinone.co.kr/public/v2/markets/KRW"
     ORDER_SAFETY_RATIO = 0.998   # 수수료(최대 0.2%) 안전 마진
     # 코인원 차트 timestamp는 UTC 기준이며, 일봉 경계 00:00 UTC = 09:00 KST 입니다.
     DAILY_CANDLE_OPEN_KST = "09:00"
@@ -165,6 +168,19 @@ class CoinoneAdapter(ExchangeBase):
             return float(tickers[0].get("last"))
         except (TypeError, ValueError) as e:
             logger.error(f"[코인원][{symbol}] 현재가 파싱 실패: {e}")
+            return None
+
+    def list_markets(self):
+        """코인원은 한글명을 주지 않으므로 심볼을 이름 자리에 그대로 넣습니다"""
+        try:
+            import requests
+
+            rows = requests.get(self.MARKETS_URL, timeout=10).json().get("markets", [])
+            out = {str(r["target_currency"]).upper(): str(r["target_currency"]).upper()
+                   for r in rows if r.get("target_currency")}
+            return out or None
+        except Exception as e:
+            logger.warning(f"[{self.DISPLAY_NAME}] 상장 목록 조회 실패: {e}")
             return None
 
     def get_ohlcv(self, ticker: str, count: int = 100, interval: str = "day") -> pd.DataFrame:

@@ -741,14 +741,68 @@ def build_config_window(parent: Any = None) -> Any:
             if config_ok and env_ok:
                 saved = ", ".join(payload.keys()) or "(키 변경 없음)"
                 self._set_status(f"저장 완료 · {key_to_display(exchange)} · {saved}", "ok")
-                QtWidgets.QMessageBox.information(
-                    self, "저장 완료",
-                    "설정이 저장되었습니다.\n\n"
-                    "config.json : 거래소 / 종목 / 전략 설정\n"
-                    ".env        : API Key (git 추적 제외)\n\n"
-                    "실행 중인 봇에 반영하려면 재시작이 필요합니다.")
+                self._offer_restart()
             else:
                 self._set_status("저장 실패 - 로그를 확인해주세요.", "danger")
+
+        def _offer_restart(self) -> None:
+            """
+            저장 후 재시작 여부를 묻습니다.
+
+            설정은 봇이 기동할 때 읽으므로, 실행 중인 봇에는 재시작해야 반영됩니다.
+            트레이에서 종료했다가 다시 켜는 과정이 번거로워 여기서 바로 처리합니다.
+
+            [주의] 재시작해도 **보유 포지션은 청산되지 않습니다.**
+            """
+            box = QtWidgets.QMessageBox(self)
+            box.setWindowTitle("저장 완료")
+            box.setIcon(QtWidgets.QMessageBox.Icon.Question)
+            box.setText("설정이 저장되었습니다.")
+
+            auto = not config_manager.load_config().get("start_paused", True)
+            note = ("\n\n※ 자동 시작 설정이라 재시작 직후 매매가 바로 재개됩니다."
+                    if auto else "\n\n※ 재시작 후에는 정지 상태로 대기합니다.")
+            box.setInformativeText(
+                "실행 중인 봇에 반영하려면 재시작해야 합니다.\n"
+                "지금 재시작할까요?\n"
+                "보유 중인 코인은 그대로 유지됩니다." + note)
+
+            restart = box.addButton("재시작", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+            box.addButton("나중에", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+            box.setDefaultButton(restart)
+            box.exec()
+
+            if box.clickedButton() is restart:
+                self._restart_app()
+
+        def _restart_app(self) -> None:
+            """
+            같은 실행파일을 새로 띄우고 현재 프로세스를 종료합니다.
+
+            빌드된 exe에서는 sys.executable이 QuantBot.exe 자신이고,
+            소스 실행에서는 파이썬 인터프리터이므로 스크립트 경로를 함께 넘깁니다.
+            """
+            import subprocess
+
+            try:
+                if getattr(sys, "frozen", False):
+                    args = [sys.executable]
+                else:
+                    args = [sys.executable, str(config_manager.BASE_DIR / "main.py")]
+
+                subprocess.Popen(
+                    args, cwd=str(config_manager.BASE_DIR), close_fds=True,
+                    creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
+                logger.info("재시작을 위해 새 프로세스를 시작했습니다.")
+            except Exception as e:
+                logger.error(f"재시작 실패: {e}", exc_info=True)
+                QtWidgets.QMessageBox.warning(
+                    self, "재시작 실패",
+                    f"새 프로세스를 시작하지 못했습니다.\n{e}\n\n"
+                    f"직접 종료 후 다시 실행해주세요.")
+                return
+
+            QtWidgets.QApplication.quit()
 
         def _on_test(self) -> None:
             """백그라운드 스레드에서 연결 테스트 (UI 프리징 방지)"""

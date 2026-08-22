@@ -32,6 +32,7 @@ class UpbitAdapter(ExchangeBase):
         KeyField("secret_key", "업비트 Secret Key", "UPBIT_SECRET_KEY"),
     )
     MIN_ORDER_KRW = 5000.0       # 업비트 최소 주문 가능 원화
+    MARKET_ALL_URL = "https://api.upbit.com/v1/market/all?isDetails=false"
     ORDER_SAFETY_RATIO = 0.9995  # 수수료(0.05%) 안전 마진
     DAILY_CANDLE_OPEN_KST = "09:00"  # 업비트 일봉 갱신 시각
 

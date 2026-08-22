@@ -3213,3 +3213,133 @@ class TestBlockedLogging:
         bot.update_daily_settings()
 
         assert "ETH" not in bot.blocked_logged
+
+
+# ======================================================================
+# 23. 종목 코드 검증
+# ======================================================================
+class TestTickerValidation:
+    """
+    종목 코드 오타는 두 가지로 나타난다.
+
+      미상장          : 시세가 None으로 와서 엉뚱한 타입 오류가 뒤늦게 터진다
+      실재하는 다른 코인: 오류 없이 조용히 다른 종목을 매매한다
+
+    실제로 빗썸에는 XRP(엑스알피[리플]) 옆에 XPR(엑스피알네트워크)이 있어,
+    오타를 내면 4원짜리 다른 코인을 사게 된다. 후자가 더 위험하므로
+    **종목명을 함께 보여주는 것**이 핵심이다.
+    """
+
+    def _make_bot(self, tmp_path, markets, tickers):
+        from main import QuantBot
+        from trade_store import TradeStore
+
+        exchange = DummyExchange(price=1000.0, krw=1_000_000.0,
+                                 api_key="k", secret_key="s")
+        exchange.list_markets = lambda: markets
+
+        config = {
+            "exchange": "dummy", "tickers": tickers, "ma_window": 10,
+            "force_simulation": False, "start_paused": True,
+            "telegram_enabled": False, "schedule": {},
+            "explosive_era_guard": False,
+        }
+        return QuantBot(config=config, exchange=exchange,
+                        notifier=FakeNotifier(), store=TradeStore(tmp_path / "t.db"))
+
+    MARKETS = {"BTC": "비트코인", "ETH": "이더리움", "XRP": "엑스알피[리플]",
+               "XPR": "엑스피알네트워크"}
+
+    def test_removes_unlisted_ticker(self, tmp_path):
+        bot = self._make_bot(tmp_path, self.MARKETS, ["BTC", "NOTACOIN", "ETH"])
+
+        assert bot.tickers == ["BTC", "ETH"]
+        assert "NOTACOIN" not in bot.target_prices
+        assert "NOTACOIN" not in bot.has_bought
+
+    def test_keeps_valid_tickers(self, tmp_path):
+        bot = self._make_bot(tmp_path, self.MARKETS, ["BTC", "ETH"])
+        assert bot.tickers == ["BTC", "ETH"]
+
+    def test_records_korean_names(self, tmp_path):
+        bot = self._make_bot(tmp_path, self.MARKETS, ["BTC", "XRP"])
+        assert bot.ticker_names["BTC"] == "비트코인"
+        assert bot.ticker_names["XRP"] == "엑스알피[리플]"
+
+    def test_typo_that_is_a_real_coin_is_kept_but_named(self, tmp_path):
+        """
+        XPR은 실재하므로 제외되지 않는다. 대신 **이름이 드러나** 사용자가
+        의도한 종목이 아님을 알아챌 수 있어야 한다.
+        """
+        bot = self._make_bot(tmp_path, self.MARKETS, ["BTC", "XPR"])
+
+        assert "XPR" in bot.tickers                      # 실재하므로 유지
+        assert bot.ticker_names["XPR"] == "엑스피알네트워크"
+        assert "엑스피알네트워크" in bot.ticker_list_text()
+
+    def test_notifies_when_removed(self, tmp_path):
+        bot = self._make_bot(tmp_path, self.MARKETS, ["BTC", "WRONG"])
+
+        sent = " ".join(bot.notifier.messages)
+        assert "WRONG" in sent
+        assert "종목 코드" in sent
+
+    def test_skips_validation_when_markets_unavailable(self, tmp_path):
+        """상장 목록을 못 가져오면 종목을 함부로 지우면 안 된다"""
+        bot = self._make_bot(tmp_path, None, ["BTC", "WHATEVER"])
+
+        assert bot.tickers == ["BTC", "WHATEVER"]        # 그대로 유지
+        assert bot.ticker_names == {}
+
+    def test_ticker_list_text_without_names(self, tmp_path):
+        bot = self._make_bot(tmp_path, None, ["BTC", "ETH"])
+        assert bot.ticker_list_text() == "BTC, ETH"
+
+    def test_all_invalid_leaves_empty(self, tmp_path):
+        """전부 잘못된 경우에도 예외 없이 빈 목록으로 남아야 한다"""
+        bot = self._make_bot(tmp_path, self.MARKETS, ["NOPE", "ALSONOPE"])
+        assert bot.tickers == []
+
+
+class TestMarketListing:
+    """어댑터의 상장 목록 조회"""
+
+    def test_base_returns_none_without_url(self):
+        exchange = DummyExchange(api_key="k", secret_key="s")
+        exchange.MARKET_ALL_URL = None
+        assert ExchangeBase.list_markets(exchange) is None
+
+    def test_parses_market_rows(self, monkeypatch):
+        exchange = DummyExchange(api_key="k", secret_key="s")
+        exchange.MARKET_ALL_URL = "https://example.invalid/market/all"
+
+        rows = [
+            {"market": "KRW-BTC", "korean_name": "비트코인"},
+            {"market": "KRW-XRP", "korean_name": "엑스알피[리플]"},
+            {"market": "BTC-ETH", "korean_name": "이더리움"},     # 원화 마켓 아님
+        ]
+        fake = types.SimpleNamespace(
+            get=lambda *a, **k: types.SimpleNamespace(json=lambda: rows))
+        monkeypatch.setitem(sys.modules, "requests", fake)
+
+        out = ExchangeBase.list_markets(exchange)
+        assert out == {"BTC": "비트코인", "XRP": "엑스알피[리플]"}
+
+    def test_network_failure_returns_none(self, monkeypatch):
+        exchange = DummyExchange(api_key="k", secret_key="s")
+        exchange.MARKET_ALL_URL = "https://example.invalid/market/all"
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("네트워크 장애")
+
+        monkeypatch.setitem(sys.modules, "requests",
+                            types.SimpleNamespace(get=boom))
+        assert ExchangeBase.list_markets(exchange) is None
+
+    def test_adapters_declare_market_url(self):
+        """빗썸·업비트는 상장 목록 URL을 가져야 한다"""
+        from bithumb_adapter import BithumbAdapter
+        from upbit_adapter import UpbitAdapter
+
+        assert BithumbAdapter.MARKET_ALL_URL
+        assert UpbitAdapter.MARKET_ALL_URL

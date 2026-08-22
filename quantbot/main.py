@@ -179,6 +179,8 @@ class QuantBot:
         # 진입 필터 판정 결과 (일일 루틴에서 1회 평가 -> 감시 루프에서 재사용)
         self.entry_allowed: Dict[str, bool] = {t: True for t in self.tickers}
         self.filter_reason: Dict[str, str] = {t: "" for t in self.tickers}
+        # 종목 한글명 (오타 확인용). validate_tickers()에서 채웁니다.
+        self.ticker_names: Dict[str, str] = {}
 
         # 주문 사이징 (equal = 1/N 균등, atr = 변동성 기반 리스크 사이징)
         self.position_sizing: str = str(self.config.get("position_sizing", "equal")).lower()
@@ -224,6 +226,9 @@ class QuantBot:
         if self.start_paused:
             self.pause_event.set()
 
+        # 종목 코드 오타를 기동 시점에 잡습니다. 잘못된 종목은 여기서 제외됩니다.
+        self.validate_tickers()
+
         mode_str = "실전 매매" if not self.exchange.is_simulation else "시뮬레이션(Dry-Run)"
         state_line = (
             "⏸️ <b>정지 상태로 대기 중</b> — 주문이 나가지 않습니다."
@@ -233,7 +238,7 @@ class QuantBot:
             f"[QuantBot v2.1 초기화]\n"
             f"• 거래소: <b>{self.exchange.DISPLAY_NAME}</b>\n"
             f"• 모드: <b>{mode_str}</b>\n"
-            f"• 대상 종목({len(self.tickers)}개): {', '.join(self.tickers)}\n"
+            f"• 대상 종목({len(self.tickers)}개): {self.ticker_list_text()}\n"
             f"• 전략: {'동적 K (20일 노이즈 비율)' if self.use_dynamic_k else f'고정 K({self.k})'} + MA{self.ma_window} 모멘텀\n"
             f"• 사이징: {self.sizing_summary()}\n"
             + (f"• 국면 청산: 하락장 MA{self.bear_exit_ma} "
@@ -753,6 +758,63 @@ class QuantBot:
             return False
         return True
 
+    def ticker_list_text(self) -> str:
+        """종목을 한글명과 함께 나열 (오타를 눈에 띄게)"""
+        parts = []
+        for ticker in self.tickers:
+            name = self.ticker_names.get(ticker)
+            parts.append(f"{ticker}({name})" if name else ticker)
+        return ", ".join(parts)
+
+    def validate_tickers(self) -> List[str]:
+        """
+        설정된 종목이 실제로 상장돼 있는지 확인하고, 없는 종목은 **관리에서 제외**합니다.
+
+        오타를 그냥 두면 두 가지로 나타납니다.
+          - 미상장  : 시세가 None으로 와서 엉뚱한 타입 오류가 뒤늦게 터진다
+          - **실재하는 다른 코인** : 오류 없이 조용히 다른 종목을 매매한다
+            (예: XRP 오타 XPR = '엑스피알네트워크'가 빗썸에 실재)
+
+        후자가 더 위험하므로 **종목명을 함께 로그에 남깁니다.** 이름을 보면
+        의도한 종목인지 바로 알 수 있습니다.
+
+        :return: 제외된 종목 목록
+        """
+        markets = self.exchange.list_markets()
+        if not markets:
+            logger.info("[종목 확인] 상장 목록을 가져오지 못해 검증을 건너뜁니다")
+            self.ticker_names = {}
+            return []
+
+        self.ticker_names = {t: markets.get(t, "") for t in self.tickers}
+        valid = [t for t in self.tickers if t in markets]
+        invalid = [t for t in self.tickers if t not in markets]
+
+        for t in valid:
+            logger.info(f"[종목 확인] {t} = {markets[t]}")
+
+        if invalid:
+            self.tickers = valid
+            for key in ("target_prices", "is_above_ma", "effective_ks", "has_bought",
+                        "skipped_today", "entry_allowed", "filter_reason",
+                        "atr_values", "is_above_exit_ma"):
+                d = getattr(self, key, None)
+                if isinstance(d, dict):
+                    for t in invalid:
+                        d.pop(t, None)
+
+            names = ", ".join(invalid)
+            logger.error(
+                f"[종목 확인] {self.exchange.DISPLAY_NAME}에 없는 종목: {names} "
+                f"- 관리 대상에서 제외했습니다. 설정의 종목 코드를 확인해주세요.")
+            self.notifier.send_message(
+                f"⚠️ <b>[종목 코드 확인 필요]</b>\n"
+                f"{self.exchange.DISPLAY_NAME}에 상장되지 않은 종목입니다.\n"
+                f"• <b>{names}</b>\n\n"
+                f"관리 대상에서 <b>제외</b>하고 나머지 {len(valid)}개로 계속합니다.\n"
+                f"설정 창에서 종목 코드를 확인해주세요.")
+        return invalid
+
     def sync_positions(self, notify: bool = False) -> str:
         """
         **잔고를 기준으로** 봇 상태를 거래소 실물과 맞춥니다.
@@ -1100,8 +1162,10 @@ class QuantBot:
             if not self.entry_allowed.get(ticker, True):
                 blocked = f"\n  - ⛔ 진입차단: {self.filter_reason.get(ticker, '')}"
 
+            name = self.ticker_names.get(ticker) or ""
+            label = f"{ticker} <i>{name}</i>" if name else ticker
             lines.append(
-                f"• <b>{ticker}</b> (현재가: {cur_price:,.0f}원)\n"
+                f"• <b>{label}</b> (현재가: {cur_price:,.0f}원)\n"
                 f"  - 당일 목표가: {tp:,.0f}원 (적용K: {eff_k:.4f})\n"
                 f"  - MA{self.ma_window} 상회: {ma_ok} | "
                 f"당일 체결여부: <b>{'완료(True)' if bought else '대기(False)'}</b>{blocked}"

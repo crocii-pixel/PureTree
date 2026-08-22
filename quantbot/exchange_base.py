@@ -86,6 +86,9 @@ class ExchangeBase(abc.ABC):
     # 청산/세팅 스케줄은 이 시각에 맞춰야 합니다. (거래소마다 다름 - 하위 클래스에서 재정의)
     DAILY_CANDLE_OPEN_KST: str = "09:00"
 
+    # 상장 목록 조회 URL (하위 클래스에서 재정의). None이면 종목 검증을 건너뜁니다.
+    MARKET_ALL_URL: Optional[str] = None
+
     def __init__(
         self,
         api_key: Optional[str] = None,
@@ -266,6 +269,34 @@ class ExchangeBase(abc.ABC):
     @abc.abstractmethod
     def get_current_price(self, ticker: str) -> Optional[float]:
         """실시간 현재가(체결가) 조회. 실패 시 None 반환"""
+
+    def list_markets(self) -> Optional[Dict[str, str]]:
+        """
+        거래소에 상장된 원화 마켓 목록을 {심볼: 한글명}으로 반환합니다.
+
+        종목 코드 오타를 잡기 위한 용도입니다. 오타가 **실재하는 다른 코인**과
+        겹치면 오류 없이 엉뚱한 종목을 매매하게 되므로(예: XRP -> XPR),
+        이름을 함께 보여주는 것이 중요합니다.
+
+        :return: {심볼: 한글명}. 조회 실패나 미지원 시 None (검증 생략)
+        """
+        if not self.MARKET_ALL_URL:
+            return None
+        try:
+            import requests
+
+            rows = requests.get(self.MARKET_ALL_URL, timeout=10).json()
+            out: Dict[str, str] = {}
+            for row in rows if isinstance(rows, list) else []:
+                market = str(row.get("market", ""))
+                if not market.startswith(f"{self.QUOTE_CURRENCY}-"):
+                    continue
+                symbol = market.split("-", 1)[1]
+                out[symbol] = str(row.get("korean_name") or symbol)
+            return out or None
+        except Exception as e:
+            logger.warning(f"[{self.DISPLAY_NAME}] 상장 목록 조회 실패: {e}")
+            return None
 
     @abc.abstractmethod
     def get_ohlcv(self, ticker: str, count: int = 100, interval: str = "day") -> pd.DataFrame:
