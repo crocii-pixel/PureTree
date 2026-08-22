@@ -1,0 +1,26 @@
+# --- 거래소 연동 ---
+pybithumb>=1.0.21        # 빗썸 (Bithumb)
+pyupbit>=0.2.31          # 업비트 (Upbit)
+PyJWT>=2.8.0             # 업비트 JWT 인증 (pyupbit 의존성)
+requests>=2.31.0         # 코인원(Coinone) Open API v2.1 직접 연동 / 텔레그램
+websocket-client>=1.6.0  # 빗썸 공개 실시간 체결/호가 그림자 기록기
+
+# --- 데이터 / 전략 ---
+pandas>=2.0.0
+numpy>=1.24.0
+scikit-learn>=1.3.0
+xgboost>=2.0.0
+
+# --- 실행 환경 ---
+schedule>=1.2.0
+python-dotenv>=1.0.0
+
+# --- GUI / 아이콘 / 빌드 ---
+# 트레이 GUI와 설정 창은 PyQt로 구현되어 있습니다.
+# PyQt6가 설치되어 있으면 자동으로 PyQt6를 사용합니다. (PyQt6>=6.5.0 로 대체 가능)
+PyQt5>=5.15.0            # 시스템 트레이 + 대시보드 + 설정 창
+Pillow>=10.0.0           # 앱 아이콘(.ico/.png) 및 UI 셰브론 생성
+pyinstaller>=6.0.0       # 단일 실행파일(.exe) 빌드
+
+# --- 개발/테스트 ---
+pytest>=7.4.0
