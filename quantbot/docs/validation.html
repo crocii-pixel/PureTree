@@ -1,0 +1,937 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="업비트 9년치로 검증한 QuantBot 전략들의 채택·기각 기록과 근거 수치">
+  <meta name="robots" content="noindex">
+  <title>QuantBot 전략 검증 대장</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+KR:wght@300;400;500;600;700&display=swap">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    body { margin: 0; }
+    img, svg { max-width: 100%; height: auto; }
+  </style>
+</head>
+<body>
+<style>
+  :root {
+    --ground:   #F5F6F9;
+    --surface:  #FFFFFF;
+    --sunken:   #EDEFF4;
+    --ink:      #141920;
+    --ink-soft: #3D4653;
+    --muted:    #6B7585;
+    --rule:     #DCE0E8;
+    --rule-firm:#C3CAD6;
+
+    /* 한국 시장 관례: 상승/채택 = 적색, 하락/기각 = 청색 */
+    --adopt:    #AF382B;
+    --adopt-bg: #F7E9E7;
+    --hold:     #8A6420;
+    --hold-bg:  #F8EEDC;
+    --reject:   #2E5B98;
+    --reject-bg:#E6EDF7;
+
+    --shadow: 0 1px 2px rgba(20, 25, 32, .06), 0 8px 24px -16px rgba(20, 25, 32, .28);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground:   #10141A;
+      --surface:  #171C24;
+      --sunken:   #1D232C;
+      --ink:      #E9EDF3;
+      --ink-soft: #C0C8D4;
+      --muted:    #8A94A4;
+      --rule:     #29313C;
+      --rule-firm:#3A4452;
+
+      --adopt:    #E47865;
+      --adopt-bg: #2E1E1C;
+      --hold:     #CCA057;
+      --hold-bg:  #2B2418;
+      --reject:   #78A5DE;
+      --reject-bg:#1A2433;
+
+      --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 8px 24px -16px rgba(0, 0, 0, .7);
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --ground:   #10141A;
+    --surface:  #171C24;
+    --sunken:   #1D232C;
+    --ink:      #E9EDF3;
+    --ink-soft: #C0C8D4;
+    --muted:    #8A94A4;
+    --rule:     #29313C;
+    --rule-firm:#3A4452;
+
+    --adopt:    #E47865;
+    --adopt-bg: #2E1E1C;
+    --hold:     #CCA057;
+    --hold-bg:  #2B2418;
+    --reject:   #78A5DE;
+    --reject-bg:#1A2433;
+
+    --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 8px 24px -16px rgba(0, 0, 0, .7);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: "IBM Plex Sans KR", -apple-system, BlinkMacSystemFont, "Malgun Gothic", sans-serif;
+    font-weight: 400;
+    font-size: 16px;
+    line-height: 1.75;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap {
+    max-width: 61rem;
+    margin: 0 auto;
+    padding: clamp(2rem, 5vw, 4.5rem) clamp(1.1rem, 4vw, 2.5rem) 6rem;
+    display: flex;
+    flex-direction: column;
+    gap: clamp(2.75rem, 5vw, 4rem);
+  }
+
+  /* ---------- 머리말 ---------- */
+  .masthead { display: flex; flex-direction: column; gap: 1.15rem; }
+
+  .eyebrow {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: .7rem;
+    font-weight: 500;
+    letter-spacing: .16em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  h1 {
+    margin: 0;
+    font-size: clamp(2rem, 5.5vw, 3.1rem);
+    font-weight: 700;
+    letter-spacing: -.035em;
+    line-height: 1.12;
+    text-wrap: balance;
+  }
+
+  .standfirst {
+    margin: 0;
+    max-width: 44ch;
+    font-size: clamp(1rem, 2.2vw, 1.13rem);
+    font-weight: 300;
+    color: var(--ink-soft);
+    line-height: 1.65;
+  }
+
+  .basis {
+    margin-top: .6rem;
+    padding-top: 1.35rem;
+    border-top: 1px solid var(--rule);
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+    gap: 1.35rem 2rem;
+  }
+  .basis div { display: flex; flex-direction: column; gap: .3rem; }
+  .basis dt {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: .66rem; font-weight: 500;
+    letter-spacing: .13em; text-transform: uppercase;
+    color: var(--muted);
+  }
+  .basis dd {
+    margin: 0; font-size: .93rem; line-height: 1.5; color: var(--ink-soft);
+  }
+  .basis dd b { color: var(--ink); font-weight: 600; }
+
+  /* ---------- 섹션 ---------- */
+  section { display: flex; flex-direction: column; gap: 1.5rem; }
+
+  .sec-head {
+    display: flex; flex-direction: column; gap: .4rem;
+    padding-bottom: .9rem;
+    border-bottom: 2px solid var(--rule-firm);
+  }
+  h2 {
+    margin: 0;
+    font-size: clamp(1.2rem, 3vw, 1.5rem);
+    font-weight: 600;
+    letter-spacing: -.02em;
+    text-wrap: balance;
+  }
+  .sec-note { margin: 0; font-size: .92rem; color: var(--muted); line-height: 1.6; }
+
+  /* ---------- 항목 카드 ---------- */
+  .item {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    box-shadow: var(--shadow);
+    display: flex; flex-direction: column;
+    gap: 1.05rem;
+    padding: 1.4rem clamp(1.1rem, 3vw, 1.7rem) 1.5rem;
+    border-left: 3px solid var(--stripe, var(--rule-firm));
+  }
+  .item.is-adopt  { --stripe: var(--adopt); }
+  .item.is-hold   { --stripe: var(--hold); }
+  .item.is-reject { --stripe: var(--reject); }
+
+  .item-head {
+    display: flex; flex-wrap: wrap; align-items: baseline;
+    gap: .55rem 1rem;
+  }
+  h3 {
+    margin: 0; flex: 1 1 16rem;
+    font-size: 1.06rem; font-weight: 600; letter-spacing: -.012em;
+  }
+  h3 code {
+    display: block;
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: .74rem; font-weight: 400;
+    color: var(--muted); letter-spacing: 0;
+    margin-top: .2rem;
+  }
+
+  .chip {
+    flex: 0 0 auto;
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: .68rem; font-weight: 600;
+    letter-spacing: .09em; text-transform: uppercase;
+    padding: .26rem .6rem; border-radius: 2px;
+    white-space: nowrap;
+  }
+  .chip.adopt  { color: var(--adopt);  background: var(--adopt-bg); }
+  .chip.hold   { color: var(--hold);   background: var(--hold-bg); }
+  .chip.reject { color: var(--reject); background: var(--reject-bg); }
+
+  .verdict {
+    margin: 0;
+    font-size: .97rem; line-height: 1.7; color: var(--ink-soft);
+  }
+  .verdict strong { color: var(--ink); font-weight: 600; }
+
+  /* ---------- 표 ---------- */
+  .scroll { overflow-x: auto; margin: 0 -.2rem; padding: 0 .2rem; }
+  table {
+    width: 100%; border-collapse: collapse;
+    font-size: .87rem;
+    font-variant-numeric: tabular-nums;
+  }
+  caption {
+    caption-side: top; text-align: left;
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: .66rem; font-weight: 500;
+    letter-spacing: .13em; text-transform: uppercase;
+    color: var(--muted); padding-bottom: .55rem;
+  }
+  th, td {
+    padding: .5rem .8rem .5rem 0;
+    text-align: right;
+    border-bottom: 1px solid var(--rule);
+    white-space: nowrap;
+  }
+  th:first-child, td:first-child { text-align: left; padding-left: 0; white-space: normal; }
+  thead th {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: .66rem; font-weight: 500;
+    letter-spacing: .09em; text-transform: uppercase;
+    color: var(--muted);
+    border-bottom: 1px solid var(--rule-firm);
+  }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr.now td { background: var(--sunken); font-weight: 600; }
+  tbody tr.best td { color: var(--adopt); font-weight: 600; }
+  td.num, th.num { font-family: "IBM Plex Mono", ui-monospace, monospace; }
+
+  /* ---------- 관문 ---------- */
+  .gates { display: flex; flex-wrap: wrap; gap: .4rem; }
+  .gate {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: .69rem; letter-spacing: .02em;
+    padding: .22rem .55rem; border-radius: 2px;
+    border: 1px solid var(--rule-firm); color: var(--muted);
+    display: inline-flex; align-items: center; gap: .35rem;
+  }
+  .gate::before { content: "—"; font-weight: 600; }
+  .gate.pass { color: var(--adopt); border-color: var(--adopt); }
+  .gate.pass::before { content: "✓"; }
+  .gate.fail { color: var(--reject); border-color: var(--reject); }
+  .gate.fail::before { content: "✕"; }
+  .gate.part { color: var(--hold); border-color: var(--hold); }
+  .gate.part::before { content: "△"; }
+
+  /* ---------- 기각 목록 ---------- */
+  .rejects { display: flex; flex-direction: column; gap: 0; }
+  .rej {
+    display: grid;
+    grid-template-columns: minmax(9rem, 15rem) 1fr;
+    gap: .3rem 1.6rem;
+    padding: .95rem 0;
+    border-bottom: 1px solid var(--rule);
+    align-items: baseline;
+  }
+  .rej:last-child { border-bottom: none; }
+  .rej dt { font-weight: 600; font-size: .96rem; }
+  .rej dd { margin: 0; font-size: .91rem; color: var(--ink-soft); line-height: 1.6; }
+  .rej dd em {
+    font-style: normal;
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: .85em; color: var(--muted);
+  }
+  @media (max-width: 34rem) { .rej { grid-template-columns: 1fr; } }
+
+  /* ---------- 강조 블록 ---------- */
+  .callout {
+    background: var(--sunken);
+    border-left: 3px solid var(--hold);
+    border-radius: 0 3px 3px 0;
+    padding: 1.15rem clamp(1rem, 3vw, 1.5rem);
+    display: flex; flex-direction: column; gap: .6rem;
+  }
+  .callout p { margin: 0; font-size: .94rem; line-height: 1.7; color: var(--ink-soft); }
+  .callout p strong { color: var(--ink); font-weight: 600; }
+  .callout .eyebrow { color: var(--hold); }
+
+  /* ---------- 마무리 ---------- */
+  .colophon {
+    border-top: 1px solid var(--rule);
+    padding-top: 1.5rem;
+    font-size: .85rem; color: var(--muted); line-height: 1.7;
+  }
+  .colophon p { margin: 0 0 .5rem; }
+  .colophon p:last-child { margin-bottom: 0; }
+
+  code {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: .88em;
+  }
+
+  a { color: var(--adopt); text-underline-offset: .18em; }
+  a:focus-visible, :focus-visible { outline: 2px solid var(--adopt); outline-offset: 2px; }
+</style>
+
+<div class="wrap">
+
+  <header class="masthead">
+    <div class="eyebrow">검증 대장 · 2026-08-21</div>
+    <h1>QuantBot 전략 검증 대장</h1>
+    <p class="standfirst">
+      아홉 가지 아이디어를 업비트 9년치에 걸어 시험한 기록입니다.
+      살아남은 것, 죽은 것, 그리고 도중에 뒤집힌 결론들.
+    </p>
+
+    <dl class="basis">
+      <div>
+        <dt>주 데이터</dt>
+        <dd><b>업비트 KRW 일봉</b><br>2017-09 ~ 2026-08 · 14~16종목</dd>
+      </div>
+      <div>
+        <dt>교차 검증</dt>
+        <dd><b>바이낸스 USDT</b> 9년 (UTC 경계)<br><b>비트스탬프</b> BTC/USD 15년</dd>
+      </div>
+      <div>
+        <dt>지표</dt>
+        <dd><b>MAR = CAGR / MDD</b><br>중앙값 기준. 평균은 소수 종목에 휘둘림</dd>
+      </div>
+      <div>
+        <dt>현재 시장</dt>
+        <dd>BTC 후행 4년 성장률 <b>31%/년</b><br>= 성숙기 (폭등기 임계 75%)</dd>
+      </div>
+    </dl>
+  </header>
+
+  <div class="item is-reject" style="border-left-color:var(--reject)">
+    <div class="item-head">
+      <h3>이 문서를 읽는 법</h3>
+      <span class="chip reject">먼저 읽기</span>
+    </div>
+    <p class="verdict">
+      여기 실린 수치는 <strong>과거 시세로 계산한 것</strong>이며 앞으로의 성과를 예측하지 않습니다.
+      또한 상장폐지된 종목은 시세 조회가 되지 않아 표본에서 빠지므로
+      <strong>절대 수익률은 실제보다 낙관적</strong>입니다.
+    </p>
+    <p class="verdict">
+      그래서 이 문서의 쓰임은 &ldquo;얼마를 벌 수 있는가&rdquo;가 아니라
+      <strong>&ldquo;어떤 설정이 어떤 설정보다 나은가&rdquo;</strong>입니다. 비교는 같은 종목·같은 기간으로
+      짝지어 계산했으므로 편향이 양쪽에 똑같이 걸려 상쇄됩니다.
+    </p>
+    <p class="verdict">
+      투자 자문이나 권유가 아닙니다. 이 프로그램은 개인이 만든 실험적 도구이며,
+      <strong>매매 결정과 그 결과는 사용하는 본인의 책임</strong>입니다.
+    </p>
+  </div>
+
+  <!-- ============ 현재 봇 ============ -->
+  <section>
+    <div class="sec-head">
+      <h2>검증 결과를 반영한 구성</h2>
+      <p class="sec-note">
+        아래 항목들을 검증한 끝에 정착한 설정입니다. 각 옵션의 근거는 이어지는 절에 있습니다.
+      </p>
+    </div>
+
+    <div class="item is-adopt">
+      <div class="scroll">
+        <table>
+          <caption>배포된 설정 — 검증 결과 전면 반영</caption>
+          <tbody>
+            <tr><td>거래소</td><td class="num">빗썸</td></tr>
+            <tr><td>종목 (8)</td><td class="num">BTC · XRP · ETH · SOL · ADA · DOGE · XLM · LINK</td></tr>
+            <tr><td>진입</td><td class="num">변동성 돌파 (시가 + 전일변동폭 × 동적 K) + MA10 상회</td></tr>
+            <tr><td>진입 조건 추가</td><td class="num">알트는 BTC 동반 돌파 확인 필요</td></tr>
+            <tr><td>진입 필터</td><td class="num">BTC 20일 −5% 하락 시 알트 차단</td></tr>
+            <tr><td>청산</td><td class="num">상승 국면 MA10 / 하락 국면 MA5 이탈</td></tr>
+            <tr><td>사이징</td><td class="num">ATR 리스크 1% (손절폭 2N, ATR20)</td></tr>
+            <tr><td>국면 가드</td><td class="num">폭등기 판정 시 위 세 옵션 자동 해제</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="verdict">
+        <strong>이 구성이 정답이라는 뜻은 아닙니다.</strong> 아래 검증을 거치며 남은 것들일 뿐이고,
+        살아남은 옵션 대부분은 <strong>수익을 늘리는 장치가 아니라 낙폭을 줄이는 장치</strong>입니다.
+        종목 수가 적으면 ATR 사이징이 오히려 손해가 되는 등, 설정끼리 맞물려 결과가 바뀌므로
+        바꾸실 때는 설정창의 백테스트로 직접 확인하시길 권합니다.
+      </p>
+      <p class="verdict">
+        빗썸으로 운용할 경우 월봉이 7개월치뿐이라, 국면 판정에는 업비트 공개 시세를 자동으로
+        끌어옵니다 (조회 전용이며 주문 경로와는 무관합니다).
+      </p>
+    </div>
+  </section>
+
+  <!-- ============ 통과: 실전 적용 중 ============ -->
+  <section>
+    <div class="sec-head">
+      <h2>통과 — 이미 실전에 들어가 있는 것</h2>
+      <p class="sec-note">5.5년치로 고른 값들이 9년치에서도 유지되는지 다시 확인했습니다.</p>
+    </div>
+
+    <article class="item is-adopt">
+      <div class="item-head">
+        <h3>MA10 모멘텀 <code>ma_window: 10</code></h3>
+        <span class="chip adopt">유지</span>
+      </div>
+      <div class="scroll">
+        <table>
+          <caption>고정 MA 비교 · 14종목 중앙값</caption>
+          <thead>
+            <tr><th>MA</th><th class="num">전체 9년 CAGR</th><th class="num">MAR</th><th class="num">성숙기 CAGR</th><th class="num">MAR</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>MA5</td><td class="num">58.0</td><td class="num">0.97</td><td class="num">29.6</td><td class="num">0.55</td></tr>
+            <tr><td>MA8</td><td class="num">71.3</td><td class="num">1.26</td><td class="num">36.3</td><td class="num">0.64</td></tr>
+            <tr class="now"><td>MA10 — 현재</td><td class="num">73.7</td><td class="num">1.28</td><td class="num">37.1</td><td class="num">0.66</td></tr>
+            <tr><td>MA12</td><td class="num">63.6</td><td class="num">1.10</td><td class="num">37.1</td><td class="num">0.64</td></tr>
+            <tr><td>MA20</td><td class="num">46.7</td><td class="num">0.74</td><td class="num">23.4</td><td class="num">0.37</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="verdict">
+        8~12가 고원이고 그 안에서 최고점입니다. 워크포워드 104개 검증 구간에서도
+        <strong>고정 MA10(539) &gt; 워크포워드 선택(504) &gt; MA5(286)</strong> —
+        구간마다 최적값을 다시 고르는 것보다 MA10을 그냥 두는 편이 나았습니다.
+      </p>
+      <div class="gates">
+        <span class="gate pass">워크포워드 104구간</span>
+        <span class="gate pass">시대 분할</span>
+        <span class="gate pass">파라미터 고원</span>
+        <span class="gate">다른 시장 미검증</span>
+      </div>
+    </article>
+
+    <article class="item is-adopt">
+      <div class="item-head">
+        <h3>동적 K <code>use_dynamic_k: true</code></h3>
+        <span class="chip adopt">유지</span>
+      </div>
+      <p class="verdict">
+        20일 노이즈 비율로 K를 자동 산출합니다. 성과는 <strong>고정 K=0.6과 동률</strong>입니다
+        (전체 9년 MAR 1.28 대 1.28, 성숙기 0.66 대 0.66). 즉 동적 K는 "자동으로 0.6 근처를
+        찾아가는" 장치입니다. 이득이 없어 보이지만, <strong>상수를 사람이 고르지 않아도 된다</strong>는
+        점이 시장이 변할 때의 안전마진입니다. 바꿀 이유가 없습니다.
+      </p>
+    </article>
+  </section>
+
+  <!-- ============ 통과: 옵션 구현됨 ============ -->
+  <section>
+    <div class="sec-head">
+      <h2>통과 — 옵션으로 구현됨, 기본 꺼짐</h2>
+      <p class="sec-note">
+        전부 실전 동작을 바꾸는 설정이라 켜는 판단은 사용자 몫으로 남겨뒀습니다.
+      </p>
+    </div>
+
+    <article class="item is-hold">
+      <div class="item-head">
+        <h3>ATR 리스크 사이징 <code>position_sizing: "atr"</code></h3>
+        <span class="chip hold">조건부</span>
+      </div>
+      <div class="scroll">
+        <table>
+          <caption>성숙기 2021–2026 · MAR</caption>
+          <thead>
+            <tr><th>구성</th><th class="num">균등</th><th class="num">1%</th><th class="num">2%</th><th class="num">3%</th><th class="num">5%</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>3종목 (현재 봇 구성)</td><td class="num">1.40</td><td class="num">2.01</td><td class="num">2.07</td><td class="num">1.86</td><td class="num">1.36</td></tr>
+            <tr><td>8종목</td><td class="num">1.58</td><td class="num">2.62</td><td class="num">1.97</td><td class="num">1.75</td><td class="num">0.72</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="verdict">
+        <strong>유동성 있는 종목에서만 통합니다.</strong> 8종목을 무작위로 100회 뽑아
+        짝지어 비교하면, 어느 풀에서 뽑느냐가 결론을 바꿉니다.
+      </p>
+      <div class="scroll">
+        <table>
+          <caption>종목 풀별 · 8종목 100회 추출 · 성숙기</caption>
+          <thead>
+            <tr><th>종목 풀</th><th class="num">균등 MAR</th><th class="num">ATR 1% MAR</th><th class="num">균등 대비 우세</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>전체 102종목 (잡코인 포함)</td><td class="num">0.41</td><td class="num">0.36</td><td class="num">42/100</td></tr>
+            <tr class="best"><td>2018년 이전 상장 33종목</td><td class="num">0.29</td><td class="num">0.41</td><td class="num">90/100</td></tr>
+            <tr class="best"><td>거래대금 상위 30종목</td><td class="num">0.98</td><td class="num">1.13</td><td class="num">74/100</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="verdict">
+        ATR은 <strong>변동성을 위험의 척도로 쓰는데</strong>, 거래가 얇고 조작되는 종목에서는
+        ATR 자체가 노이즈라 사이징 근거가 되지 못합니다. 그래서 잡코인이 섞인 전체 풀에서는
+        우위가 사라지고(42/100), 유동성으로 거르면 90/100 · 74/100으로 강하게 유효합니다.
+      </p>
+      <div class="callout">
+        <div class="eyebrow">이 항목은 결론이 두 번 뒤집혔습니다</div>
+        <p>
+          처음에는 손으로 고른 8종목만 보고 <strong>우위를 과장</strong>했습니다(MAR 2.62 대 1.58 —
+          무작위 분포의 100 백분위). 그 다음에는 잡코인이 섞인 전체 풀만 보고
+          <strong>우위가 없다고 기각</strong>했습니다. 둘 다 종목 풀을 잘못 잡은 결과입니다.
+        </p>
+        <p>
+          올바른 질문은 &ldquo;ATR이 좋은가&rdquo;가 아니라
+          <strong>&ldquo;어떤 종목에서 ATR이 의미를 갖는가&rdquo;</strong>였습니다.
+        </p>
+      </div>
+      <div class="gates">
+        <span class="gate pass">시대 분할</span>
+        <span class="gate pass">종목 수 민감도</span>
+        <span class="gate pass">무작위 추출 (유동성 풀 90/100)</span>
+        <span class="gate fail">저유동성 종목에서는 무효</span>
+      </div>
+    </article>
+
+    <article class="item is-hold">
+      <div class="item-head">
+        <h3>하락 국면 청산 가속 <code>bear_market_exit: true</code></h3>
+        <span class="chip hold">낙폭만</span>
+      </div>
+      <p class="verdict">
+        월봉 MA6가 하락이면 청산 MA를 10에서 5로 줄여 빠르게 빠져나옵니다. 진입 기준은 그대로입니다.
+      </p>
+      <div class="scroll">
+        <table>
+          <caption>업비트 KRW · 국면 전환 18회</caption>
+          <thead>
+            <tr><th>구간</th><th class="num">CAGR</th><th class="num">MDD</th><th class="num">CAGR 우세</th><th class="num">MDD 우세</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>전체 9년 (14종목)</td><td class="num">64.0 → 66.6</td><td class="num">58.8 → 53.7</td><td class="num">10/14</td><td class="num">11/14</td></tr>
+            <tr><td>2017–2021 신규 (8종목)</td><td class="num">201.9 → 199.3</td><td class="num">46.1 → 43.7</td><td class="num">4/8</td><td class="num">6/8</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="verdict">
+        <strong>수익률 개선은 과최적화였습니다.</strong> 처음 5.5년치로는 CAGR도 오르는 것처럼 보였지만,
+        손대지 않은 2017–2021 구간에서 사라집니다(4/8, 중앙값은 오히려 하락).
+        <strong>남는 것은 낙폭 감소뿐</strong>이고 개선폭도 2~5%p로 크지 않습니다.
+      </p>
+      <div class="gates">
+        <span class="gate pass">대조군</span>
+        <span class="gate part">신규 구간 (낙폭만)</span>
+        <span class="gate pass">파라미터 고원 (MA 3/6/9/12)</span>
+        <span class="gate fail">다른 시장 (바이낸스 6/14)</span>
+      </div>
+    </article>
+
+    <article class="item is-adopt">
+      <div class="item-head">
+        <h3>폭등기 가드 <code>explosive_era_guard: true</code></h3>
+        <span class="chip adopt">보험</span>
+      </div>
+      <p class="verdict">
+        BTC 후행 4년 성장률이 75%/년을 넘으면 위의 국면 전환과 아래의 BTC 필터를
+        <strong>자동 해제</strong>합니다. 미래 정보를 쓰지 않고 오늘 계산됩니다.
+      </p>
+      <div class="scroll">
+        <table>
+          <caption>반감기 주기별 · 왜 필요한가</caption>
+          <thead>
+            <tr><th>주기</th><th class="num">보유 CAGR</th><th class="num">국면 전환</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>1기 2012–2016</td><td class="num">200.3</td><td class="num">손해</td></tr>
+            <tr><td>2기 2016–2020</td><td class="num">96.0</td><td class="num">손해</td></tr>
+            <tr><td>3기 2020–2024</td><td class="num">67.2</td><td class="num">이득</td></tr>
+            <tr><td>4기 2024–현재</td><td class="num">7.3</td><td class="num">낙폭만</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="verdict">
+        폭등기에는 가만히 들고 있는 것이 최선이라, 하락 국면마다 빠르게 청산하면 상승분을 잘라먹습니다.
+        비트스탬프 15년 기준 <strong>MAR 1.46 → 상시 전환 1.59 → era 가드 1.93</strong>이고
+        임계 50/75/100% 모두 1.87~1.93으로 고원입니다.
+        업비트 9년치는 폭등기 이후에 시작해 상시 전환과 성능이 같습니다(1.24 대 1.25) —
+        <strong>수익 장치가 아니라 시장이 다시 폭등기로 갈 때를 위한 보험</strong>입니다.
+      </p>
+      <div class="gates">
+        <span class="gate pass">15년 전체 주기</span>
+        <span class="gate pass">파라미터 고원</span>
+        <span class="gate pass">선행참조 없음</span>
+      </div>
+    </article>
+
+    <article class="item is-adopt">
+      <div class="item-head">
+        <h3>BTC 하락 필터 <code>btc_regime_filter: true</code></h3>
+        <span class="chip adopt">성숙기 유효</span>
+      </div>
+      <p class="verdict">
+        BTC 20일 수익률이 −5% 아래면 알트 진입을 막습니다. BTC 자신에게는 적용하지 않습니다.
+      </p>
+      <div class="scroll">
+        <table>
+          <caption>업비트 KRW · 종목별 개선 집계</caption>
+          <thead>
+            <tr><th>구간</th><th class="num">CAGR 우세</th><th class="num">MDD 우세</th><th class="num">둘 다</th></tr>
+          </thead>
+          <tbody>
+            <tr class="best"><td>성숙기 2021–2026</td><td class="num">12/14</td><td class="num">11/14</td><td class="num">9/14</td></tr>
+            <tr><td>폭등기 2017–2021</td><td class="num">1/8</td><td class="num">4/8</td><td class="num">1/8</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="verdict">
+        5.5년치로는 "낙폭만 줄고 수익률 개선은 없다"고 기각했던 필터입니다. 9년치로 보니
+        <strong>성숙기에는 양쪽 다 개선</strong>됩니다(평균 CAGR 37.8 → 42.9, MDD 57.5 → 50.3).
+        폭등기에는 눌림목마다 진입을 막아 손해라 era 가드에 물려뒀습니다.
+        <strong>지금은 성숙기이므로 켤 근거가 있습니다.</strong>
+      </p>
+      <div class="gates">
+        <span class="gate pass">시대 분할</span>
+        <span class="gate pass">종목별 12/14</span>
+        <span class="gate pass">선행참조 없음</span>
+        <span class="gate">다른 시장 미검증</span>
+      </div>
+    </article>
+  </section>
+
+  <!-- ============ 통과: 미구현 ============ -->
+  <section>
+    <div class="sec-head">
+      <h2>통과 — 이번에 구현·적용</h2>
+      <p class="sec-note">이번 대화에서 가장 크게 나온 결과이며, 실전 설정에 반영했습니다.</p>
+    </div>
+
+    <article class="item is-adopt">
+      <div class="item-head">
+        <h3>BTC 동반 돌파 확인</h3>
+        <span class="chip adopt">적용됨</span>
+      </div>
+      <p class="verdict">
+        알트를 살 때 <strong>BTC도 같은 세션에 돌파했을 것</strong>을 조건으로 겁니다.
+        BTC 없이 알트 혼자 튀는 돌파는 상당수가 가짜라는 발상입니다.
+      </p>
+      <div class="scroll">
+        <table>
+          <caption>성숙기 2021–2026 · 16종목</caption>
+          <thead>
+            <tr><th>구성</th><th class="num">CAGR 중앙</th><th class="num">MDD 중앙</th><th class="num">MAR</th><th class="num">MDD 우세</th></tr>
+          </thead>
+          <tbody>
+            <tr class="now"><td>각자 신호 — 현재 봇</td><td class="num">34.5</td><td class="num">58.1</td><td class="num">0.59</td><td class="num">—</td></tr>
+            <tr><td>하락기에만 요구</td><td class="num">38.6</td><td class="num">52.8</td><td class="num">0.73</td><td class="num">15/16</td></tr>
+            <tr><td>상승기에만 요구</td><td class="num">40.9</td><td class="num">54.4</td><td class="num">0.75</td><td class="num">13/16</td></tr>
+            <tr class="best"><td>항상 요구</td><td class="num">48.8</td><td class="num">45.5</td><td class="num">1.07</td><td class="num">16/16</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="verdict">
+        <strong>국면별로 나누면 오히려 손해입니다.</strong> "하락기만"과 "상승기만"이 거의 같다는 것(0.73 대 0.75)이
+        단서입니다 — 국면이 중요했다면 두 방향이 갈렸어야 합니다. 각각 절반의 기간에만 적용해
+        절반의 효과만 얻은 것이고, 그래서 항상 적용이 가장 좋습니다.
+        가짜 돌파율이 상승기 50.5% / 하락기 52.0%로 사실상 같았던 것과도 맞습니다.
+      </p>
+      <div class="callout">
+        <div class="eyebrow">신뢰 구간</div>
+        <p>
+          이 결과에는 <strong>선행참조 여지</strong>가 있습니다. 일봉만으로는 알트와 BTC 중 무엇이 먼저
+          돌파했는지 알 수 없습니다. 시간봉으로 실측하니 <strong>BTC 선행 35% · 동시 35% · 알트 선행 29%</strong> —
+          동전 던지기입니다.
+        </p>
+        <p>
+          체결 가정을 낙관/비관 양극단으로 잡으면 성숙기 CAGR은 <strong>29.5 ~ 47.0</strong>(기준 34.5)로
+          기준값을 사이에 두고 벌어집니다. 반면 <strong>MDD는 어느 가정에서도 개선</strong>되고
+          (58.1 → 49~54), 승률도 선행참조를 완전히 제거한 조건에서 32.2 → 36.6으로 오릅니다.
+          <strong>낙폭과 승률은 믿을 수 있고, 수익률은 약속드릴 수 없습니다.</strong>
+        </p>
+      </div>
+      <div class="gates">
+        <span class="gate pass">다른 시장 (바이낸스 11/13 · 12/13)</span>
+        <span class="gate pass">승률 동반 상승</span>
+        <span class="gate part">선행참조 (구간으로 제시)</span>
+        <span class="gate fail">폭등기 3/10 — era 가드 필요</span>
+      </div>
+    </article>
+  </section>
+
+  <!-- ============ 기각 ============ -->
+  <section>
+    <div class="sec-head">
+      <h2>기각</h2>
+      <p class="sec-note">
+        검증 관문을 통과하지 못한 것들. 대부분 전체 기간에서는 좋아 보였지만 신규 구간에서 무너졌습니다.
+      </p>
+    </div>
+
+    <div class="item is-reject">
+      <dl class="rejects">
+        <div class="rej">
+          <dt>리드–랙 (미리 매수)</dt>
+          <dd>알트가 BTC를 뒤늦게 따라간다는 전제가 성립하지 않습니다.
+            <em>일봉 18/18 · 시간봉 9/9 · 분봉 5/5 전부 lag 0에서 최대 상관.</em>
+            돌파 선후도 35% 대 29%로 동전 던지기입니다.</dd>
+        </div>
+        <div class="rej">
+          <dt>BTC 청산 신호 추종</dt>
+          <dd>언제 나올지는 그 종목 자신의 모멘텀이 정해야 합니다.
+            <em>MAR 0.51~0.61 (기준 0.59) — 어느 조합에서도 이득 없음.</em></dd>
+        </div>
+        <div class="rej">
+          <dt>주봉 추세 필터</dt>
+          <dd>전 구간에서 손해입니다. <em>MAR 1.28 → 0.89 (전체), 0.66 → 0.49 (성숙기).</em></dd>
+        </div>
+        <div class="rej">
+          <dt>손절 (스톱로스)</dt>
+          <dd>제 직관이 데이터에 반박당한 사례입니다. 손절이 없어 걱정된다고 했지만
+            넣으면 <em>CAGR 31% → 18~20%</em>로 떨어집니다. 변동성 돌파는 이미 하루 단위로 빠져나옵니다.</dd>
+        </div>
+        <div class="rej">
+          <dt>국면별 파라미터 분기</dt>
+          <dd>상승장/하락장에 다른 값을 쓰는 발상. 표본이 얇은 데다,
+            <em>항상 적용(1.07)이 조건부 적용(0.73~0.75)보다 나았습니다.</em></dd>
+        </div>
+        <div class="rej">
+          <dt>터틀 트레이딩</dt>
+          <dd>진입·청산 규칙은 현재 봇이 더 나았습니다. 가져올 만한 것은 <strong>N(ATR) 사이징</strong>뿐이었고
+            그것만 따로 옵션으로 구현했습니다.</dd>
+        </div>
+        <div class="rej">
+          <dt>비대칭 진입/청산 · 갭 필터 · 자동 최적화</dt>
+          <dd>전부 전체 기간에서만 좋았고 검증 구간에서 사라졌습니다.</dd>
+        </div>
+      </dl>
+    </div>
+  </section>
+
+  <!-- ============ 이 봇은 무엇을 하는가 ============ -->
+  <section>
+    <div class="sec-head">
+      <h2>이 봇은 무엇을 하는가</h2>
+      <p class="sec-note">
+        현재 설정 그대로 시장 국면별로 돌린 결과. 8종목 균등 보유와 나란히 놓고 봅니다.
+      </p>
+    </div>
+
+    <div class="item is-adopt">
+      <div class="scroll">
+        <table>
+          <caption>업비트 KRW · 8종목 · 총수익률 (낙관 / 비관 체결 가정)</caption>
+          <thead>
+            <tr><th>구간</th><th class="num">보유</th><th class="num">보유 MDD</th><th class="num">전략</th><th class="num">전략 MDD</th></tr>
+          </thead>
+          <tbody>
+            <tr class="best"><td>2018 하락장</td><td class="num">−84.9%</td><td class="num">−92.7%</td><td class="num">+13.6%</td><td class="num">9.8%</td></tr>
+            <tr><td>2019–20 횡보</td><td class="num">+74.0%</td><td class="num">−33.7%</td><td class="num">+166.8%</td><td class="num">13.4%</td></tr>
+            <tr><td>2021 대세상승</td><td class="num">+814.5%</td><td class="num">−59.9%</td><td class="num">+341.3%</td><td class="num">17.2%</td></tr>
+            <tr class="best"><td>2022 하락장</td><td class="num">−79.6%</td><td class="num">−79.6%</td><td class="num">+6.0% / −3.3%</td><td class="num">10.4%</td></tr>
+            <tr><td>2023–24 회복</td><td class="num">+627.5%</td><td class="num">−41.5%</td><td class="num">+598.9% / +416.6%</td><td class="num">10.9%</td></tr>
+            <tr class="best"><td>2025–26 하락장</td><td class="num">−55.4%</td><td class="num">−65.4%</td><td class="num">+18.8% / +3.2%</td><td class="num">8.0%</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="verdict">
+        <strong>세 번의 하락장에서 세 번 다 막았습니다.</strong> 낙폭은 국면과 무관하게
+        8~17%로 일정한 반면, 보유는 33~93%로 요동칩니다. 복구 부담으로 환산하면
+        −55%에서 원금을 되찾으려면 +122%가, −80%면 +400%가 필요합니다.
+        MAR이 4~5로 높은 진짜 이유는 수익이 특출나서가 아니라 <strong>그 구멍에 빠지지 않아서</strong>입니다.
+      </p>
+      <div class="callout">
+        <div class="eyebrow">대가는 2021년 줄에 있습니다</div>
+        <p>
+          하락장에서 이긴 방식은 종목을 잘 골라서가 아니라 <strong>현금으로 빠져 있어서</strong>입니다.
+          포지션을 들고 있는 날이 절반뿐인 것이 그 대가이자 이유입니다.
+        </p>
+        <p>
+          그래서 대세 상승기에는 뒤처집니다. 2021년 보유 <strong>+814.5%</strong> 대 전략
+          <strong>+341.3%</strong> — 상승분의 절반 이상을 포기했습니다. 폭등기 가드가
+          작동해도 이 정도입니다. <strong>하락장 방어를 사는 값이 대세 상승기 수익의 절반</strong>이라고
+          보시면 됩니다.
+        </p>
+        <p>
+          2022년 비관 가정은 <strong>−3.3%</strong>로 플러스가 아닙니다. 체결이 불리하면
+          하락장에서 본전 근처일 수 있습니다.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 관통 원리 ============ -->
+  <section>
+    <div class="sec-head">
+      <h2>관통하는 하나의 원리</h2>
+      <p class="sec-note">검증한 것 대부분이 같은 축에서 갈렸습니다.</p>
+    </div>
+
+    <div class="item">
+      <p class="verdict">
+        BTC의 장기 성장률은 시장이 커지며 계속 낮아져 왔습니다. 반감기 주기별 보유 수익률이
+        <strong>200% → 96% → 67% → 7%</strong>로 반토막씩 납니다. 그리고 이 축을 따라
+        위험 관리의 가치가 뒤집힙니다.
+      </p>
+      <div class="scroll">
+        <table>
+          <caption>시대별로 정반대가 되는 것들</caption>
+          <thead>
+            <tr><th>항목</th><th class="num">폭등기</th><th class="num">성숙기 (현재)</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>하락 국면 청산 가속</td><td class="num">손해</td><td class="num">낙폭 개선</td></tr>
+            <tr><td>BTC 하락 필터</td><td class="num">1/8 — 손해</td><td class="num">12/14 — 이득</td></tr>
+            <tr><td>BTC 동반 돌파 확인</td><td class="num">3/10 — 손해</td><td class="num">16/16 — 이득</td></tr>
+            <tr><td>ATR 최적 리스크 (8종목)</td><td class="num">3% (MAR 14.6)</td><td class="num">1% (MAR 2.6)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="verdict">
+        폭등기에는 <strong>시장에 남아 있는 것</strong>이 전부이고, 성숙기에는 <strong>나쁜 매매를 걸러내는 것</strong>이
+        전부입니다. 그래서 모든 안정성 옵션이 폭등기 가드 하나에 물려 있습니다.
+        지금 후행 4년 성장률은 31%/년으로 성숙기이며, 마지막으로 75%를 넘은 것은 2024년 4월입니다 —
+        꺼지지 않는 신호가 아니라 실제로 오가는 신호입니다.
+      </p>
+    </div>
+  </section>
+
+  <!-- ============ 방법론 ============ -->
+  <section>
+    <div class="sec-head">
+      <h2>뒤집힌 결론들</h2>
+      <p class="sec-note">
+        결론보다 이쪽이 더 값어치 있을 수 있습니다. 앞으로의 검증에서 같은 실수를 피하기 위한 기록입니다.
+      </p>
+    </div>
+
+    <div class="item is-reject">
+      <dl class="rejects">
+        <div class="rej">
+          <dt>5.5년치만 보고 있었음</dt>
+          <dd><code>pyupbit</code>는 <code>count</code>를 준 만큼만 돌려줍니다. 관행적으로 쓰던
+            <code>count=2000</code>이 5.5년치였을 뿐, 업비트 KRW-BTC는 <strong>2017-09부터</strong> 있습니다.
+            <em>월봉 국면 전환 10회 → 18회.</em> 이 차이로 결론이 뒤집혔습니다.</dd>
+        </div>
+        <div class="rej">
+          <dt>4개 관문을 통과시켰는데 전부 같은 창이었음</dt>
+          <dd>대조군·검증 종목·시기 분할·파라미터 민감도를 모두 통과시켜놓고
+            "이건 통과했다"고 보고했습니다. 그런데 네 관문 모두 <strong>같은 5.5년 안에서</strong> 뽑은
+            것이라 독립적이지 않았습니다. 9년으로 늘리자 수익률 주장이 무너졌습니다.</dd>
+        </div>
+        <div class="rej">
+          <dt>종목을 임의로 골랐고, 그게 결론을 만들었음</dt>
+          <dd>백테스트의 8종목은 근거 없이 하드코딩한 목록이었습니다. 102종목 풀에서
+            무작위로 뽑아 재보니 그 목록은 <strong>100 백분위</strong>였습니다
+            (균등 MAR 1.58 대 무작위 중앙 0.45).
+            <br><br>
+            더 심각한 건 <strong>결론 자체가 바뀐다</strong>는 점입니다. 임의 목록에서는
+            ATR 1%가 균등을 크게 이겼지만(2.62 대 1.58), 무작위 120회에서는
+            <em>50/120</em> — 우위가 사라집니다. 짝지은 비교라 편향이 상쇄된다고 했지만,
+            <strong>비교하는 대상 자체가 편향된 표본이면 소용없었습니다.</strong></dd>
+        </div>
+        <div class="rej">
+          <dt>다만 무작위 중앙값도 옳은 기준은 아님</dt>
+          <dd>실전 봇의 BTC/ETH/SOL은 98 백분위지만, 그 원인은 사후 판단이 아니라
+            <strong>대형주라는 사실 자체</strong>였습니다. BTC 하나만 돌려도 MAR 1.39가 나오고
+            (BTC/ETH/SOL은 1.40), 세 번째 자리에 SOL은 <em>100개 후보 중 15위</em>로
+            특별히 운 좋은 선택이 아닙니다.
+            <br><br>
+            즉 무작위 중앙값 0.35는 잡코인이 섞인 값이라 이 봇의 기대치가 아닙니다.
+            <strong>올바른 기준은 사전에 규정 가능한 규칙</strong>(예: 시총 상위 N)으로
+            뽑은 풀이며, 그 검증은 진행 중입니다.</dd>
+        </div>
+        <div class="rej">
+          <dt>생존 편향 (없앨 수 없음)</dt>
+          <dd>업비트 API는 현재 상장 종목만 돌려줍니다. 2017년부터 있던 종목은
+            <em>ARK · LSK · MTL · NEO · QTUM · SNT · STEEM · STORJ · STRAX · WAVES</em>인데
+            임의 목록엔 하나도 없었습니다. 살아남아 커진 것만 고른 셈입니다.
+            <strong>절대 수익률은 실제보다 낙관적입니다.</strong> 짝지은 비교(A 대 B)만 신뢰하세요.</dd>
+        </div>
+        <div class="rej">
+          <dt>선행참조를 늦게 발견</dt>
+          <dd>"같은 날 BTC도 돌파"는 일봉만으로는 <strong>순서를 모릅니다.</strong>
+            제거하고 다시 재니 CAGR 이득이 대부분 사라졌습니다(47.0 → 34.6).
+            지금은 낙관/비관 구간으로 제시합니다.</dd>
+        </div>
+        <div class="rej">
+          <dt>조용한 버그</dt>
+          <dd><code>numpy.bool_(True) is True</code>가 <strong>False</strong>라 필터가 아예 작동하지 않았고,
+            필터 on/off 결과가 똑같이 나왔습니다. 결과가 "너무 똑같으면" 코드를 먼저 의심해야 합니다.</dd>
+        </div>
+      </dl>
+    </div>
+  </section>
+
+  <!-- ============ 다음 ============ -->
+  <section>
+    <div class="sec-head">
+      <h2>남은 일</h2>
+    </div>
+    <div class="item">
+      <div class="scroll">
+        <table>
+          <tbody>
+            <tr><td>매매 시작</td><td class="num">텔레그램 <code>/실행</code> — 사용자 지시 대기</td></tr>
+            <tr><td>첫 세션 관찰</td><td class="num">BTC 동반 돌파 조건이 실제로 어떻게 걸리는지</td></tr>
+            <tr><td>종목 선택 규칙 자체를 검증</td><td class="num">임의 목록 대신 사전 규정 가능한 규칙으로</td></tr>
+            <tr><td>두 폴더 dry-run 비교</td><td class="num">균등 대 ATR 사이징</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <footer class="colophon">
+    <p>
+      MAR은 CAGR을 MDD로 나눈 값입니다. 낙폭 한 단위당 얼마를 벌었는지를 보며, 높을수록 좋습니다.
+      모든 수치는 마감된 봉만 사용해 계산했고 왕복 마찰비용을 반영했습니다.
+    </p>
+    <p>
+      검증 도구: <code>tools/walkforward.py</code> · <code>tools/backtest_portfolio.py</code> ·
+      <code>tools/backtest_regime_params.py</code> · <code>tools/market_data.py</code> ·
+      <code>tools/universe_robustness.py</code>
+    </p>
+    <p>
+      과거 성과는 미래를 보장하지 않습니다. 이 문서의 수치는 생존 편향이 남아 있는 표본에서 나온 것이며,
+      실전 기대치가 아니라 <strong>선택지 간 비교</strong>의 근거로만 쓰시기 바랍니다.
+    </p>
+  </footer>
+
+</div>
+</body>
+</html>
