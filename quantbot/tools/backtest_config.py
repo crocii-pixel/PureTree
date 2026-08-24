@@ -16,8 +16,8 @@ config.json을 그대로 읽어 **전부 켠 상태**로 돌립니다. 옵션끼
 
 [데이터 주의]
   빗썸은 pybithumb가 일봉 200건(약 7개월)만 제공해 장기 백테스트가 불가능합니다.
-  따라서 **업비트 KRW 일봉**을 대용으로 씁니다. 같은 원화 시장이고 일봉 경계도
-  같은 KST 09:00이지만, 거래소가 다르므로 체결가에는 차이가 있습니다.
+  따라서 **업비트 KRW 일봉**을 대용으로 씁니다. 빗썸 일봉 경계는 KST 00:00,
+  업비트는 KST 09:00이라 K와 목표가가 달라질 수 있으며 체결가에도 차이가 있습니다.
 
 [결과를 읽을 때]
   - 절대 수익률은 생존 편향(상장폐지 종목이 표본에 없음)으로 실제보다 낙관적입니다.
@@ -75,8 +75,31 @@ def add_indicators(raw: pd.DataFrame, ma_windows: List[int], atr_window: int) ->
     return d
 
 
+def _align_by_date(series: pd.Series, target_index: pd.Index) -> pd.Series:
+    """UTC/KST 시각이 달라도 같은 달력 날짜의 일봉 신호를 맞춥니다."""
+    source = series.copy()
+    source.index = pd.DatetimeIndex(source.index).normalize()
+    source = source[~source.index.duplicated(keep="last")]
+    target_dates = pd.DatetimeIndex(target_index).normalize()
+    return pd.Series(source.reindex(target_dates).values, index=target_index)
+
+
+def attach_reference_signals(local: pd.DataFrame, reference: pd.DataFrame,
+                             ma_windows: List[int], atr_window: int) -> pd.DataFrame:
+    """현지 가격 프레임에 Binance K·MA 열만 날짜 기준으로 붙입니다."""
+    out = local.copy()
+    ref = add_indicators(reference, ma_windows, atr_window)
+    out["signal_k"] = _align_by_date(ref["k"], out.index).fillna(out["k"])
+    for window in set(ma_windows):
+        out[f"signal_above_ma{window}"] = _align_by_date(
+            ref[f"above_ma{window}"], out.index).fillna(out[f"above_ma{window}"]).astype(bool)
+    out["signal_target"] = out["open"] + out["prev_range"] * out["signal_k"]
+    return out
+
+
 def market_context(btc_raw: pd.DataFrame, config: Dict[str, Any],
-                   era_source: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+                   era_source: Optional[pd.DataFrame] = None,
+                   signal_source: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """
     종목과 무관한 시장 상태를 일봉 인덱스로 만듭니다.
 
@@ -87,21 +110,26 @@ def market_context(btc_raw: pd.DataFrame, config: Dict[str, Any],
     ctx = pd.DataFrame(index=btc_raw.index)
 
     # BTC 당일 돌파 여부 (동반 돌파 확인용)
-    b = add_indicators(btc_raw, [int(config.get("ma_window", 10))],
+    signal_raw = signal_source if signal_source is not None else btc_raw
+    b = add_indicators(signal_raw, [int(config.get("ma_window", 10))],
                        int(config.get("atr_window", 20)))
     ma = int(config.get("ma_window", 10))
-    ctx["btc_broke"] = (b["high"] >= b["target"]) & b[f"above_ma{ma}"]
+    broke = (b["high"] >= b["target"]) & b[f"above_ma{ma}"]
+    ctx["btc_broke"] = _align_by_date(broke, ctx.index).fillna(False).astype(bool)
 
     # BTC 20일 하락 국면 (진입 차단용)
     threshold = float(config.get("btc_decline_threshold", -0.05))
-    closed = btc_raw["close"].shift(1)
-    ctx["btc_declining"] = (closed / closed.shift(BTC_DECLINE_WINDOW) - 1.0) < threshold
+    closed = signal_raw["close"].shift(1)
+    declining = (closed / closed.shift(BTC_DECLINE_WINDOW) - 1.0) < threshold
+    ctx["btc_declining"] = _align_by_date(
+        declining, ctx.index).fillna(False).astype(bool)
 
     # 월봉 국면 (청산 속도 전환용) - 마감된 월봉만
     months = int(config.get("regime_ma_months", 6))
-    monthly = btc_raw.resample("MS", label="left", closed="left").agg({"close": "last"}).dropna()
+    monthly = signal_raw.resample("MS", label="left", closed="left").agg({"close": "last"}).dropna()
     bull = (monthly["close"] > monthly["close"].rolling(months).mean()).shift(1)
-    ctx["bull"] = bull.reindex(btc_raw.index, method="ffill").fillna(False).astype(bool)
+    ctx["bull"] = _align_by_date(
+        bull.reindex(signal_raw.index, method="ffill"), ctx.index).fillna(False).astype(bool)
 
     # 폭등기 (후행 N년 성장률)
     src = (era_source if era_source is not None else btc_raw)["close"]
@@ -145,6 +173,11 @@ def run_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
     use_bear_exit = bool(config.get("bear_market_exit", False))
     use_confirm = bool(config.get("btc_breakout_confirm", False))
     use_decline = bool(config.get("btc_regime_filter", False))
+    btc_min_weight = max(0.0, min(1.0, float(config.get("btc_min_weight", 0.0))))
+    sizing_cap = max(0.0, float(config.get("sizing_equity_cap_krw", 0.0)))
+    refill_threshold = max(
+        0.0, min(1.0, float(config.get("position_refill_threshold", 0.95))))
+    use_reference = str(config.get("signal_reference", "local")).lower() == "binance"
 
     tickers = list(data)
     dates = sorted(set().union(*[set(df.index) for df in data.values()]))
@@ -162,6 +195,8 @@ def run_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
     trades: List[Dict[str, Any]] = []
     exposure = 0
     blocked = {"btc_confirm": 0, "btc_decline": 0}
+    buy_orders = 0
+    cash_ratios: List[float] = []
 
     for date in dates:
         row_ctx = ctx.loc[date]
@@ -176,7 +211,9 @@ def run_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
             if date not in df.index:
                 continue
             r = df.loc[date]
-            if bool(r[f"above_ma{exit_ma}"]):
+            exit_col = (f"signal_above_ma{exit_ma}" if use_reference
+                        and f"signal_above_ma{exit_ma}" in r.index else f"above_ma{exit_ma}")
+            if bool(r[exit_col]):
                 continue
             pos = positions.pop(ticker)
             proceeds = pos["units"] * float(r["open"]) * (1 - FEE_RATE)
@@ -186,20 +223,42 @@ def run_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
                            "profit": proceeds - pos["cost"]})
 
         equity = cash + sum(
-            p["units"] * float(data[t].loc[date, "close"])
+            p["units"] * float(data[t].loc[date, "open"])
             for t, p in positions.items() if date in data[t].index)
+        sizing_equity = min(equity, sizing_cap) if sizing_cap > 0 else equity
+
+        # BTC 최소 목표비중의 부족분을 가상 예약금으로 떼어 둡니다. 실제 주문은
+        # BTC 돌파가 확인될 때만 내며, 0%이면 예약금이 전혀 생기지 않습니다.
+        btc_reserved = 0.0
+        if btc_min_weight > 0 and "BTC" in data and date in data["BTC"].index:
+            br = data["BTC"].loc[date]
+            if not pd.isna(br["N"]) and float(br["N"]) > 0:
+                btc_target_col = ("signal_target" if use_reference
+                                  and "signal_target" in br.index else "target")
+                btc_price = max(float(br[btc_target_col]), float(br["open"]))
+                if sizing == "atr":
+                    btc_atr_units = (sizing_equity * risk) / (stop_mult * float(br["N"]))
+                else:
+                    btc_atr_units = (sizing_equity / len(tickers)) / btc_price
+                btc_target_units = max(
+                    btc_atr_units, (sizing_equity * btc_min_weight) / btc_price)
+                held_units = positions.get("BTC", {}).get("units", 0.0)
+                if held_units < btc_target_units * refill_threshold:
+                    btc_reserved = min(cash, (btc_target_units - held_units) * btc_price)
 
         # ---------- 2) 진입 ----------
         for ticker in tickers:
-            if ticker in positions:
-                continue
             df = data[ticker]
             if date not in df.index:
                 continue
             r = df.loc[date]
-            if pd.isna(r["target"]) or pd.isna(r["N"]) or float(r["N"]) <= 0:
+            target_col = ("signal_target" if use_reference
+                          and "signal_target" in r.index else "target")
+            ma_col = (f"signal_above_ma{ma}" if use_reference
+                      and f"signal_above_ma{ma}" in r.index else f"above_ma{ma}")
+            if pd.isna(r[target_col]) or pd.isna(r["N"]) or float(r["N"]) <= 0:
                 continue
-            if not (float(r["high"]) >= float(r["target"]) and bool(r[f"above_ma{ma}"])):
+            if not (float(r["high"]) >= float(r[target_col]) and bool(r[ma_col])):
                 continue
 
             is_btc = ticker == "BTC"
@@ -211,27 +270,43 @@ def run_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
                     blocked["btc_decline"] += 1
                     continue
 
-            entry = max(float(r["target"]), float(r["open"]))
+            entry = max(float(r[target_col]), float(r["open"]))
             # BTC 확인을 기다리다 늦게 들어가는 경우를 비관적으로 모사
             if use_confirm and not is_btc and not explosive and confirm_fill == "close":
                 entry = max(entry, float(r["close"]))
             if sizing == "atr":
-                units = (equity * risk) / (stop_mult * float(r["N"]))
-                budget = units * entry * (1 + FEE_RATE)
+                target_units = (sizing_equity * risk) / (stop_mult * float(r["N"]))
             else:
-                budget = equity / len(tickers)
-            budget = min(budget, cash)
+                target_units = (sizing_equity / len(tickers)) / entry
+            if is_btc and btc_min_weight > 0:
+                target_units = max(
+                    target_units, (sizing_equity * btc_min_weight) / entry)
+
+            held_units = positions.get(ticker, {}).get("units", 0.0)
+            if held_units >= target_units * refill_threshold:
+                continue
+            gap_units = max(0.0, target_units - held_units)
+            budget = gap_units * entry * (1 + FEE_RATE)
+            spendable = cash if is_btc else max(0.0, cash - btc_reserved)
+            budget = min(budget, spendable)
             if budget <= 0:
                 continue
 
-            positions[ticker] = {"units": budget / (entry * (1 + FEE_RATE)),
-                                 "cost": budget, "entry": entry}
+            bought_units = budget / (entry * (1 + FEE_RATE))
+            old = positions.get(ticker, {"units": 0.0, "cost": 0.0, "entry": entry})
+            positions[ticker] = {"units": old["units"] + bought_units,
+                                 "cost": old["cost"] + budget, "entry": entry}
             cash -= budget
+            buy_orders += 1
+            if is_btc:
+                btc_reserved = max(0.0, btc_reserved - budget)
 
         holdings = sum(
             p["units"] * float(data[t].loc[date, "close"])
             for t, p in positions.items() if date in data[t].index)
-        curve.append(cash + holdings)
+        closing_equity = cash + holdings
+        curve.append(closing_equity)
+        cash_ratios.append(cash / closing_equity if closing_equity > 0 else 0.0)
         if positions:
             exposure += 1
 
@@ -269,6 +344,8 @@ def run_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
         "평균손실%": round(np.mean([t["return"] for t in trades if t["return"] <= 0]) * 100, 2)
                     if len(wins) < len(trades) else 0.0,
         "노출일%": round(exposure / days * 100, 1),
+        "현금대기율%": round(float(np.mean(cash_ratios)) * 100, 1) if cash_ratios else 0.0,
+        "매수주문": buy_orders,
         "최종자산": round(final),
         "월수익_중앙%": round(float(monthly.median()), 2) if len(monthly) else None,
         "월수익_최악%": round(float(monthly.min()), 2) if len(monthly) else None,
@@ -291,7 +368,7 @@ def prepare_data(config: Dict[str, Any], refresh: bool = False):
 
     :return: (종목별 지표 DataFrame, 시장 상태 DataFrame, 제외된 종목)
     """
-    from tools.market_data import fetch_ohlcv, fetch_upbit
+    from tools.market_data import fetch_binance_reference, fetch_ohlcv, fetch_upbit
 
     ma = int(config.get("ma_window", 10))
     bear_ma = int(config.get("bear_exit_ma_window", 5))
@@ -304,19 +381,29 @@ def prepare_data(config: Dict[str, Any], refresh: bool = False):
 
     data: Dict[str, pd.DataFrame] = {}
     missing: List[str] = []
+    references: Dict[str, pd.DataFrame] = {}
+    use_reference = str(config.get("signal_reference", "local")).lower() == "binance"
     for ticker in tickers:
         raw = fetch_upbit(ticker, refresh=refresh)
         if raw is None or len(raw) < 200:
             missing.append(ticker)
             continue
-        data[ticker] = add_indicators(raw, windows, atr_w)
+        local = add_indicators(raw, windows, atr_w)
+        if use_reference:
+            reference = fetch_binance_reference(ticker, refresh=refresh)
+            if reference is not None and len(reference) >= 200:
+                references[ticker] = reference
+                local = attach_reference_signals(local, reference, windows, atr_w)
+            else:
+                logger.warning(f"[{ticker}] Binance 백테스트 기준신호 없음 - 현지 신호로 대체")
+        data[ticker] = local
 
     if "BTC" not in data:
         raise RuntimeError("BTC 일봉을 가져오지 못해 시장 상태를 만들 수 없습니다")
 
     btc_raw = fetch_upbit("BTC", refresh=refresh)
     era_source = fetch_ohlcv("bitstamp", "BTC/USD")     # 폭등기 판정용 15년치
-    ctx = market_context(btc_raw, config, era_source)
+    ctx = market_context(btc_raw, config, era_source, references.get("BTC"))
 
     # 매매 대상에서 BTC를 뺐다면 지표만 쓰고 매매에서는 제외
     if "BTC" not in [str(t).upper() for t in (config.get("tickers") or [])]:

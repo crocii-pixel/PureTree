@@ -977,24 +977,24 @@ class TestQuantBotIntegration:
 
         assert bot.has_bought["BTC"] is False
 
-    def test_monitor_market_skips_when_already_bought(self, bot):
+    def test_today_fill_does_not_block_remaining_room(self, bot):
         bot.target_prices = {"BTC": 500.0}
         bot.is_above_ma = {"BTC": True}
         bot.has_bought = {"BTC": True, "ETH": True}
         bot.monitor_market()
 
-        assert bot.exchange.placed == []
+        assert bot.pending_buy_units["BTC"] > 0
 
-    def test_insufficient_balance_skips_ticker_for_the_day(self, bot):
-        """잔고 부족 시 주문을 시도하지 않고 당일 매수 대상에서 제외 (초당 재시도 방지)"""
-        bot.exchange.krw = 8_000.0         # 2종목 분할 시 종목당 약 3,998원 -> 최소주문금액(5,000원) 미만
+    def test_insufficient_balance_does_not_permanently_skip_ticker(self, bot):
+        """가용현금은 입금/예약 변화가 있으므로 부족해도 다음 루프에서 재평가한다."""
+        bot.exchange.krw = 4_000.0         # 가용현금 자체가 최소주문금액(5,000원) 미만
         bot.target_prices = {"BTC": 500.0, "ETH": 500.0}
         bot.is_above_ma = {"BTC": True, "ETH": True}
 
         bot.monitor_market()
 
-        assert bot.skipped_today["BTC"] is True
-        assert bot.skipped_today["ETH"] is True
+        assert bot.skipped_today["BTC"] is False
+        assert bot.skipped_today["ETH"] is False
         assert bot.has_bought["BTC"] is False
         assert bot.exchange.placed == []   # 거래소 주문 API 자체를 호출하지 않음
 
@@ -1043,11 +1043,11 @@ class TestQuantBotIntegration:
         thread.start()
         assert finished.wait(timeout=10) is True
 
-    def test_liquidate_resets_position_flags(self, bot):
+    def test_liquidate_does_not_falsify_today_fill_history(self, bot):
         bot.has_bought = {"BTC": True, "ETH": True}
         bot.liquidate_position()
 
-        assert all(v is False for v in bot.has_bought.values())
+        assert all(v is True for v in bot.has_bought.values())
 
     def test_status_report_shows_exchange_name(self, bot):
         assert "더미 거래소" in bot.get_status_report()
@@ -1175,6 +1175,35 @@ class TestTradeStore:
         assert state["effective_k"] == 0.6
         assert state["has_bought"] == 1
 
+    def test_legacy_daily_state_is_migrated_without_data_loss(self, tmp_path):
+        import sqlite3
+        from trade_store import TradeStore
+
+        db = tmp_path / "legacy.db"
+        with sqlite3.connect(db) as conn:
+            conn.execute("""
+                CREATE TABLE daily_state (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trade_date TEXT NOT NULL,
+                    exchange TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    has_bought INTEGER NOT NULL DEFAULT 0,
+                    skipped INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT,
+                    UNIQUE(trade_date, exchange, symbol)
+                )
+            """)
+            conn.execute(
+                "INSERT INTO daily_state (trade_date, exchange, symbol, has_bought) "
+                "VALUES (?, ?, ?, ?)", ("2026-08-21", "bithumb", "BTC", 1))
+
+        migrated = TradeStore(db)
+        state = migrated.load_daily_state("bithumb", "2026-08-21")["BTC"]
+        assert state["has_bought"] == 1
+        for field in ("bought_today", "has_position", "position_units",
+                      "position_value", "target_units", "target_value", "closed_today"):
+            assert field in state
+
     def test_exchange_order_id_lookup(self, store):
         store.record_trade("C-1", "upbit", "BTC", "buy", "success",
                            exchange_order_id="uuid-123")
@@ -1278,7 +1307,7 @@ class TestRestartRecovery:
         assert second.exchange.placed == []
         assert second.has_bought["BTC"] is True
 
-    def test_skip_state_is_restored(self, tmp_path):
+    def test_insufficient_cash_is_not_persisted_as_daily_skip(self, tmp_path):
         from trade_store import TradeStore
 
         db = tmp_path / "shared.db"
@@ -1287,11 +1316,11 @@ class TestRestartRecovery:
         first.target_prices = {"BTC": 500.0, "ETH": 500.0}
         first.is_above_ma = {"BTC": True, "ETH": True}
         first.monitor_market()
-        assert first.skipped_today["BTC"] is True
+        assert first.skipped_today["BTC"] is False
 
         second = self._make_bot(tmp_path, TradeStore(db))
         second.restore_daily_state()
-        assert second.skipped_today["BTC"] is True
+        assert second.skipped_today["BTC"] is False
 
     def test_daily_settings_persists_indicators(self, tmp_path):
         bot = self._make_bot(tmp_path)
@@ -1498,7 +1527,8 @@ class TestEvaluateThenRebalance:
         bot.rebalance_positions()
 
         assert bot.exchange.placed == []                    # 매도 주문 없음
-        assert bot.has_bought == {"BTC": True, "ETH": True}  # 당일 재매수도 차단
+        assert bot.has_position == {"BTC": True, "ETH": True}
+        assert bot.bought_today == {"BTC": False, "ETH": False}
 
     def test_momentum_lost_exits_position(self, tmp_path):
         bot = self._make_bot(tmp_path)
@@ -1519,8 +1549,8 @@ class TestEvaluateThenRebalance:
 
         sells = [p for p in bot.exchange.placed if p["side"] == "sell"]
         assert len(sells) == 1
-        assert bot.has_bought["BTC"] is True
-        assert bot.has_bought["ETH"] is False
+        assert bot.has_position["BTC"] is True
+        assert bot.has_position["ETH"] is False
 
     def test_dust_holdings_are_skipped(self, tmp_path):
         """최소 주문금액 미만 보유분은 매도 시도조차 하지 않음"""
@@ -1530,8 +1560,8 @@ class TestEvaluateThenRebalance:
         bot.rebalance_positions()
         assert bot.exchange.placed == []
 
-    def test_held_position_is_not_rebought(self, tmp_path):
-        """보유 유지로 판정된 종목은 같은 날 추가 매수되지 않는다"""
+    def test_held_position_buys_only_target_gap(self, tmp_path):
+        """기존 보유는 차단 플래그가 아니며 목표 보유액의 부족분만 보충한다."""
         bot = self._make_bot(tmp_path)
         bot.is_above_ma = {"BTC": True, "ETH": True}
         bot.rebalance_positions()
@@ -1539,7 +1569,9 @@ class TestEvaluateThenRebalance:
         bot.target_prices = {"BTC": 500.0, "ETH": 500.0}    # 돌파 조건 충족
         bot.monitor_market()
 
-        assert bot.exchange.placed == []
+        buys = [o for o in bot.exchange.placed if o["side"] == "buy"]
+        assert len(buys) == 2
+        assert all(0 < o["budget"] < 500_000 for o in buys)
 
     def test_daily_routine_evaluates_before_acting(self, tmp_path, monkeypatch):
         """평가 -> 반영 순서가 지켜지는지 (순서가 뒤바뀌면 잘못된 판단으로 매매)"""
@@ -1794,6 +1826,11 @@ class TestPositionSizing:
     # -- 기본값 --------------------------------------------------------
     def test_default_is_equal_split(self, tmp_path):
         assert config_manager.DEFAULT_CONFIG["position_sizing"] == "equal"
+        assert config_manager.DEFAULT_CONFIG["btc_min_weight"] == 0.0
+        assert config_manager.DEFAULT_CONFIG["position_refill_threshold"] == 0.95
+        assert config_manager.DEFAULT_CONFIG["sizing_equity_cap_krw"] == 0.0
+        assert config_manager.DEFAULT_CONFIG["signal_reference"] == "local"
+        assert config_manager.DEFAULT_CONFIG["realtime_price_stream"] is True
 
         bot = self._make_bot(tmp_path)
         assert bot.position_sizing == "equal"
@@ -1806,7 +1843,7 @@ class TestPositionSizing:
         # 종목 2개 -> 주문가능 원화의 1/2 (수수료 안전마진 반영)
         expected = 1_000_000.0 * 0.5 * bot.exchange.ORDER_SAFETY_RATIO
         assert planned == pytest.approx(expected)
-        assert explicit is None          # budget_ratio 경로 사용
+        assert explicit == pytest.approx(500_000.0)
 
     # -- ATR 사이징 -----------------------------------------------------
     def test_atr_sizing_scales_with_volatility(self, tmp_path):
@@ -1881,13 +1918,105 @@ class TestPositionSizing:
         bot.monitor_market()
 
         assert bot.exchange.placed == []
-        assert bot.skipped_today["BTC"] is True
+        assert bot.skipped_today["BTC"] is False
 
     def test_sizing_summary_shows_mode(self, tmp_path):
         atr_bot = self._make_bot(tmp_path, position_sizing="atr", risk_per_trade=0.02)
         summary = atr_bot.sizing_summary()
         assert "ATR" in summary and "2.0%" in summary
         assert "사이징" in atr_bot.get_status_report()
+
+    def test_room_closes_at_refill_threshold(self, tmp_path):
+        bot = self._make_bot(tmp_path)
+        bot.target_position_units["BTC"] = 100.0
+        bot.position_units["BTC"] = 94.0
+        assert bot.position_room_units("BTC") == pytest.approx(6.0)
+
+        bot.position_units["BTC"] = 95.0
+        assert bot.position_room_units("BTC") == 0.0
+
+    def test_btc_zero_weight_creates_no_reservation(self, tmp_path):
+        bot = self._make_bot(tmp_path, position_sizing="atr", btc_min_weight=0.0)
+        bot.sizing_equity = 1_000_000.0
+        bot.atr_values = {"BTC": 100.0, "ETH": 5.0}
+        bot.refresh_position_targets()
+
+        assert bot.btc_reserved_cash == 0.0
+
+    def test_btc_min_weight_is_floor_and_reserves_alt_cash(self, tmp_path):
+        bot = self._make_bot(tmp_path, position_sizing="atr", btc_min_weight=0.20)
+        bot.sizing_equity = 1_000_000.0
+        bot.atr_values = {"BTC": 100.0, "ETH": 5.0}
+        bot.refresh_position_targets()
+
+        assert bot.target_position_values["BTC"] == pytest.approx(200_000.0)
+        assert bot.btc_reserved_cash == pytest.approx(200_000.0)
+        planned, explicit = bot.plan_order_budget("ETH")
+        assert planned == pytest.approx(800_000.0)
+        assert explicit == pytest.approx(800_000.0 / bot.exchange.ORDER_SAFETY_RATIO)
+
+    def test_btc_floor_never_reduces_larger_atr_target(self, tmp_path):
+        bot = self._make_bot(tmp_path, position_sizing="atr", btc_min_weight=0.20)
+        bot.sizing_equity = 1_000_000.0
+        bot.atr_values["BTC"] = 10.0
+        bot.refresh_position_targets()
+
+        assert bot.target_position_values["BTC"] == pytest.approx(500_000.0)
+
+    def test_manual_recalculation_preserves_intraday_state(self, tmp_path, monkeypatch):
+        bot = self._make_bot(tmp_path, btc_min_weight=0.20)
+        bot.bought_today["BTC"] = True
+        bot.closed_today["ETH"] = True
+        calls = []
+
+        def recalc(**kwargs):
+            calls.append(kwargs)
+            bot.sizing_equity = 1_200_000.0
+            bot.target_position_units = {"BTC": 240.0, "ETH": 100.0}
+            bot.btc_reserved_cash = 240_000.0
+
+        monkeypatch.setattr(bot, "update_daily_settings", recalc)
+        result = bot.command_recalculate()
+
+        assert calls[0]["reset_session_state"] is False
+        assert bot.bought_today["BTC"] is True
+        assert bot.closed_today["ETH"] is True
+        assert "1,200,000" in result
+
+    def test_sizing_equity_cap_limits_compounding_base(self, tmp_path):
+        bot = self._make_bot(tmp_path, sizing_equity_cap_krw=300_000.0)
+        assert bot.total_equity() == pytest.approx(1_000_000.0)
+        assert bot.capped_sizing_equity() == pytest.approx(300_000.0)
+
+        bot.sizing_equity = bot.capped_sizing_equity()
+        bot.refresh_position_targets()
+        assert bot.target_position_values["BTC"] == pytest.approx(150_000.0)
+
+    def test_zero_sizing_cap_keeps_full_compounding(self, tmp_path):
+        bot = self._make_bot(tmp_path, sizing_equity_cap_krw=0.0)
+        assert bot.capped_sizing_equity() == pytest.approx(bot.total_equity())
+
+    def test_websocket_price_precedes_rest_fallback(self, tmp_path):
+        bot = self._make_bot(tmp_path)
+
+        class Cache:
+            def get(self, ticker, max_age):
+                return 12_345.0
+
+        bot.price_stream = Cache()
+        assert bot.current_price("BTC") == 12_345.0
+
+    def test_binance_reference_sets_common_k_and_ma(self, tmp_path, monkeypatch):
+        import main
+
+        bot = self._make_bot(tmp_path, signal_reference="binance")
+        reference = make_ohlcv(100, base_price=500.0)
+        monkeypatch.setattr(main, "fetch_binance_daily", lambda *args, **kwargs: reference)
+        bot.update_daily_settings(notify=False)
+
+        assert bot.signal_sources == {"BTC": "binance", "ETH": "binance"}
+        expected = bot.strategy_engine.calculate_noise_ratio(reference, 20)
+        assert bot.effective_ks["BTC"] == pytest.approx(expected)
 
     def test_atr_indicator_excludes_in_progress_candle(self):
         """진행 중인 봉은 값이 계속 바뀌므로 ATR 계산에서 제외해야 한다"""
@@ -2340,7 +2469,8 @@ class TestBearMarketExit:
         bot.rebalance_positions()
 
         assert [o for o in bot.exchange.placed if o["side"] == "sell"] == []
-        assert bot.has_bought["BTC"] is True              # 보유 유지 -> 당일 재매수 차단
+        assert bot.has_position["BTC"] is True
+        assert bot.bought_today["BTC"] is False
 
     def test_daily_settings_sets_exit_flag(self, tmp_path):
         rising = [100 + i * 10 for i in range(10)]
@@ -2816,9 +2946,39 @@ class TestBacktestConfig:
     # -- 백테스트 기본 ------------------------------------------------
     def test_runs_and_reports_core_metrics(self):
         result = self._run(self._config())
-        for key in ("총수익률%", "MDD%", "매매", "승률%", "노출일%"):
+        for key in ("총수익률%", "MDD%", "CAGR%", "MAR", "매매", "승률%",
+                    "노출일%", "현금대기율%", "매수주문"):
             assert key in result
         assert result["매매"] > 0
+
+    def test_btc_min_weight_backtest_can_be_compared_with_zero_baseline(self):
+        baseline = self._run(self._config(btc_min_weight=0.0, position_sizing="atr"))
+        weighted = self._run(self._config(btc_min_weight=0.20, position_sizing="atr"))
+
+        for result in (baseline, weighted):
+            assert all(key in result for key in ("CAGR%", "MDD%", "MAR", "현금대기율%"))
+        assert weighted["최종자산"] != baseline["최종자산"]
+
+    def test_sizing_cap_reduces_reinvestment_in_rising_market(self):
+        unlimited = self._run(self._config(position_sizing="equal", sizing_equity_cap_krw=0.0))
+        capped = self._run(self._config(
+            position_sizing="equal", sizing_equity_cap_krw=10_000_000.0))
+
+        assert capped["최종자산"] <= unlimited["최종자산"]
+        assert capped["최종자산"] != unlimited["최종자산"]
+
+    def test_binance_reference_columns_drive_signal_target(self):
+        from tools.backtest_config import add_indicators, attach_reference_signals
+
+        local_raw = self._series()
+        reference_raw = self._series(drift=0.2, phase=11)
+        local = add_indicators(local_raw, [10, 5], 20)
+        attached = attach_reference_signals(local, reference_raw, [10, 5], 20)
+
+        assert "signal_k" in attached
+        assert "signal_target" in attached
+        assert "signal_above_ma10" in attached
+        assert not attached["signal_k"].equals(attached["k"])
 
     def test_short_window_returns_empty(self):
         """구간이 너무 짧으면 억지 숫자를 내지 않는다"""
@@ -3054,17 +3214,18 @@ class TestPositionSync:
         return QuantBot(config=config, exchange=exchange,
                         notifier=FakeNotifier(), store=TradeStore(tmp_path / "t.db"))
 
-    def test_detects_untracked_holding(self, tmp_path):
-        """봇 기록에 없는 보유를 찾아내 추가 매수를 막는다"""
+    def test_detects_untracked_holding_without_fake_today_fill(self, tmp_path):
+        """기존 보유는 찾되 오늘 체결로 거짓 표시하지 않는다."""
         bot = self._make_bot(tmp_path)
         bot.exchange.coin = 100.0                  # 100 x 1000원 = 10만원 보유
         assert bot.has_bought["BTC"] is False
 
         summary = bot.sync_positions()
 
-        assert bot.has_bought["BTC"] is True
+        assert bot.has_position["BTC"] is True
+        assert bot.bought_today["BTC"] is False
         assert "BTC" in bot.external_positions
-        assert "발견" in summary
+        assert "갱신" in summary
 
     def test_ignores_dust(self, tmp_path):
         """최소 주문금액에 못 미치는 잔량은 포지션으로 보지 않는다"""
@@ -3113,7 +3274,8 @@ class TestPositionSync:
 
         bot.sync_positions()                        # 예외가 새어나오면 실패
 
-        assert bot.has_bought["ETH"] is True        # BTC는 실패했지만 ETH는 처리됨
+        assert bot.has_position["ETH"] is True      # BTC는 실패했지만 ETH는 처리됨
+        assert bot.bought_today["ETH"] is False
 
     def test_records_daily_state(self, tmp_path):
         """재시작해도 유지되도록 저장소에 기록한다"""
@@ -3123,7 +3285,8 @@ class TestPositionSync:
         bot.sync_positions()
 
         states = bot.store.load_daily_state(bot.exchange.NAME, bot.trade_date())
-        assert states.get("BTC", {}).get("has_bought")
+        assert states.get("BTC", {}).get("has_position")
+        assert not states.get("BTC", {}).get("bought_today")
 
     def test_telegram_command_wired(self, tmp_path):
         bot = self._make_bot(tmp_path)
@@ -3132,10 +3295,11 @@ class TestPositionSync:
         result = bot.command_sync()
 
         assert "잔고 대사" in result
-        assert bot.has_bought["BTC"] is True
+        assert bot.has_position["BTC"] is True
+        assert bot.bought_today["BTC"] is False
 
-    def test_sync_prevents_second_buy(self, tmp_path):
-        """대사 후에는 돌파해도 추가 매수하지 않는다"""
+    def test_sync_buys_only_remaining_target_room(self, tmp_path):
+        """대사한 기존 보유액을 빼고 목표 보유액까지의 차액만 주문한다."""
         bot = self._make_bot(tmp_path)
         bot.exchange.coin = 100.0                  # 이미 보유 (사용자가 직접 매수)
         bot.target_prices = {"BTC": 500.0, "ETH": 500.0}
@@ -3145,7 +3309,9 @@ class TestPositionSync:
         bot.monitor_market()
 
         bought = [o["market"] for o in bot.exchange.placed if o["side"] == "buy"]
-        assert "BTC" not in bought
+        assert "BTC" in bought
+        btc_order = next(o for o in bot.exchange.placed if o["market"] == "BTC")
+        assert 0 < btc_order["budget"] < 500_000
 
 
 class TestBlockedLogging:
@@ -3321,6 +3487,75 @@ class TestTickerValidation:
         bot = self._make_bot(tmp_path, self.MARKETS, ["NOPE", "ALSONOPE"])
         assert bot.tickers == []
 
+
+class TestBacktestPeriodPresets:
+    def test_default_relative_presets_are_available(self):
+        names = [item["name"] for item in config_gui.backtest_presets()]
+        for name in ("최근 3개월", "최근 6개월", "최근 1년", "최근 2년", "최근 3년"):
+            assert name in names
+
+    def test_market_regime_presets_are_available(self):
+        names = [item["name"] for item in config_gui.backtest_presets()]
+        for name in ("2017 상승장", "2018 하락장", "2020~21 상승장", "2022 하락장",
+                     "성장·폭등기 벤치마크", "성숙기 벤치마크"):
+            assert name in names
+
+    def test_relative_preset_switches_dates(self):
+        start, end, all_period = config_gui.resolve_backtest_preset(
+            {"name": "최근 6개월", "months": 6}, today="2026-08-24")
+        assert (start, end, all_period) == ("2026-02-24", "2026-08-24", False)
+
+    def test_maturity_preset_ends_today(self):
+        preset = next(item for item in config_gui.backtest_presets()
+                      if item["name"] == "성숙기 벤치마크")
+        assert config_gui.resolve_backtest_preset(preset, today="2026-08-24") == (
+            "2021-01-01", "2026-08-24", False)
+
+    def test_custom_presets_are_extensible_and_deduplicated(self):
+        presets = config_gui.backtest_presets([
+            {"name": "내 비교", "start": "2023-01-01", "end": "2023-06-30"},
+            {"name": "최근 1년", "start": "2020-01-01", "end": "2020-12-31"},
+        ])
+        assert [item["name"] for item in presets].count("최근 1년") == 1
+        assert any(item.get("custom") and item["name"] == "내 비교" for item in presets)
+
+
+class TestLivePriceStream:
+    def test_subscription_contains_all_tickers(self):
+        from live_price_stream import LivePriceStream
+
+        stream = LivePriceStream("bithumb", ["BTC", "KRW-ETH"])
+        request = stream.subscription()
+        ticker = next(item for item in request if item.get("type") == "ticker")
+        assert ticker["codes"] == ["KRW-BTC", "KRW-ETH"]
+
+    def test_ingest_and_staleness(self, monkeypatch):
+        import live_price_stream
+        from live_price_stream import LivePriceStream
+
+        stream = LivePriceStream("upbit", ["BTC"])
+        monkeypatch.setattr(live_price_stream.time, "time", lambda: 100.0)
+        stream.ingest({"type": "ticker", "code": "KRW-BTC",
+                       "trade_price": 123.0, "timestamp": 99_900})
+        assert stream.get("BTC", max_age=1.0) == 123.0
+
+        monkeypatch.setattr(live_price_stream.time, "time", lambda: 102.0)
+        assert stream.get("BTC", max_age=1.0) is None
+
+    def test_unsupported_exchange_does_not_start(self):
+        from live_price_stream import LivePriceStream
+
+        assert LivePriceStream("dummy", ["BTC"]).start() is False
+
+
+class TestReferenceData:
+    def test_binance_rows_are_normalized_to_kst_nine(self):
+        from reference_data import _frame
+
+        rows = [[0, "1", "2", "0.5", "1.5", "10", 0, 0, 0, 0, 0, 0]]
+        df = _frame(rows)
+        assert list(df.columns) == ["open", "high", "low", "close", "volume"]
+        assert df.index[0].hour == 9
 
 class TestMarketListing:
     """어댑터의 상장 목록 조회"""

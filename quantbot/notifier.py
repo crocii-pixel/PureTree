@@ -145,7 +145,8 @@ class TelegramNotifier:
             help_text = (
                 "🤖 <b>[QuantBot 명령어 안내]</b>\n"
                 "• <b>/자산</b> 또는 <b>/balance</b> : 원화 및 보유 코인 실시간 평가 현황\n"
-                "• <b>/상태</b> 또는 <b>/status</b> : 봇 가동 상태 및 종목별 목표가/동적 K값 현황"
+                "• <b>/상태</b> 또는 <b>/status</b> : 봇 가동 상태 및 종목별 목표가/동적 K값 현황\n"
+                "• <b>/재산정</b> : 최신 입출금·잔고로 목표가와 ATR 목표수량 다시 계산"
             )
             self.send_message(help_text)
 

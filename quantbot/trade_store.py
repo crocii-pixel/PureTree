@@ -65,6 +65,13 @@ CREATE TABLE IF NOT EXISTS daily_state (
     ma_value     REAL    NOT NULL DEFAULT 0,
     is_above_ma  INTEGER NOT NULL DEFAULT 0,
     has_bought   INTEGER NOT NULL DEFAULT 0,
+    bought_today INTEGER NOT NULL DEFAULT 0,
+    has_position INTEGER NOT NULL DEFAULT 0,
+    position_units REAL NOT NULL DEFAULT 0,
+    position_value REAL NOT NULL DEFAULT 0,
+    target_units REAL NOT NULL DEFAULT 0,
+    target_value REAL NOT NULL DEFAULT 0,
+    closed_today INTEGER NOT NULL DEFAULT 0,
     skipped      INTEGER NOT NULL DEFAULT 0,
     skip_reason  TEXT,
     updated_at   TEXT    NOT NULL,
@@ -165,6 +172,20 @@ class TradeStore:
             # WAL: 봇의 쓰기와 GUI의 조회가 서로를 차단하지 않도록
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(SCHEMA)
+            # 기존 설치의 daily_state를 파괴하지 않고 새 상태 컬럼만 더합니다.
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(daily_state)")}
+            migrations = {
+                "bought_today": "INTEGER NOT NULL DEFAULT 0",
+                "has_position": "INTEGER NOT NULL DEFAULT 0",
+                "position_units": "REAL NOT NULL DEFAULT 0",
+                "position_value": "REAL NOT NULL DEFAULT 0",
+                "target_units": "REAL NOT NULL DEFAULT 0",
+                "target_value": "REAL NOT NULL DEFAULT 0",
+                "closed_today": "INTEGER NOT NULL DEFAULT 0",
+            }
+            for name, definition in migrations.items():
+                if name not in columns:
+                    conn.execute(f"ALTER TABLE daily_state ADD COLUMN {name} {definition}")
 
     # ------------------------------------------------------------------
     # 주문 코드
@@ -312,12 +333,14 @@ class TradeStore:
     def upsert_daily_state(self, exchange: str, symbol: str,
                            trade_date: Optional[str] = None, **fields: Any) -> None:
         """
-        당일 종목 상태 저장/갱신 (target_price, effective_k, has_bought, skipped 등).
+        당일 종목 상태 저장/갱신 (목표·실보유·실제 당일 체결·차단 상태 등).
         지정하지 않은 컬럼은 기존 값을 유지합니다.
         """
         trade_date = trade_date or today_str()
-        allowed = ("target_price", "effective_k", "ma_value",
-                   "is_above_ma", "has_bought", "skipped", "skip_reason")
+        allowed = ("target_price", "effective_k", "ma_value", "is_above_ma",
+                   "has_bought", "bought_today", "has_position",
+                   "position_units", "position_value", "target_units", "target_value",
+                   "closed_today", "skipped", "skip_reason")
         updates = {k: v for k, v in fields.items() if k in allowed}
         now = datetime.now().isoformat(timespec="seconds")
 

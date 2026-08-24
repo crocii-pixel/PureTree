@@ -420,7 +420,7 @@ class Dashboard(QWidget):
 
         # --- 지표 카드 ---
         strategy = "동적 K" if self.bot.use_dynamic_k else f"K {self.bot.k}"
-        filled = sum(1 for t in self.bot.tickers if self.bot.has_bought.get(t))
+        filled = sum(1 for t in self.bot.tickers if self.bot.bought_today.get(t))
         self.metric_labels["strategy"].setText(f"{strategy} · MA{self.bot.ma_window}")
         self.metric_labels["tickers"].setText(str(len(self.bot.tickers)))
         self.metric_labels["filled"].setText(f"{filled} / {len(self.bot.tickers)}")
@@ -433,8 +433,18 @@ class Dashboard(QWidget):
         invalid = list(getattr(self.bot, "invalid_tickers", []))
         self.table.setRowCount(len(self.bot.tickers) + len(invalid))
         for row, ticker in enumerate(self.bot.tickers):
-            if self.bot.has_bought.get(ticker):
-                status, tone, tip = "체결 완료", ui_theme.COLORS["accent"], "당일 매수 체결 완료"
+            target_units = self.bot.target_position_units.get(ticker, 0.0)
+            covered = (self.bot.position_units.get(ticker, 0.0)
+                       + self.bot.pending_buy_units.get(ticker, 0.0))
+            fill = covered / target_units if target_units > 0 else 0.0
+            if self.bot.bought_today.get(ticker):
+                status, tone, tip = "오늘 체결", ui_theme.COLORS["accent"], "오늘 실제 매수 체결"
+            elif self.bot.closed_today.get(ticker):
+                status, tone, tip = "오늘 청산", ui_theme.COLORS["danger"], "당일 재진입 차단"
+            elif self.bot.has_position.get(ticker) and fill >= self.bot.position_refill_threshold:
+                status, tone, tip = "목표 충족", ui_theme.COLORS["accent"], f"ATR 목표 {fill * 100:.1f}% 충족"
+            elif self.bot.has_position.get(ticker):
+                status, tone, tip = "기존 보유", ui_theme.COLORS["amber"], f"ATR 목표 {fill * 100:.1f}% · 돌파 시 보충"
             elif self.bot.skipped_today.get(ticker):
                 status, tone = "당일 제외", ui_theme.COLORS["amber"]
                 tip = "주문 가능 예산이 최소 주문금액 미만이라 당일 매수 대상에서 제외되었습니다."
@@ -548,10 +558,12 @@ class TrayApplication:
         self.bot_thread.crashed.connect(self._on_bot_crashed)
         self.bot_thread.start()
 
-        # 트레이 툴팁/대시보드용 현재가 갱신 타이머 (5초 주기, 백그라운드 조회)
+        # WebSocket 캐시를 1초마다 화면에 반영합니다. 스트림이 없으면 bot.current_price가
+        # 기존 REST 조회로 자동 대체하므로 거래소별 호환성도 유지됩니다.
         self.price_timer = QTimer()
+        self._price_refreshing = False
         self.price_timer.timeout.connect(self._refresh_prices_async)
-        self.price_timer.start(5000)
+        self.price_timer.start(1000)
 
         mode = "시뮬레이션" if bot.exchange.is_simulation else "실전 매매"
         self.notify("QuantBot 가동", f"{bot.exchange.DISPLAY_NAME} / {mode}\n"
@@ -673,17 +685,24 @@ class TrayApplication:
 
     def _refresh_prices_async(self) -> None:
         """현재가를 백그라운드로 조회해 대시보드/툴팁에 반영"""
+        if self._price_refreshing:
+            return
+        self._price_refreshing = True
+
         def worker() -> None:
-            prices: Dict[str, float] = {}
-            for ticker in self.bot.tickers:
-                try:
-                    price = self.bot.exchange.get_current_price(ticker)
-                    if price:
-                        prices[ticker] = float(price)
-                except Exception:
-                    continue
-            for ticker, price in prices.items():
-                self.dashboard.set_price(ticker, price)
+            try:
+                prices: Dict[str, float] = {}
+                for ticker in self.bot.tickers:
+                    try:
+                        price = self.bot.current_price(ticker)
+                        if price:
+                            prices[ticker] = float(price)
+                    except Exception:
+                        continue
+                for ticker, price in prices.items():
+                    self.dashboard.set_price(ticker, price)
+            finally:
+                self._price_refreshing = False
 
         threading.Thread(target=worker, daemon=True).start()
 

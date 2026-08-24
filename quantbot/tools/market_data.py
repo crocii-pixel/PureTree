@@ -159,7 +159,6 @@ def fetch_upbit(ticker: str, count: int = UPBIT_FULL_COUNT,
     except ImportError:
         logger.error("pyupbit가 필요합니다")
         return None
-
     try:
         df = pyupbit.get_ohlcv(f"KRW-{ticker}", interval="day", count=count)
         if df is None or df.empty:
@@ -170,6 +169,26 @@ def fetch_upbit(ticker: str, count: int = UPBIT_FULL_COUNT,
         return df
     except Exception as e:
         logger.error(f"업비트 KRW-{ticker} 수집 실패: {e}")
+        return None
+
+
+def fetch_binance_reference(ticker: str, refresh: bool = False) -> Optional[pd.DataFrame]:
+    """K·MA 공통 기준용 Binance USDT 전체 일봉을 캐시해 반환합니다."""
+    ticker = str(ticker).split("-")[-1].upper()
+    cache = _cache_path("binance_reference", f"{ticker}-USDT", "1d")
+    if cache.exists() and not refresh:
+        return pd.read_csv(cache, index_col=0, parse_dates=True)
+    try:
+        from reference_data import fetch_binance_history
+        df = fetch_binance_history(ticker)
+        if df is None or df.empty:
+            return None
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        df.to_csv(cache)
+        logger.info(f"[수집] Binance {ticker}/USDT 기준신호 {len(df)}건")
+        return df
+    except Exception as e:
+        logger.error(f"Binance {ticker}/USDT 기준신호 수집 실패: {e}")
         return None
 
 

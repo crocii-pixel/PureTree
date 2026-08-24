@@ -19,7 +19,7 @@ int main() {
     // Access the shell from the node
     // 노드에서 쉘에 접근합니다.
     nsTree::Node* node = tree.getNode(workerH);
-    CThreadShell& shell = node->value.to<CThreadShell>();
+    CThreadShell& shell = node->value.get<CThreadShell>();
 
     // 2. Define a background task (e.g., monitoring or processing)
     // 2. 배경 작업 정의 (예: 모니터링 또는 처리)

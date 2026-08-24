@@ -206,6 +206,25 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "risk_per_trade": 0.01,
     "atr_window": 20,
     "atr_stop_multiple": 2.0,
+    # BTC 최소 목표 비중. 0이면 ATR 외 별도 우대가 없습니다.
+    # 0보다 크면 목표가 산정 시 총자산 대비 이 비중까지의 부족분을 내부 예약금으로
+    # 남겨 알트 주문이 먼저 사용하지 못하게 합니다. 실제 지정가 주문을 내는 값은 아닙니다.
+    "btc_min_weight": 0.0,
+    # 목표 수량의 이 비율 미만일 때만 부족분을 보충합니다. 작은 가격/수수료 차이로
+    # 소액 주문이 반복되는 것을 막는 히스테리시스입니다.
+    "position_refill_threshold": 0.95,
+    # 복리 사이징 기준자산 상한. 0이면 제한 없이 실제 총자산을 전부 반영합니다.
+    # 예: 30_000_000이면 계좌가 5천만원이어도 목표수량은 3천만원 기준으로 계산합니다.
+    "sizing_equity_cap_krw": 0.0,
+
+    # 진입 방향(MA)과 동적 K의 기준 시장. local은 실제 거래소 일봉,
+    # binance는 Binance USDT 일봉을 공통 기준으로 쓰되 목표가 범위와 ATR은 현지 KRW를 씁니다.
+    "signal_reference": "local",
+
+    # 공개 WebSocket 가격 캐시. 화면과 돌파 감시의 순차 REST 지연을 줄이며,
+    # 스트림이 끊기거나 오래되면 기존 REST 조회로 자동 대체합니다.
+    "realtime_price_stream": True,
+    "realtime_price_max_age_seconds": 30.0,
 
     "force_simulation": False,
 
@@ -225,6 +244,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # 200일치뿐). 조회 전용이며 주문 경로와는 무관합니다.
     # 짧은 구간은 표본이 적어 편차가 큽니다. 참고 지표로만 보세요.
     "startup_backtest_months": 0,
+
+    # 백테스트 창에서 사용자가 저장한 추가 기간 프리셋.
+    # [{"name": "내 구간", "start": "2023-01-01", "end": "2023-12-31"}]
+    "backtest_presets": [],
 
     # 잔고 대사 주기(분). 0이면 사용하지 않습니다.
     #

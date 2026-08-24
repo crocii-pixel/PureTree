@@ -84,29 +84,29 @@ public:
     const std::type_info& type() const noexcept { return m_vtable ? m_vtable->type() : typeid(void); }
 
     /**
-     * @brief Returns a copy of the contained value. (Causes binding error if assigned to non-const &)
-     * 내부 값을 복사하여 반환합니다. (비상수 참조자에 바인딩 시 오류 발생 가능)
+     * @brief Returns a copy of the contained value.
+     * 내부 값을 복사하여 반환합니다.
      */
     template<typename T>
-    T to() const {
+    T copy() const {
         using DecayedT = typename std::decay<T>::type;
         if (type() != typeid(DecayedT)) throw bad_any_cast();
         return *static_cast<const DecayedT*>(get_ptr());
     }
 
     /**
-     * @brief Returns a reference to the internal object. (Solves lvalue reference binding error)
-     * 내부 객체의 실제 참조를 반환합니다. (참조자 바인딩 오류 해결)
+     * @brief Returns a reference to the internal object.
+     * 내부 객체의 실제 참조를 반환합니다.
      */
     template<typename T>
-    T& as() {
+    T& get() {
         using DecayedT = typename std::decay<T>::type;
         if (type() != typeid(DecayedT)) throw bad_any_cast();
         return *static_cast<DecayedT*>(get_ptr());
     }
 
     template<typename T>
-    const T& as() const {
+    const T& get() const {
         using DecayedT = typename std::decay<T>::type;
         if (type() != typeid(DecayedT)) throw bad_any_cast();
         return *static_cast<const DecayedT*>(get_ptr());

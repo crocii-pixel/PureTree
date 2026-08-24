@@ -28,7 +28,7 @@ void run_harsh_test() {
 
         // "EventA" triggers "EventB", and "EventB" triggers "EventA" back (up to 10)
         keys().addEvent(boss, "EventA", [&](const std::string& k, const AnyValue& v) {
-            int current = v.to<int>();
+            int current = v.get<int>();
             if (current < 10) {
                 std::cout << "  EventA -> Raising EventB (" << current << ")" << std::endl;
                 key("EventB", current + 1);
@@ -37,7 +37,7 @@ void run_harsh_test() {
         });
 
         keys().addEvent(boss, "EventB", [&](const std::string& k, const AnyValue& v) {
-            int current = v.to<int>();
+            int current = v.get<int>();
             std::cout << "  EventB -> Raising EventA (" << current << ")" << std::endl;
             key("EventA", current);
             trigger_count++;
@@ -125,7 +125,7 @@ void run_harsh_test() {
 
         keys().addEvent(inspector, "DataKey", [&](const std::string&, const AnyValue& v) {
             try {
-                auto received = v.to<ComplexData>();
+                auto received = v.get<ComplexData>();
                 if (received.id == 42 && received.message == "Deep Learning" && received.values.size() == 3) {
                     success = true;
                 }

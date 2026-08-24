@@ -77,18 +77,8 @@ public:
 
     void start(uint32_t delay_ms = 0) {
         std::lock_guard<std::mutex> lock(_mtx);
-        if (_running) return;
-
-        _running = true;
-        _paused = false;
         _singleShotMode = false;
-
-        _thread = std::make_unique<std::thread>([this, delay_ms]() {
-            if (delay_ms > 0) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
-            }
-            _runLoop();
-        });
+        _start_nolock(delay_ms);
     }
 
     void singleShot(uint32_t delay_ms = 0) {
@@ -96,7 +86,7 @@ public:
         _singleShotMode = true;
         _paused = false;
         if (!_running) {
-            start(delay_ms);
+            _start_nolock(delay_ms);  // Fix(A): _mtx 이미 보유 중이므로 start() 대신 _start_nolock() 호출
         } else {
             _cv.notify_one();
         }
@@ -105,7 +95,8 @@ public:
     void stop() {
         {
             std::lock_guard<std::mutex> lock(_mtx);
-            if (!_running) return;
+            // Fix(B): 조기 반환 제거 — singleShot 자연 종료 시 _running이 이미 false여도
+            // _thread가 joinable 상태일 수 있으므로 항상 join까지 진행해야 std::terminate 방지
             _running = false;
             _paused = true;
         }
@@ -119,6 +110,18 @@ public:
     bool isRunning() const { return _running; }
 
 private:
+    // Fix(A): start()의 실제 로직. 호출자가 이미 _mtx를 보유 중일 때 사용.
+    void _start_nolock(uint32_t delay_ms) {
+        if (_running) return;
+        _running = true;
+        _paused = false;
+        _thread = std::make_unique<std::thread>([this, delay_ms]() {
+            if (delay_ms > 0)
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+            _runLoop();
+        });
+    }
+
     void _runLoop() {
         while (_running) {
             {

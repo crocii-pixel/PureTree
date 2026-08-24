@@ -5,6 +5,7 @@
 #include <iomanip>
 #include "CPureTree.h"
 #include "Simulator.h"
+#include "TypeRegistry.h"
 
 /**
  * @brief Test suite for CPureTree core functionality.
@@ -50,24 +51,29 @@ void run_filter_logic_tests() {
     auto child1 = tree.addNode(0, "Child_Type1");
     auto child2 = tree.addNode(0, "Child_Type2");
 
-    tree.addLink(root, child1, 101); // Link Type 101
-    tree.addLink(root, child2, 102); // Link Type 102
+    int type101 = nsTree::TypeRegistry::instance().resolve("LinkType101");
+    int type102 = nsTree::TypeRegistry::instance().resolve("LinkType102");
+
+    tree.addLink(root, child1, type101); // Link Type 101
+    tree.addLink(root, child2, type102); // Link Type 102
 
     // 1. FilterMode::Only
+    std::vector<bool> filterMask101 = nsTree::TypeRegistry::instance().createFilterMask({type101});
     std::vector<nsTree::hTree> onlyType101;
-    tree.linearize(root, onlyType101, true, nsTree::FilterMode::Only, {101});
+    tree.serialize(root, onlyType101, true, nsTree::FilterMode::Only, filterMask101);
     // Expected: Root, Child1 (Child2 skipped because link type 102 is not in 'Only')
     assert(onlyType101.size() == 2);
 
     // 2. FilterMode::Skip
     std::vector<nsTree::hTree> skipType101;
-    tree.linearize(root, skipType101, true, nsTree::FilterMode::Skip, {101});
+    tree.serialize(root, skipType101, true, nsTree::FilterMode::Skip, filterMask101);
     // Expected: Root, Child2 (Child1 skipped)
     assert(skipType101.size() == 2);
 
     // 3. Early Exit (Only with empty filter)
     std::vector<nsTree::hTree> earlyExit;
-    tree.linearize(root, earlyExit, true, nsTree::FilterMode::Only, {});
+    std::vector<bool> emptyMask;
+    tree.serialize(root, earlyExit, true, nsTree::FilterMode::Only, emptyMask);
     assert(earlyExit.size() == 1 && earlyExit[0] == root);
 
     std::cout << "  -> Linearization and FilterMode: PASSED" << std::endl;

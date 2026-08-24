@@ -11,7 +11,9 @@ import schedule
 
 import config_manager
 from exchange_base import ExchangeBase, create_exchange
+from live_price_stream import LivePriceStream
 from notifier import TelegramNotifier
+from reference_data import fetch_binance_daily
 from strategy_engine import StrategyEngine
 from trade_store import TradeStore, session_date
 
@@ -173,8 +175,19 @@ class QuantBot:
         self.target_prices: Dict[str, float] = {t: 0.0 for t in self.tickers}
         self.is_above_ma: Dict[str, bool] = {t: False for t in self.tickers}
         self.effective_ks: Dict[str, float] = {t: 0.5 for t in self.tickers}
-        self.has_bought: Dict[str, bool] = {t: False for t in self.tickers}
-        # 잔고 부족으로 당일 매수 대상에서 제외된 종목 (매초 재시도 방지)
+        # 실제 당일 매수 체결과 기존 보유를 분리합니다. 과거 has_bought 하나에 두 의미를
+        # 섞어 GUI가 기존 보유를 '당일 체결'로 표시하고 ATR 보충까지 막던 문제를 피합니다.
+        self.bought_today: Dict[str, bool] = {t: False for t in self.tickers}
+        self.has_position: Dict[str, bool] = {t: False for t in self.tickers}
+        self.position_units: Dict[str, float] = {t: 0.0 for t in self.tickers}
+        self.position_values: Dict[str, float] = {t: 0.0 for t in self.tickers}
+        self.pending_buy_units: Dict[str, float] = {t: 0.0 for t in self.tickers}
+        self.target_position_units: Dict[str, float] = {t: 0.0 for t in self.tickers}
+        self.target_position_values: Dict[str, float] = {t: 0.0 for t in self.tickers}
+        self.closed_today: Dict[str, bool] = {t: False for t in self.tickers}
+        self.balance_zero_counts: Dict[str, int] = {t: 0 for t in self.tickers}
+        # 전략 필터 등 명시적인 당일 제외용. 단순 현금 부족은 여기에 기록하지 않아
+        # 추가 입금/예약금 변화 뒤 다음 루프에서 자동 재평가할 수 있게 합니다.
         self.skipped_today: Dict[str, bool] = {t: False for t in self.tickers}
         # 진입 필터 판정 결과 (일일 루틴에서 1회 평가 -> 감시 루프에서 재사용)
         self.entry_allowed: Dict[str, bool] = {t: True for t in self.tickers}
@@ -190,6 +203,24 @@ class QuantBot:
         self.atr_window: int = int(self.config.get("atr_window", 20))
         self.atr_stop_multiple: float = float(self.config.get("atr_stop_multiple", 2.0))
         self.atr_values: Dict[str, float] = {t: 0.0 for t in self.tickers}
+        self.sizing_equity: float = 0.0
+        self.actual_equity: float = 0.0
+        self.sizing_equity_cap_krw: float = max(
+            0.0, float(self.config.get("sizing_equity_cap_krw", 0.0)))
+        self.btc_min_weight: float = max(
+            0.0, min(1.0, float(self.config.get("btc_min_weight", 0.0))))
+        self.position_refill_threshold: float = max(
+            0.0, min(1.0, float(self.config.get("position_refill_threshold", 0.95))))
+        self.btc_reserved_cash: float = 0.0
+        self.last_recalculated_at: Optional[datetime] = None
+        self.signal_reference: str = str(
+            self.config.get("signal_reference", "local")).strip().lower()
+        if self.signal_reference not in {"local", "binance"}:
+            self.signal_reference = "local"
+        self.signal_sources: Dict[str, str] = {t: "local" for t in self.tickers}
+        self.realtime_price_max_age: float = max(
+            1.0, float(self.config.get("realtime_price_max_age_seconds", 30.0)))
+        self.price_stream: Optional[LivePriceStream] = None
 
         # 월봉 국면별 청산 속도 전환 (하락 국면에서 더 짧은 MA로 빠르게 청산)
         self.bear_market_exit: bool = bool(self.config.get("bear_market_exit", False))
@@ -220,6 +251,9 @@ class QuantBot:
         # GUI(트레이) 제어용 이벤트. pause_event가 set이면 매매 감시를 일시 중단합니다.
         self.pause_event = threading.Event()
         self.stop_event = threading.Event()
+        self.recalculate_lock = threading.Lock()
+        self.order_locks: Dict[str, threading.Lock] = {
+            t: threading.Lock() for t in self.tickers}
         self.last_error: Optional[str] = None
 
         # 기동 즉시 매매하지 않고 **정지 상태로 대기**합니다.
@@ -230,6 +264,18 @@ class QuantBot:
 
         # 종목 코드 오타를 기동 시점에 잡습니다. 잘못된 종목은 여기서 제외됩니다.
         self.validate_tickers()
+        if self.btc_min_weight > 0 and "BTC" not in self.tickers:
+            logger.error("BTC 최소 목표 비중이 설정됐지만 BTC가 대상 종목에 없어 0%로 해제합니다.")
+            self.notifier.send_message(
+                "⚠️ BTC 최소 목표 비중을 사용하려면 대상 종목에 BTC가 필요합니다. "
+                "이번 실행에서는 0%로 처리합니다.")
+            self.btc_min_weight = 0.0
+
+        if (bool(self.config.get("realtime_price_stream", True))
+                and not self.exchange.is_simulation):
+            stream = LivePriceStream(self.exchange.NAME, self.tickers)
+            if stream.start():
+                self.price_stream = stream
 
         mode_str = "실전 매매" if not self.exchange.is_simulation else "시뮬레이션(Dry-Run)"
         state_line = (
@@ -242,6 +288,7 @@ class QuantBot:
             f"• 모드: <b>{mode_str}</b>\n"
             f"• 대상 종목({len(self.tickers)}개): {self.ticker_list_text()}\n"
             f"• 전략: {'동적 K (20일 노이즈 비율)' if self.use_dynamic_k else f'고정 K({self.k})'} + MA{self.ma_window} 모멘텀\n"
+            f"• K·MA 신호 기준: <b>{self.signal_reference}</b>\n"
             f"• 사이징: {self.sizing_summary()}\n"
             + (f"• 국면 청산: 하락장 MA{self.bear_exit_ma} "
                f"(판정 월봉 MA{self.regime_ma_months})\n"
@@ -257,7 +304,8 @@ class QuantBot:
                 f"• <b>/실행</b> : 매매 시작\n"
                 f"• <b>/정지</b> : 매매 중단 (주문만 멈추고 감시는 유지)\n"
                 f"• <b>/자산</b> : 실시간 잔고\n"
-                f"• <b>/상태</b> : 종목별 목표가·체결 현황"
+                f"• <b>/상태</b> : 종목별 목표가·체결 현황\n"
+                f"• <b>/재산정</b> : 최신 자산으로 목표가·ATR 목표수량 다시 계산"
             )
         logger.info(
             f"QuantBot 초기화 완료 | 거래소: {self.exchange.NAME} | 종목: {self.tickers} | "
@@ -267,6 +315,15 @@ class QuantBot:
 
         self._setup_telegram_command_handlers()
         self.start_startup_backtest()
+
+    @property
+    def has_bought(self) -> Dict[str, bool]:
+        """이전 코드/플러그인 호환용 별칭. 의미는 이제 '실제 당일 매수 체결'뿐입니다."""
+        return self.bought_today
+
+    @has_bought.setter
+    def has_bought(self, value: Dict[str, bool]) -> None:
+        self.bought_today = value
 
     # ------------------------------------------------------------------
     # 기동 시 자동 백테스트
@@ -373,10 +430,27 @@ class QuantBot:
     # ------------------------------------------------------------------
     def sizing_summary(self) -> str:
         """현재 주문 사이징 방식을 한 줄로 설명 (상태 리포트/기동 메시지용)"""
+        cap = (f", 기준자산 상한 {self.sizing_equity_cap_krw:,.0f}원"
+               if self.sizing_equity_cap_krw > 0 else "")
         if self.position_sizing == "atr":
             return (f"ATR 리스크 {self.risk_per_trade * 100:.1f}% "
-                    f"(손절폭 {self.atr_stop_multiple:g}N, ATR{self.atr_window})")
-        return f"균등 1/{len(self.tickers)} 분할"
+                    f"(손절폭 {self.atr_stop_multiple:g}N, ATR{self.atr_window}{cap})")
+        return f"균등 1/{len(self.tickers)} 분할{cap}"
+
+    def capped_sizing_equity(self, equity: Optional[float] = None) -> float:
+        """실제 총자산에 사용자가 정한 복리 사이징 상한을 적용합니다."""
+        raw = self.total_equity() if equity is None else max(0.0, float(equity))
+        if self.sizing_equity_cap_krw > 0:
+            return min(raw, self.sizing_equity_cap_krw)
+        return raw
+
+    def current_price(self, ticker: str) -> Optional[float]:
+        """WebSocket 최신가를 우선 사용하고 없거나 오래됐으면 REST로 대체합니다."""
+        if self.price_stream is not None:
+            price = self.price_stream.get(ticker, self.realtime_price_max_age)
+            if price is not None:
+                return price
+        return self.exchange.get_current_price(ticker)
 
     def total_equity(self) -> float:
         """
@@ -392,9 +466,9 @@ class QuantBot:
             logger.warning(f"총자산 조회 실패({e}). 주문가능 원화로 대체합니다.")
             return self.exchange.get_balance("KRW", use_available=True)
 
-    def atr_budget(self, ticker: str) -> float:
+    def atr_target_units(self, ticker: str, price: Optional[float] = None) -> float:
         """
-        ATR 기반 주문 금액 산출 (수수료 안전마진 적용 **전** 금액).
+        현재 목표가산정 세션에 고정된 총자산으로 ATR 목표 보유수량을 계산합니다.
 
             수량 = 총자산 x 리스크비율 / (손절배수 x N)
             금액 = 수량 x 현재가
@@ -402,17 +476,109 @@ class QuantBot:
         손절폭(2N)만큼 불리하게 움직였을 때 잃는 금액이 총자산의 risk_per_trade가
         되도록 맞춥니다. 변동성이 큰 종목일수록 적게 사게 됩니다.
 
-        :return: 주문 금액 (산출 불가 시 0.0)
+        :return: 목표 보유수량 (산출 불가 시 0.0)
         """
         atr = self.atr_values.get(ticker, 0.0)
-        price = self.exchange.get_current_price(ticker) or 0.0
+        price = price or self.current_price(ticker) or 0.0
         if atr <= 0 or price <= 0:
             logger.warning(f"[{ticker}] ATR({atr}) 또는 현재가({price}) 이상 - 사이징 불가")
             return 0.0
 
         stop_distance = self.atr_stop_multiple * atr
-        units = (self.total_equity() * self.risk_per_trade) / stop_distance
-        return units * price
+        equity = self.sizing_equity or self.capped_sizing_equity()
+        return (equity * self.risk_per_trade) / stop_distance
+
+    def atr_budget(self, ticker: str) -> float:
+        """호환용 ATR 목표 평가액. 신규 주문은 plan_order_budget()의 부족분만 사용합니다."""
+        price = self.current_price(ticker) or 0.0
+        return self.atr_target_units(ticker, price) * price
+
+    def refresh_position_targets(self) -> None:
+        """
+        고정된 sizing_equity와 최신 ATR로 종목별 목표수량을 산정합니다.
+
+        BTC 최소비중은 ATR 목표를 대체하지 않고 **하한**으로만 작동합니다. 설정값이
+        0이면 BTC도 다른 종목과 똑같이 순수 ATR/균등 사이징만 적용합니다.
+        """
+        equity = self.sizing_equity or self.capped_sizing_equity()
+        for ticker in self.tickers:
+            price = self.current_price(ticker) or 0.0
+            if price <= 0:
+                self.target_position_units[ticker] = 0.0
+                self.target_position_values[ticker] = 0.0
+                continue
+            if self.position_sizing == "atr":
+                target_units = self.atr_target_units(ticker, price)
+            else:
+                target_units = (equity / max(len(self.tickers), 1)) / price
+            if ticker == "BTC" and self.btc_min_weight > 0:
+                target_units = max(target_units, (equity * self.btc_min_weight) / price)
+            self.target_position_units[ticker] = max(0.0, target_units)
+            self.target_position_values[ticker] = max(0.0, target_units * price)
+            if self.store is not None:
+                self.store.upsert_daily_state(
+                    self.exchange.NAME, ticker, self.trade_date(),
+                    target_units=target_units, target_value=target_units * price)
+        self.refresh_btc_reservation()
+
+    def position_room_units(self, ticker: str) -> float:
+        """실보유와 주문 처리 중 수량을 제외한 목표 보충 가능 수량."""
+        target = self.target_position_units.get(ticker, 0.0)
+        covered = (self.position_units.get(ticker, 0.0)
+                   + self.pending_buy_units.get(ticker, 0.0))
+        if target <= 0 or covered >= target * self.position_refill_threshold:
+            return 0.0
+        return max(0.0, target - covered)
+
+    def ensure_position_target(self, ticker: str, price: float) -> None:
+        """기동 직후/테스트처럼 목표 딕셔너리가 비어 있으면 해당 종목만 지연 산정."""
+        if self.target_position_units.get(ticker, 0.0) > 0 or price <= 0:
+            return
+        equity = self.sizing_equity or self.capped_sizing_equity()
+        self.sizing_equity = self.sizing_equity or equity
+        if self.position_sizing == "atr":
+            units = self.atr_target_units(ticker, price)
+        else:
+            units = (equity / max(len(self.tickers), 1)) / price
+        if ticker == "BTC" and self.btc_min_weight > 0:
+            units = max(units, (equity * self.btc_min_weight) / price)
+        self.target_position_units[ticker] = max(0.0, units)
+        self.target_position_values[ticker] = max(0.0, units * price)
+
+    def restore_trade_coverage(self, ticker: str) -> None:
+        """재시작 직후 잔고 반영이 늦어도 같은 목표 룸을 중복 주문하지 않게 합니다."""
+        if self.store is None:
+            return
+        trades = self.store.get_trades(
+            trade_date=self.trade_date(), exchange=self.exchange.NAME, symbol=ticker)
+        statuses = self._trade_statuses()
+        net = 0.0
+        found_buy = False
+        for trade in trades:
+            if trade.get("status") not in statuses:
+                continue
+            units = float(trade.get("units", 0.0) or 0.0)
+            if trade.get("side") == "buy":
+                net += units
+                found_buy = True
+            elif trade.get("side") == "sell":
+                net -= units
+        if found_buy:
+            self.bought_today[ticker] = True
+        uncovered = max(0.0, net - self.position_units.get(ticker, 0.0))
+        self.pending_buy_units[ticker] = max(
+            self.pending_buy_units.get(ticker, 0.0), uncovered)
+
+    def refresh_btc_reservation(self) -> float:
+        """알트가 사용하지 못하도록 남길 BTC 내부 예약금(실제 거래소 주문 아님)."""
+        if self.btc_min_weight <= 0 or "BTC" not in self.tickers:
+            self.btc_reserved_cash = 0.0
+            return 0.0
+        price = self.current_price("BTC") or 0.0
+        room_value = self.position_room_units("BTC") * price
+        available = self.exchange.get_balance("KRW", use_available=True)
+        self.btc_reserved_cash = max(0.0, min(room_value, available))
+        return self.btc_reserved_cash
 
     def plan_order_budget(self, ticker: str) -> Tuple[float, Optional[float]]:
         """
@@ -421,14 +587,16 @@ class QuantBot:
         :return: (수수료 안전마진이 반영된 예상 투입액, buy_market에 넘길 budget_krw)
             budget_krw가 None이면 균등 분할(budget_ratio) 방식을 사용합니다.
         """
-        if self.position_sizing == "atr":
-            raw = self.atr_budget(ticker)
-            # buy_market이 안전마진을 다시 곱하므로 raw를 그대로 넘기고,
-            # 최소주문금액 비교에는 마진이 반영된 값을 씁니다.
-            return raw * self.exchange.ORDER_SAFETY_RATIO, raw
-
-        ratio = 1.0 / max(len(self.tickers), 1)
-        return self.exchange.estimate_order_budget(ratio), None
+        price = self.current_price(ticker) or 0.0
+        self.ensure_position_target(ticker, price)
+        self.restore_trade_coverage(ticker)
+        room_value = self.position_room_units(ticker) * price
+        available = self.exchange.get_balance("KRW", use_available=True)
+        if ticker != "BTC":
+            available = max(0.0, available - self.refresh_btc_reservation())
+        ratio = self.exchange.ORDER_SAFETY_RATIO
+        raw = min(room_value, available / ratio if ratio > 0 else 0.0)
+        return raw * ratio, raw
 
     def resolve_schedule(self) -> Tuple[str, str, bool]:
         """
@@ -735,7 +903,7 @@ class QuantBot:
             return True
 
         try:
-            price = self.exchange.get_current_price(ExchangeBase.to_symbol("BTC"))
+            price = self.current_price(ExchangeBase.to_symbol("BTC"))
             if price and price >= self.btc_target:
                 self.btc_broke_out = True
                 logger.info(
@@ -800,9 +968,11 @@ class QuantBot:
         self.invalid_tickers = invalid
         if invalid:
             self.tickers = valid
-            for key in ("target_prices", "is_above_ma", "effective_ks", "has_bought",
-                        "skipped_today", "entry_allowed", "filter_reason",
-                        "atr_values", "is_above_exit_ma"):
+            for key in ("target_prices", "is_above_ma", "effective_ks", "bought_today",
+                        "has_position", "position_units", "position_values",
+                        "pending_buy_units", "target_position_units", "target_position_values",
+                        "closed_today", "balance_zero_counts", "skipped_today", "entry_allowed", "filter_reason",
+                        "atr_values", "is_above_exit_ma", "signal_sources", "order_locks"):
                 d = getattr(self, key, None)
                 if isinstance(d, dict):
                     for t in invalid:
@@ -824,69 +994,66 @@ class QuantBot:
         """
         **잔고를 기준으로** 봇 상태를 거래소 실물과 맞춥니다.
 
-        기존 reconcile_with_exchange()는 거래소의 주문 이력 API에 의존하는데,
-        빗썸은 그 조회를 제공하지 않아 무력합니다. 이 메서드는 어느 거래소에서도
-        동작하도록 **보유 수량만 보고** 판단합니다.
-
-        잡아내는 상황:
-          - 사용자가 앱에서 직접 매수한 경우
-          - 봇이 주문 직후 종료되어 기록을 남기지 못한 경우
-        둘 다 봇이 모르는 포지션이라, 그대로 두면 **같은 종목을 또 사서**
-        의도보다 큰 포지션이 됩니다.
-
-        [한 방향으로만 작동합니다]
-        보유가 확인되면 has_bought를 켜서 추가 매수를 막을 뿐, 보유가 없다고 해서
-        끄지는 않습니다. 사용자가 직접 판 것을 봇이 다시 사들이면 곤란하기 때문입니다.
+        실제 보유와 당일 체결 플래그를 섞지 않습니다. 보유 증가는 처리 중 매수수량을
+        소진시키고, 장중 보유가 사라지면 수동 매도로 간주해 closed_today를 켭니다.
 
         :param notify: 결과를 텔레그램으로도 보낼지
         :return: 사람이 읽을 요약
         """
         trade_date = self.trade_date()
-        found: List[str] = []
+        changed: List[str] = []
         self.external_positions = {}
 
         for ticker in self.tickers:
             try:
-                units = self.exchange.get_balance(ticker, use_available=False)
-                if not units or units <= 0:
-                    continue
-                price = self.exchange.get_current_price(ticker) or 0.0
+                units = float(self.exchange.get_balance(ticker, use_available=False) or 0.0)
+                price = self.current_price(ticker) or 0.0
                 value = units * price
-                if value < self.exchange.MIN_ORDER_KRW:
-                    continue          # 먼지 수준 잔량은 무시
+                valid = units > 0 and value >= self.exchange.MIN_ORDER_KRW
+                old_units = self.position_units.get(ticker, 0.0)
+                old_has = self.has_position.get(ticker, False)
 
-                already = self.has_bought.get(ticker, False)
-                if self.store is not None and not already:
-                    already = self.store.has_trade(
-                        self.exchange.NAME, ticker, "buy", trade_date,
-                        self._trade_statuses())
+                if old_has and not valid:
+                    self.balance_zero_counts[ticker] += 1
+                    if self.balance_zero_counts[ticker] < 2:
+                        logger.warning(
+                            f"[잔고 대사] {ticker} 잔고 0 첫 감지 - API 순간값 가능성으로 다음 대사까지 유지")
+                        continue
+                else:
+                    self.balance_zero_counts[ticker] = 0
 
-                if already:
-                    self.has_bought[ticker] = True
-                    continue
+                increase = max(0.0, units - old_units)
+                if increase > 0:
+                    self.pending_buy_units[ticker] = max(
+                        0.0, self.pending_buy_units.get(ticker, 0.0) - increase)
+                if old_has and not valid:
+                    self.closed_today[ticker] = True
 
-                # 봇이 모르는 포지션 발견
-                self.has_bought[ticker] = True
-                self.external_positions[ticker] = value
-                found.append(f"• <b>{ticker}</b>: {units:.8f}개 ({value:,.0f}원)")
+                self.has_position[ticker] = valid
+                self.position_units[ticker] = units if valid else 0.0
+                self.position_values[ticker] = value if valid else 0.0
+                if valid:
+                    self.external_positions[ticker] = value
+                if old_has != valid or abs(units - old_units) > 1e-12:
+                    state = "보유" if valid else "미보유"
+                    changed.append(f"• <b>{ticker}</b>: {state} ({value:,.0f}원)")
                 if self.store is not None:
                     self.store.upsert_daily_state(
-                        self.exchange.NAME, ticker, trade_date, has_bought=True)
-                logger.info(
-                    f"[잔고 대사] {ticker} 보유 {units:.8f}개({value:,.0f}원) 확인 "
-                    f"- 봇 기록에 없어 추가 매수를 막습니다")
+                        self.exchange.NAME, ticker, trade_date,
+                        has_position=valid, position_units=self.position_units[ticker],
+                        position_value=self.position_values[ticker],
+                        closed_today=self.closed_today.get(ticker, False))
             except Exception as e:
                 logger.error(f"[잔고 대사] {ticker} 조회 실패: {e}")
 
-        if found:
-            summary = ("🔍 <b>[잔고 대사] 봇이 모르던 보유를 발견했습니다</b>\n"
-                       + "\n".join(found)
-                       + "\n\n오늘은 이 종목들을 추가 매수하지 않습니다. "
-                         "청산은 평소대로 모멘텀 규칙을 따릅니다.")
+        self.refresh_btc_reservation()
+        if changed:
+            summary = ("🔍 <b>[잔고 대사] 실보유 상태를 갱신했습니다</b>\n"
+                       + "\n".join(changed))
         else:
             summary = "🔍 <b>[잔고 대사]</b> 봇 기록과 거래소 잔고가 일치합니다."
 
-        logger.info(f"[잔고 대사] 완료 - 신규 발견 {len(found)}건")
+        logger.info(f"[잔고 대사] 완료 - 변경 {len(changed)}건")
         if notify:
             self.notifier.send_message(summary)
         return summary
@@ -934,8 +1101,8 @@ class QuantBot:
         """
         저장소에서 당일 상태를 복구합니다.
 
-        봇이 장중에 재시작되면 has_bought가 초기화되어 **같은 날 같은 종목을 재매수**하는
-        문제가 있었습니다. 체결 이력과 daily_state를 근거로 상태를 되돌립니다.
+        체결 표시는 trades/new bought_today만 신뢰합니다. 과거 has_bought 컬럼에는
+        기존 보유도 섞여 있으므로 새 버전에서는 당일 체결 근거로 사용하지 않습니다.
         """
         if self.store is None:
             return
@@ -946,19 +1113,20 @@ class QuantBot:
         restored: List[str] = []
 
         for ticker in self.tickers:
-            # 체결 이력이 가장 강한 근거 (daily_state보다 우선)
+            self.restore_trade_coverage(ticker)
             if self.store.has_trade(exchange, ticker, "buy", trade_date,
                                     self._trade_statuses()):
-                self.has_bought[ticker] = True
+                self.bought_today[ticker] = True
                 restored.append(f"{ticker}(체결)")
-                continue
 
             state = states.get(ticker)
             if not state:
                 continue
-            if state.get("has_bought"):
-                self.has_bought[ticker] = True
-                restored.append(f"{ticker}(기록)")
+            if state.get("bought_today"):
+                self.bought_today[ticker] = True
+            if state.get("closed_today"):
+                self.closed_today[ticker] = True
+                restored.append(f"{ticker}(청산)")
             if state.get("skipped"):
                 self.skipped_today[ticker] = True
                 restored.append(f"{ticker}(제외)")
@@ -966,7 +1134,7 @@ class QuantBot:
         if restored:
             msg = (
                 f"♻️ <b>[당일 상태 복구]</b> {trade_date} 세션\n"
-                f"재매수 방지를 위해 이전 실행 기록을 반영했습니다: {', '.join(restored)}"
+                f"이전 실행의 실제 체결·차단 기록을 반영했습니다: {', '.join(restored)}"
             )
             logger.info(f"[당일 상태 복구] {trade_date} | {', '.join(restored)}")
             self.notifier.send_message(msg)
@@ -1023,7 +1191,7 @@ class QuantBot:
                 trade_date=trade_date,
             )
             if side == "buy":
-                self.has_bought[symbol] = True
+                self.bought_today[symbol] = True
             discovered.append(f"{symbol} {side}")
 
         if discovered:
@@ -1067,6 +1235,7 @@ class QuantBot:
             "/stop": self.command_pause,
             "/동기화": self.command_sync,
             "/sync": self.command_sync,
+            "/재산정": self.command_recalculate,
         }
         self.notifier.start_polling(handlers)
 
@@ -1078,6 +1247,36 @@ class QuantBot:
         또 살 수 있습니다. 이 명령으로 즉시 맞출 수 있습니다.
         """
         return self.sync_positions(notify=False)
+
+    def command_recalculate(self) -> str:
+        """텔레그램 /재산정 - 최신 자산으로 일일 목표가·ATR 목표수량을 다시 산정."""
+        if not self.recalculate_lock.acquire(blocking=False):
+            return "🔄 이미 <b>재산정 중</b>입니다. 잠시 후 다시 확인해주세요."
+        try:
+            before = self.sizing_equity
+            self.update_daily_settings(
+                reset_session_state=False, notify=False, label="수동 재산정")
+            lines = [
+                "🔄 <b>[목표가 재산정 완료]</b>",
+                f"• 기준자산: {before:,.0f}원 → <b>{self.sizing_equity:,.0f}원</b>",
+                f"• 실제 총자산: {self.actual_equity:,.0f}원"
+                + (f" (상한 {self.sizing_equity_cap_krw:,.0f}원 적용)"
+                   if self.sizing_equity_cap_krw > 0 else ""),
+                f"• BTC 최소 목표 비중: {self.btc_min_weight * 100:.1f}%",
+                f"• BTC 내부 예약금: {self.btc_reserved_cash:,.0f}원",
+            ]
+            for ticker in self.tickers:
+                price = self.current_price(ticker) or 0.0
+                held = self.position_units.get(ticker, 0.0) * price
+                target = self.target_position_units.get(ticker, 0.0) * price
+                room = self.position_room_units(ticker) * price
+                lines.append(
+                    f"• <b>{ticker}</b>: 목표 {target:,.0f} / 보유 {held:,.0f} / "
+                    f"추가 가능 {room:,.0f}원")
+            lines.append("현재 돌파·MA 조건이 충족될 때만 부족분을 주문합니다.")
+            return "\n".join(lines)
+        finally:
+            self.recalculate_lock.release()
 
     def command_resume(self) -> str:
         """텔레그램 /실행 - 매매 시작 (사용자 승인)"""
@@ -1141,6 +1340,11 @@ class QuantBot:
             f"• <b>실행 모드</b>: <b>{mode_str}</b>",
             f"• <b>상태</b>: <b>{state}</b>",
             f"• <b>사이징</b>: {self.sizing_summary()}",
+            f"• <b>실제/목표 기준자산</b>: {self.actual_equity:,.0f} / "
+            f"{self.sizing_equity:,.0f}원",
+            f"• <b>K·MA 신호 기준</b>: {self.signal_reference}",
+            f"• <b>BTC 최소비중</b>: {self.btc_min_weight * 100:.1f}% "
+            f"(내부 예약금 {self.btc_reserved_cash:,.0f}원)",
         ]
         if self.bear_market_exit:
             lines.append(f"• <b>국면</b>: {self.regime_summary()}")
@@ -1160,8 +1364,11 @@ class QuantBot:
             tp = self.target_prices.get(ticker, 0.0)
             ma_ok = self.is_above_ma.get(ticker, False)
             eff_k = self.effective_ks.get(ticker, 0.5)
-            bought = self.has_bought.get(ticker, False)
-            cur_price = self.exchange.get_current_price(ticker) or 0.0
+            bought = self.bought_today.get(ticker, False)
+            cur_price = self.current_price(ticker) or 0.0
+            held = self.position_units.get(ticker, 0.0) * cur_price
+            target_value = self.target_position_units.get(ticker, 0.0) * cur_price
+            room = self.position_room_units(ticker) * cur_price
 
             blocked = ""
             if not self.entry_allowed.get(ticker, True):
@@ -1172,20 +1379,23 @@ class QuantBot:
             lines.append(
                 f"• <b>{label}</b> (현재가: {cur_price:,.0f}원)\n"
                 f"  - 당일 목표가: {tp:,.0f}원 (적용K: {eff_k:.4f})\n"
+                f"  - 신호 데이터: {self.signal_sources.get(ticker, 'local')}\n"
+                f"  - 목표/보유/추가룸: {target_value:,.0f} / {held:,.0f} / {room:,.0f}원\n"
                 f"  - MA{self.ma_window} 상회: {ma_ok} | "
-                f"당일 체결여부: <b>{'완료(True)' if bought else '대기(False)'}</b>{blocked}"
+                f"오늘 실제 매수: <b>{'체결' if bought else '없음'}</b>{blocked}"
             )
 
         return "\n".join(lines)
 
-    def update_daily_settings(self):
+    def update_daily_settings(self, reset_session_state: bool = True,
+                              notify: bool = True, label: str = "일일 세팅 갱신"):
         """
         [일일 세팅 갱신 루틴] 매일 아침 09:00:05 실행 (일봉 갱신 직후).
         종목별 최신 일봉 데이터 수집 -> 동적 K값 및 목표가, MA상회 여부 산출 -> 텔레그램 요약 발송.
         """
         logger.info("=" * 65)
         logger.info(
-            f"[일일 세팅 갱신] {self.exchange.DISPLAY_NAME} {len(self.tickers)}개 종목 "
+            f"[{label}] {self.exchange.DISPLAY_NAME} {len(self.tickers)}개 종목 "
             f"시세 수집 및 동적 파라미터 산출..."
         )
 
@@ -1210,17 +1420,42 @@ class QuantBot:
                     df, ticker=ticker, use_dynamic_k=self.use_dynamic_k
                 )
 
+                # 선택 시 Binance USDT 일봉에서 방향(MA)과 동적 K를 공통으로 가져옵니다.
+                # 목표가의 시가/전일범위와 ATR은 실제 주문이 체결되는 KRW 거래소 데이터를
+                # 유지해 환율·김치프리미엄·현지 변동성을 버리지 않습니다.
+                signal_df = df
+                self.signal_sources[ticker] = "local"
+                if self.signal_reference == "binance":
+                    reference_df = fetch_binance_daily(ticker, limit=100)
+                    if reference_df is not None and len(reference_df) >= max(22, self.ma_window + 1):
+                        reference_eval = self.strategy_engine.evaluate(
+                            reference_df, ticker=ticker, use_dynamic_k=self.use_dynamic_k)
+                        effective_k = float(reference_eval["effective_k"])
+                        eval_res["effective_k"] = effective_k
+                        eval_res["noise_ratio_20d"] = reference_eval.get("noise_ratio_20d")
+                        eval_res["is_above_ma"] = bool(reference_eval["is_above_ma"])
+                        eval_res["ma_value"] = reference_eval.get("ma_value", 0.0)
+                        eval_res["target_price"] = self.strategy_engine.calculate_target_price(
+                            df, k=effective_k, use_dynamic_k=False)
+                        signal_df = reference_df
+                        self.signal_sources[ticker] = "binance"
+                    else:
+                        logger.warning(f"[{ticker}] Binance 기준신호 없음 - 현지 일봉으로 대체")
+
                 self.target_prices[ticker] = eval_res["target_price"]
                 self.is_above_ma[ticker] = eval_res["is_above_ma"]
                 # 하락 국면이면 더 짧은 MA로 청산을 판정 (진입 기준은 그대로)
                 self.is_above_exit_ma[ticker] = (
                     self.is_above_ma[ticker] if exit_ma == self.ma_window
-                    else eval_res["current_price"] > self.strategy_engine.calculate_ma(df, exit_ma)
+                    else float(signal_df["close"].iloc[-1])
+                    > self.strategy_engine.calculate_ma(signal_df, exit_ma)
                 )
                 self.effective_ks[ticker] = eval_res["effective_k"]
-                self.has_bought[ticker] = False    # 당일 매수 플래그 초기화
-                self.skipped_today[ticker] = False  # 잔고 부족 스킵 플래그 초기화
-                self.blocked_logged.pop(ticker, None)   # 차단 사유 기록도 새 세션 기준으로
+                if reset_session_state:
+                    self.bought_today[ticker] = False
+                    self.skipped_today[ticker] = False
+                    self.closed_today[ticker] = False
+                    self.blocked_logged.pop(ticker, None)
 
                 if self.store is not None:
                     # 산출된 지표만 저장 (has_bought/skipped는 체결 시점에 기록)
@@ -1252,7 +1487,8 @@ class QuantBot:
                 summary_lines.append(
                     f"• <b>{ticker}</b> -> 목표가: {self.target_prices[ticker]:,.0f}원 | "
                     f"적용K: {self.effective_ks[ticker]:.4f} | "
-                    f"MA{self.ma_window}상회: {self.is_above_ma[ticker]}{filter_note}"
+                    f"MA{self.ma_window}상회: {self.is_above_ma[ticker]} | "
+                    f"신호: {self.signal_sources[ticker]}{filter_note}"
                 )
                 logger.info(
                     f"[{ticker}] 세팅 완료: 목표가 {self.target_prices[ticker]:,.0f}원 "
@@ -1269,11 +1505,26 @@ class QuantBot:
                 f"<b>BTC 동반 돌파</b>: 목표가 {self.btc_target:,.0f}원"
                 + (" (폭등기 - 해제됨)" if self.explosive_era else ""))
 
-        if summary_lines:
+        # 잔고와 총자산을 먼저 고정한 뒤 모든 종목의 목표 보유수량을 같은 기준으로 산정합니다.
+        self.sync_positions(notify=False)
+        self.actual_equity = self.total_equity()
+        self.sizing_equity = self.capped_sizing_equity(self.actual_equity)
+        self.refresh_position_targets()
+        self.last_recalculated_at = datetime.now()
+        if self.btc_min_weight > 0:
+            summary_lines.append(
+                f"<b>BTC 최소비중</b>: {self.btc_min_weight * 100:.1f}% | "
+                f"내부 예약금 {self.btc_reserved_cash:,.0f}원")
+        if self.sizing_equity_cap_krw > 0:
+            summary_lines.append(
+                f"<b>복리 기준자산</b>: 실제 {self.actual_equity:,.0f}원 / "
+                f"적용 {self.sizing_equity:,.0f}원 (상한 적용)")
+
+        if summary_lines and notify:
             if self.bear_market_exit:
                 summary_lines.append(f"[국면] {self.regime_summary()}")
             self.notifier.send_message(
-                f"🌅 <b>[{self.exchange.DISPLAY_NAME} 일일 세팅 갱신 완료]</b>\n" + "\n".join(summary_lines)
+                f"🌅 <b>[{self.exchange.DISPLAY_NAME} {label} 완료]</b>\n" + "\n".join(summary_lines)
             )
 
         # 세팅이 플래그를 초기화했으므로, 저장된 당일 이력을 다시 반영해 재매수를 방지
@@ -1296,7 +1547,7 @@ class QuantBot:
         """
         [포지션 재조정] 평가 결과를 반영해 보유 종목을 유지할지 청산할지 결정합니다.
 
-        - 모멘텀 조건(MA 상회) 유지 -> **보유 지속**, 당일 추가 매수는 하지 않음
+        - 모멘텀 조건(MA 상회) 유지 -> **보유 지속**, 목표수량보다 부족하면 돌파 시 보충
         - 모멘텀 이탈 -> 시장가 청산
 
         일시정지 상태에서는 어떤 주문도 내지 않습니다.
@@ -1313,7 +1564,7 @@ class QuantBot:
         for ticker in self.tickers:
             try:
                 units = self.exchange.get_balance(ticker, use_available=True)
-                price = self.exchange.get_current_price(ticker) or 0.0
+                price = self.current_price(ticker) or 0.0
                 value = units * price
 
                 # 보유분이 최소 주문금액 미만이면 매도 자체가 불가능하므로 건너뜀
@@ -1321,11 +1572,13 @@ class QuantBot:
                     continue
 
                 if self.exit_signal_ok(ticker):
-                    # 모멘텀 유지 -> 보유 지속. 당일 재매수를 막기 위해 체결 상태로 표시
-                    self.has_bought[ticker] = True
+                    self.has_position[ticker] = True
+                    self.position_units[ticker] = units
+                    self.position_values[ticker] = value
                     if self.store is not None:
                         self.store.upsert_daily_state(
-                            self.exchange.NAME, ticker, self.trade_date(), has_bought=True)
+                            self.exchange.NAME, ticker, self.trade_date(), has_position=True,
+                            position_units=units, position_value=value)
                     held.append(f"• <b>{ticker}</b>: 보유 유지 ({value:,.0f}원, MA 상회)")
                     logger.info(f"[{ticker}] 모멘텀 유지 -> 보유 지속 (평가 {value:,.0f}원)")
                 else:
@@ -1342,7 +1595,16 @@ class QuantBot:
                         logger.info(
                             f"[{ticker}] 모멘텀 이탈 -> 청산 "
                             f"(MA{self.exit_ma_window()}, 주문코드: {order_code})")
-                    self.has_bought[ticker] = False
+                        self.has_position[ticker] = False
+                        self.position_units[ticker] = 0.0
+                        self.position_values[ticker] = 0.0
+                        self.pending_buy_units[ticker] = 0.0
+                        self.closed_today[ticker] = True
+                        if self.store is not None:
+                            self.store.upsert_daily_state(
+                                self.exchange.NAME, ticker, self.trade_date(),
+                                has_position=False, position_units=0.0, position_value=0.0,
+                                closed_today=True)
 
             except Exception as e:
                 logger.error(f"[{ticker}] 포지션 재조정 예외: {e}", exc_info=True)
@@ -1380,7 +1642,11 @@ class QuantBot:
                     self._record_order(result, "sell", ticker)
                     logger.info(f"[{ticker}] 청산 처리 결과: {result.get('status')} "
                                 f"(주문코드: {order_code or 'N/A'})")
-                self.has_bought[ticker] = False
+                    self.has_position[ticker] = False
+                    self.position_units[ticker] = 0.0
+                    self.position_values[ticker] = 0.0
+                    self.pending_buy_units[ticker] = 0.0
+                    self.closed_today[ticker] = True
             except Exception as e:
                 logger.error(f"[{ticker}] 청산 루틴 처리 에러: {e}", exc_info=True)
 
@@ -1389,7 +1655,7 @@ class QuantBot:
     def monitor_market(self):
         """
         [실시간 감시 루틴] 1초 간격 호출.
-        실시간 시세를 확인하고, 돌파 조건 충족 시 균등 분산 매수를 집행합니다.
+        실시간 시세를 확인하고, 돌파 조건 충족 시 목표 보유수량의 부족분만 매수합니다.
         정지 상태에서는 어떤 주문도 내지 않습니다.
         """
         if self.pause_event.is_set():
@@ -1399,9 +1665,9 @@ class QuantBot:
             try:
                 target_price = self.target_prices.get(ticker, 0.0)
                 is_above_ma = self.is_above_ma.get(ticker, False)
-                has_bought = self.has_bought.get(ticker, False)
 
-                if target_price <= 0 or has_bought or self.skipped_today.get(ticker, False):
+                if (target_price <= 0 or self.skipped_today.get(ticker, False)
+                        or self.closed_today.get(ticker, False)):
                     continue
 
                 # 진입 필터에 걸린 종목은 당일 매수하지 않음 (일일 루틴에서 판정 완료)
@@ -1410,21 +1676,19 @@ class QuantBot:
                         ticker, f"진입 필터: {self.filter_reason.get(ticker, '사유 미상')}")
                     continue
 
-                # 저장소에 당일 체결 기록이 있으면 메모리 상태와 무관하게 재매수 차단
-                if self.store is not None and self.store.has_trade(
-                        self.exchange.NAME, ticker, "buy", self.trade_date(),
-                        self._trade_statuses()):
-                    self.has_bought[ticker] = True
-                    logger.info(f"[{ticker}] 당일 매수 이력이 확인되어 추가 매수를 건너뜁니다.")
+                current_price: Optional[float] = self.current_price(ticker)
+                if current_price is None or current_price <= 0:
                     continue
 
-                current_price: Optional[float] = self.exchange.get_current_price(ticker)
-                if current_price is None or current_price <= 0:
+                self.ensure_position_target(ticker, current_price)
+                self.restore_trade_coverage(ticker)
+                room_units = self.position_room_units(ticker)
+                if room_units <= 0:
                     continue
 
                 logger.debug(f"[{ticker}] 현재가: {current_price:,.0f}원 / 목표가: {target_price:,.0f}원")
 
-                # 매수 조건: 1) 현재가 >= 목표가, 2) 전일 종가 >= MA, 3) 당일 미매수
+                # 당일 체결 횟수가 아니라 목표수량까지 남은 룸으로 판단합니다.
                 if current_price >= target_price and is_above_ma:
                     # 4) 알트는 BTC도 같은 세션에 돌파했어야 함 (폭등기에는 해제)
                     if self.needs_btc_confirm(ticker) and not self.btc_confirmed():
@@ -1434,59 +1698,48 @@ class QuantBot:
                             f"(BTC 목표가 {self.btc_target:,.0f}원)")
                         continue
 
-                    budget_ratio = 1.0 / len(self.tickers)
-
-                    # 잔고 부족은 당일 안에 해소되지 않으므로 주문을 시도하지 않고 종목을 제외합니다.
-                    # (매초 주문 시도 -> 거부 로그 반복 및 거래소 API 과다 호출 방지)
-                    budget, explicit_budget = self.plan_order_budget(ticker)
-                    if budget < self.exchange.MIN_ORDER_KRW:
-                        self.skipped_today[ticker] = True
-                        skip_msg = (
-                            f"⏭️ <b>[{ticker} 당일 매수 제외]</b>\n"
-                            f"투입 가능 예산 {budget:,.0f}원이 "
-                            f"{self.exchange.DISPLAY_NAME} 최소 주문금액({self.exchange.MIN_ORDER_KRW:,.0f}원) 미만입니다.\n"
-                            f"다음 일일 세팅 갱신 시 자동으로 재평가됩니다."
-                        )
-                        logger.warning(
-                            f"[{ticker}] 주문가능 예산({budget:,.0f}원) < 최소 주문금액"
-                            f"({self.exchange.MIN_ORDER_KRW:,.0f}원). 당일 매수 대상에서 제외합니다."
-                        )
-                        if self.store is not None:
-                            self.store.upsert_daily_state(
-                                self.exchange.NAME, ticker, self.trade_date(),
-                                skipped=True, skip_reason="잔고 부족 (최소 주문금액 미만)")
-                        self.notifier.send_message(skip_msg)
+                    lock = self.order_locks[ticker]
+                    if not lock.acquire(blocking=False):
                         continue
+                    try:
+                        budget, explicit_budget = self.plan_order_budget(ticker)
+                        if budget < self.exchange.MIN_ORDER_KRW or not explicit_budget:
+                            self.log_blocked(
+                                ticker,
+                                f"목표 룸/가용현금 {budget:,.0f}원 < 최소주문 "
+                                f"{self.exchange.MIN_ORDER_KRW:,.0f}원")
+                            continue
 
-                    logger.info(
-                        f"🚀 [{self.exchange.DISPLAY_NAME} 매수 신호] {ticker} - "
-                        f"현재가({current_price:,.0f}원) >= 목표가({target_price:,.0f}원) & MA조건({is_above_ma}). "
-                        f"예산 {budget_ratio * 100:.1f}% 시장가 매수 집행!"
-                    )
+                        logger.info(
+                            f"🚀 [{self.exchange.DISPLAY_NAME} 매수 신호] {ticker} - "
+                            f"현재가({current_price:,.0f}원) >= 목표가({target_price:,.0f}원), "
+                            f"목표 부족분 {budget:,.0f}원 매수")
 
-                    order_code = None
-                    if self.store is not None:
-                        order_code = self.store.next_order_code(
-                            self.exchange.NAME, ticker, self.trade_date())
+                        order_code = None
+                        if self.store is not None:
+                            order_code = self.store.next_order_code(
+                                self.exchange.NAME, ticker, self.trade_date())
 
-                    if explicit_budget is not None:
                         buy_result = self.exchange.buy_market(
                             ticker, budget_krw=explicit_budget, order_code=order_code)
-                    else:
-                        buy_result = self.exchange.buy_market(
-                            ticker, budget_ratio=budget_ratio, order_code=order_code)
 
-                    if buy_result:
-                        self.has_bought[ticker] = True
-                        self._record_order(buy_result, "buy", ticker)
-                        if self.store is not None:
-                            self.store.upsert_daily_state(
-                                self.exchange.NAME, ticker, self.trade_date(), has_bought=True)
-                        logger.info(
-                            f"✅ [매수 집행 성공] {ticker} 처리 완료. "
-                            f"(주문코드: {order_code or 'N/A'})")
-                    else:
-                        logger.warning(f"⚠️ [매수 거부/실패] {ticker}")
+                        if buy_result:
+                            units = float(buy_result.get("units", 0.0) or 0.0)
+                            self.pending_buy_units[ticker] += units
+                            self.bought_today[ticker] = True
+                            self._record_order(buy_result, "buy", ticker)
+                            self.refresh_btc_reservation()
+                            if self.store is not None:
+                                self.store.upsert_daily_state(
+                                    self.exchange.NAME, ticker, self.trade_date(),
+                                    bought_today=True)
+                            logger.info(
+                                f"✅ [매수 집행 성공] {ticker} 부족분 처리 완료. "
+                                f"(주문코드: {order_code or 'N/A'})")
+                        else:
+                            logger.warning(f"⚠️ [매수 거부/실패] {ticker}")
+                    finally:
+                        lock.release()
 
             except Exception as e:
                 logger.error(f"[{ticker}] 실시간 시세 감시 예외 발생: {e}")
@@ -1588,6 +1841,8 @@ class QuantBot:
     def stop(self) -> None:
         """매매 루프 안전 종료 요청 (GUI 트레이 메뉴용)"""
         self.stop_event.set()
+        if self.price_stream is not None:
+            self.price_stream.stop()
         self.notifier.stop_polling()
         logger.info("🛑 봇 종료 요청을 접수했습니다.")
 
