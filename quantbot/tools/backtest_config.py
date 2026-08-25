@@ -638,7 +638,7 @@ def prepare_data(config: Dict[str, Any], refresh: bool = False):
             and composite_requested):
         raise RuntimeError(
             "복합 국면 백테스트에는 공용 Bitstamp BTC 정본이 필요합니다. "
-            "먼저 `python -m tools.download_global_btc`를 실행해 주세요.")
+            "[BTC 차트 보기]를 한 번 열면 자동으로 내려받습니다.")
     if global_btc is None or len(global_btc) < 200:
         global_btc = references.get("BTC")
         if global_btc is None or len(global_btc) < 200:

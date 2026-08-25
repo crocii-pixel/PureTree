@@ -37,6 +37,39 @@ FILE_RE = re.compile(
     r"(?P<start>\d{8})-(?P<end>\d{8})__r(?P<revision>\d{4})__sealed\.parquet$"
 )
 
+#: ``backfill_minutes`` / ``build_rollups`` 가 progress 콜백에 넘기는 문자열
+#: 형식.  GUI 가 진행률 막대를 그리려면 몇 개 중 몇 개인지 알아야 하는데,
+#: 콜백 시그니처를 바꾸면 CLI(``progress=print``)가 깨지므로 형식을 고정하고
+#: 여기서 한 번만 해석합니다.
+PROGRESS_RE = re.compile(
+    r"^\[(?P<interval>[^\]]+)\]\s+(?:(?P<done>\d+)/(?P<total>\d+)\s+)?(?P<name>.*)$"
+)
+
+
+class ArchiveCancelled(RuntimeError):
+    """사용자가 아카이브 수집을 중단했습니다."""
+
+
+def parse_progress(message: str) -> Dict[str, object]:
+    """진행 메시지를 {interval, done, total, name} 으로 풀어 냅니다."""
+    match = PROGRESS_RE.match(str(message).strip())
+    if not match:
+        return {"interval": "", "done": None, "total": None,
+                "name": str(message).strip()}
+    done, total = match.group("done"), match.group("total")
+    return {
+        "interval": match.group("interval"),
+        "done": int(done) if done is not None else None,
+        "total": int(total) if total is not None else None,
+        "name": match.group("name"),
+    }
+
+
+def bootstrap_needed(root: Optional[Path] = None) -> bool:
+    """정본이 아직 한 번도 수집되지 않았는지."""
+    return not GlobalMarketRepository(root).sealed_files("1m")
+
+
 SUPPORTED_MINUTES = (1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30)
 SUPPORTED_HOURS = (1, 2, 3, 4, 6, 8, 12)
 BACKBONE_INTERVALS = ("1m", "1h", "1d")
@@ -626,7 +659,8 @@ class BitstampBTCArchive:
             })
 
     def backfill_minutes(self, end_exclusive: Optional[object] = None, workers: int = 8,
-                         progress: Optional[Callable[[str], None]] = None) -> List[Path]:
+                         progress: Optional[Callable[[str], None]] = None,
+                         should_cancel: Optional[Callable[[], bool]] = None) -> List[Path]:
         self.initialize_metadata()
         end_ts = _utc(end_exclusive) if end_exclusive is not None else pd.Timestamp.now(tz="UTC").floor("D")
         if end_ts > pd.Timestamp.now(tz="UTC").floor("D"):
@@ -640,10 +674,18 @@ class BitstampBTCArchive:
             frame = self.fetch_range(start, end)
             return self._write_sealed(frame, "1m", start, end)
 
+        cancelled = False
         with ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
             futures = {pool.submit(run_month, bounds): bounds for bounds in pending}
             complete = len(ranges) - len(pending)
             for future in as_completed(futures):
+                if should_cancel is not None and should_cancel():
+                    # 이미 받아 둔 달은 봉인이 끝나 있으므로 그대로 두고 멈춥니다.
+                    # 다음에 다시 실행하면 남은 달부터 이어서 받습니다.
+                    cancelled = True
+                    for pending_future in futures:
+                        pending_future.cancel()
+                    break
                 path = future.result()
                 results.append(path)
                 complete += 1
@@ -651,18 +693,23 @@ class BitstampBTCArchive:
                 logger.info(message)
                 if progress:
                     progress(message)
+        if cancelled:
+            raise ArchiveCancelled("사용자가 수집을 중단했습니다")
         return sorted(results)
 
     def build_rollups(self, end_exclusive: Optional[object] = None,
                       progress: Optional[Callable[[str], None]] = None,
-                      years: Optional[Iterable[int]] = None) -> List[Path]:
+                      years: Optional[Iterable[int]] = None,
+                      should_cancel: Optional[Callable[[], bool]] = None) -> List[Path]:
         end_ts = _utc(end_exclusive) if end_exclusive is not None else pd.Timestamp.now(tz="UTC").floor("D")
         results: List[Path] = []
         target_years = (
             sorted({int(year) for year in years}) if years is not None
             else list(range(SOURCE_START.year, end_ts.year + 1))
         )
-        for year in target_years:
+        for position, year in enumerate(target_years, start=1):
+            if should_cancel is not None and should_cancel():
+                raise ArchiveCancelled("사용자가 수집을 중단했습니다")
             start = max(SOURCE_START, pd.Timestamp(year=year, month=1, day=1, tz="UTC"))
             stop = min(end_ts, pd.Timestamp(year=year + 1, month=1, day=1, tz="UTC"))
             if start >= stop:
@@ -680,16 +727,19 @@ class BitstampBTCArchive:
                     frame, interval, start, stop, parent_files=parents
                 )
                 results.append(path)
-                message = f"[{interval}] {path.name}"
+                message = (f"[{interval}] {position}/{len(target_years)} "
+                           f"{path.name}")
                 logger.info(message)
                 if progress:
                     progress(message)
         return results
 
     def run(self, end_exclusive: Optional[object] = None, workers: int = 8,
-            progress: Optional[Callable[[str], None]] = None) -> Dict[str, object]:
+            progress: Optional[Callable[[str], None]] = None,
+            should_cancel: Optional[Callable[[], bool]] = None) -> Dict[str, object]:
         end_ts = _utc(end_exclusive) if end_exclusive is not None else pd.Timestamp.now(tz="UTC").floor("D")
-        minute_files = self.backfill_minutes(end_ts, workers=workers, progress=progress)
+        minute_files = self.backfill_minutes(
+            end_ts, workers=workers, progress=progress, should_cancel=should_cancel)
         affected_years = {parse_sealed_file(path).start.year for path in minute_files}
         rollups_current = all(
             (files := self.repository.sealed_files(interval))
@@ -698,12 +748,14 @@ class BitstampBTCArchive:
         )
         if affected_years:
             rollup_files = self.build_rollups(
-                end_ts, progress=progress, years=affected_years
+                end_ts, progress=progress, years=affected_years,
+                should_cancel=should_cancel,
             )
         elif rollups_current:
             rollup_files = []
         else:
-            rollup_files = self.build_rollups(end_ts, progress=progress)
+            rollup_files = self.build_rollups(
+                end_ts, progress=progress, should_cancel=should_cancel)
         catalog = self.repository.rebuild_catalog()
         return {
             "root": str(self.root),

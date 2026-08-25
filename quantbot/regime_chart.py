@@ -39,6 +39,30 @@ MIN_VISIBLE_BARS: Dict[str, int] = {
     "1d": 30, "1w": 12, "1mo": 6,
 }
 
+#: 판정값 입력란 공통 폭. 기존 76px 의 2/3.
+PARAM_INPUT_WIDTH = 50
+
+
+def compact_spin(widget: Any, target: int = PARAM_INPUT_WIDTH) -> Any:
+    """
+    숫자 입력란을 ``target`` 폭으로 좁힙니다.
+
+    폰트가 큰 환경에서 값이 잘리면 설정을 확인할 수 없으므로, 최댓값 글자가
+    안 들어가는 경우에만 필요한 만큼 늘립니다.  ``compact`` 속성은 여백과
+    화살표를 줄이는 스타일시트 규칙을 켭니다.
+    """
+    widget.setProperty("compact", "true")
+    text = widget.textFromValue(widget.maximum())
+    if getattr(widget, "suffix", None):
+        text += widget.suffix()
+    # 테두리 2 + 좌우 여백 7 + 화살표 11 + 커서 여유 2
+    needed = widget.fontMetrics().horizontalAdvance(text) + 22
+    widget.setFixedWidth(max(int(target), int(needed)))
+    return widget
+#: 콤보 폭을 맞출 때 넘지 않을 상한. 패널이 통째로 넓어지는 것을 막습니다.
+#: 가장 긴 항목(장세별 전략 콤보)이 잘리지 않는 선에서 잡았습니다.
+FIELD_WIDTH_CAP = 250
+
 DEFAULT_VISIBLE_BARS: Dict[str, int] = {
     "1m": 360, "15m": 240, "30m": 240,
     "1h": 240, "2h": 180, "3h": 160, "4h": 150,
@@ -57,11 +81,14 @@ BULL_DETECTOR_OPTIONS = tuple(
 BEAR_DETECTOR_OPTIONS = tuple(
     item for item in DETECTOR_OPTIONS if item[0] != "volatility_breakout")
 
+#: 예약매수 기준선은 이제 '예약매수 방식'에서 ATR 하단과 하방 채널선 중에
+#: 고릅니다. 전략 이름에 "ATR 하단"을 박아 두면 틀린 설명이 되고, 콤보가
+#: 패널 폭을 넘길 만큼 길어집니다.
 STRATEGY_OPTIONS: Tuple[Tuple[str, str], ...] = (
     ("period_rebalance", "주간 기간리밸런싱"),
     ("volatility_breakout", "동적 K 변동성돌파"),
-    ("defensive_atr", "동적 K + ATR 하단 예약매수"),
-    ("cash_with_atr", "현금 대기 + ATR 하단 예약매수"),
+    ("defensive_atr", "동적 K + 예약매수"),
+    ("cash_with_atr", "현금 대기 + 예약매수"),
     ("cash", "현금 대기"),
 )
 
@@ -894,9 +921,20 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
                 data = load_global_btc(source_interval, start=start, end=end)
                 data = aggregate_chart_frame(data, self.interval)
                 if data.empty:
+                    from global_market_data import bootstrap_needed
+                    if bootstrap_needed():
+                        # 한 번도 받은 적이 없는 상태.  CLI 를 실행하라고 안내만
+                        # 하면 아무도 못 알아봅니다.  창이 직접 받아 옵니다.
+                        self.finished.emit({
+                            "ok": False, "needs_bootstrap": True,
+                            "generation": self.generation,
+                            "interval": self.interval,
+                            "message": "공용 BTC 정본이 없습니다",
+                        })
+                        return
                     raise RuntimeError(
-                        "공용 BTC 정본이 없습니다. 먼저 `python -m tools.download_global_btc`를 "
-                        "실행해 1회 초기 수집해 주세요.")
+                        "요청한 구간에 공용 BTC 데이터가 없습니다. "
+                        "기간을 조정하거나 새로고침해 주세요.")
                 self.finished.emit({
                     "ok": True, "data": data, "generation": self.generation,
                     "interval": self.interval, "anchor": self.anchor,
@@ -908,6 +946,40 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
                 self.finished.emit({"ok": False, "message": str(exc),
                                     "generation": self.generation,
                                     "interval": self.interval})
+
+    class _BootstrapWorker(QtCore.QObject):
+        """공용 BTC 정본을 처음 받아 오는 백그라운드 작업."""
+
+        progress = QtCore.pyqtSignal(object)
+        finished = QtCore.pyqtSignal(object)
+
+        def __init__(self):
+            super().__init__()
+            self._cancelled = False
+
+        def cancel(self) -> None:
+            self._cancelled = True
+
+        def run(self) -> None:
+            try:
+                from global_market_data import (ArchiveCancelled,
+                                                BitstampBTCArchive,
+                                                parse_progress)
+                archive = BitstampBTCArchive()
+                result = archive.run(
+                    workers=4,
+                    progress=lambda message: self.progress.emit(
+                        parse_progress(message)),
+                    should_cancel=lambda: self._cancelled,
+                )
+                self.finished.emit({"ok": True, "result": result})
+            except Exception as exc:
+                from global_market_data import ArchiveCancelled
+                self.finished.emit({
+                    "ok": False,
+                    "cancelled": isinstance(exc, ArchiveCancelled),
+                    "message": str(exc),
+                })
 
     class RegimeChartWindow(QtWidgets.QWidget):
         def __init__(self):
@@ -924,6 +996,8 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
             self._view_states: Dict[str, Dict[str, Any]] = {}
             self._view_revision = 0
             self._loaded_full_period = False
+            self._bootstrap_worker = None
+            self._bootstrap_thread = None
             self._config = dict(config_provider())
             self._score = scoring_config(self._config)
             self._current_interval = str(self._score.get("decision_interval", "1d"))
@@ -990,6 +1064,26 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
             interval_row.addStretch(1)
             outer.addLayout(interval_row)
 
+            # 정본이 없을 때만 나타나는 수집 진행 줄.
+            self.bootstrap_row = QtWidgets.QWidget()
+            bootstrap_layout = QtWidgets.QHBoxLayout(self.bootstrap_row)
+            bootstrap_layout.setContentsMargins(0, 2, 0, 4)
+            bootstrap_layout.setSpacing(8)
+            self.bootstrap_label = QtWidgets.QLabel("")
+            self.bootstrap_label.setObjectName("Hint")
+            self.bootstrap_label.setMinimumWidth(280)
+            bootstrap_layout.addWidget(self.bootstrap_label)
+            self.bootstrap_bar = QtWidgets.QProgressBar()
+            self.bootstrap_bar.setRange(0, 0)          # 처음엔 진행률을 모릅니다
+            self.bootstrap_bar.setTextVisible(True)
+            bootstrap_layout.addWidget(self.bootstrap_bar, 1)
+            self.bootstrap_cancel = QtWidgets.QPushButton("중단")
+            self.bootstrap_cancel.setObjectName("Ghost")
+            self.bootstrap_cancel.clicked.connect(self._cancel_bootstrap)
+            bootstrap_layout.addWidget(self.bootstrap_cancel)
+            self.bootstrap_row.setVisible(False)
+            outer.addWidget(self.bootstrap_row)
+
             splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
             self.chart = PriceChart()
             self.chart.windowRequested.connect(self._request_visible_window)
@@ -998,7 +1092,7 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
             panel.setWidgetResizable(True)
             panel.setHorizontalScrollBarPolicy(
                 QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-            panel.setMinimumWidth(330)
+            panel.setMinimumWidth(380)
             panel.setMaximumWidth(420)
             content = QtWidgets.QWidget()
             self.panel_layout = QtWidgets.QVBoxLayout(content)
@@ -1055,10 +1149,10 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
             ma_row.setSpacing(4)
             self.inputs["short_ma"] = QtWidgets.QSpinBox()
             self.inputs["short_ma"].setRange(5, 200)
-            self.inputs["short_ma"].setMaximumWidth(76)
+            compact_spin(self.inputs["short_ma"])
             self.inputs["long_ma"] = QtWidgets.QSpinBox()
             self.inputs["long_ma"].setRange(20, 400)
-            self.inputs["long_ma"].setMaximumWidth(76)
+            compact_spin(self.inputs["long_ma"])
             ma_row.addWidget(QtWidgets.QLabel("단기"))
             ma_row.addWidget(self.inputs["short_ma"])
             ma_row.addWidget(QtWidgets.QLabel("장기"))
@@ -1073,7 +1167,7 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
                                ("macd_signal", "신호")):
                 widget = QtWidgets.QSpinBox()
                 widget.setRange(2, 240)
-                widget.setMaximumWidth(68)
+                compact_spin(widget)
                 self.inputs[key] = widget
                 macd_row.addWidget(QtWidgets.QLabel(label))
                 macd_row.addWidget(widget)
@@ -1087,17 +1181,16 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
             threshold.setRange(0.1, 20.0)
             threshold.setSingleStep(0.1)
             threshold.setDecimals(1)
-            threshold.setMaximumWidth(68)
+            compact_spin(threshold)
             self.inputs["atr_multiple"] = threshold
             atr_row.addWidget(QtWidgets.QLabel("ATR %"))
             atr_row.addWidget(threshold)
-            atr_row.addWidget(QtWidgets.QLabel("기간:"))
             for key, label, default in (("bull_atr_window", "상승", 10),
                                         ("bear_atr_window", "하락", 2)):
                 widget = QtWidgets.QSpinBox()
                 widget.setRange(2, 120)
                 widget.setValue(default)
-                widget.setMaximumWidth(62)
+                compact_spin(widget)
                 self.inputs[key] = widget
                 atr_row.addWidget(QtWidgets.QLabel(label))
                 atr_row.addWidget(widget)
@@ -1106,11 +1199,12 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
             parameter_layout.addLayout(atr_row)
 
             channel_row = QtWidgets.QHBoxLayout()
+            channel_row.setSpacing(4)
             for key, label in (("breakout_lower_window", "기간"),
                                ("channel_slope_bars", "기울기")):
                 widget = QtWidgets.QSpinBox()
                 widget.setRange(2, 120)
-                widget.setMaximumWidth(76)
+                compact_spin(widget)
                 self.inputs[key] = widget
                 channel_row.addWidget(QtWidgets.QLabel(label))
                 channel_row.addWidget(widget)
@@ -1176,6 +1270,10 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
             self.inputs["defensive_cancel_buffer_atr"] = cancel_buffer
             strategy_form.addRow("돌파 접근 예약취소", cancel_buffer)
             self.panel_layout.addWidget(strategy_group)
+            # 콤보와 스핀박스가 제각각 자기 글자 길이만큼 늘어나 계단처럼
+            # 보였습니다. 두 그룹을 통틀어 **가장 긴 항목 하나**에 폭을 맞춥니다.
+            # 고정값을 쓰면 긴 항목이 잘리므로 실제 필요한 폭에서 뽑습니다.
+            self._align_field_widths(detector_form, strategy_form)
 
             self.summary = QtWidgets.QLabel("국면 계산 대기")
             self.summary.setWordWrap(True)
@@ -1365,6 +1463,9 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
             if int(payload.get("generation", -1)) != self._load_generation:
                 return
             if not payload.get("ok"):
+                if payload.get("needs_bootstrap"):
+                    self._start_bootstrap()
+                    return
                 self.status.setText(f"데이터 오류: {payload.get('message', '알 수 없음')}")
                 self._requested_interval = self._current_interval
                 self._interval_buttons[self._current_interval].setChecked(True)
@@ -1518,6 +1619,78 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
                 return
             self.chart.set_period(requested_start, requested_end, all_period)
             self._update_period_label()
+
+        def _start_bootstrap(self) -> None:
+            """정본이 없으면 안내문 대신 직접 받아 옵니다."""
+            if self._bootstrap_thread is not None:
+                return
+            self.status.setText("BTC 정본 최초 수집 중…")
+            self.bootstrap_label.setText("Bitstamp BTC/USD 1분봉 내려받는 중…")
+            self.bootstrap_bar.setRange(0, 0)
+            self.bootstrap_cancel.setEnabled(True)
+            self.bootstrap_row.setVisible(True)
+            for button in self._interval_buttons.values():
+                button.setEnabled(False)
+            worker = _BootstrapWorker()
+            worker.progress.connect(self._bootstrap_progress)
+            worker.finished.connect(self._bootstrap_finished)
+            self._bootstrap_worker = worker
+            self._bootstrap_thread = threading.Thread(
+                target=worker.run, daemon=True)
+            self._bootstrap_thread.start()
+
+        def _cancel_bootstrap(self) -> None:
+            if self._bootstrap_worker is None:
+                return
+            self._bootstrap_worker.cancel()
+            self.bootstrap_cancel.setEnabled(False)
+            self.bootstrap_label.setText("중단하는 중… 받던 달까지는 저장됩니다")
+
+        def _bootstrap_progress(self, state: Any) -> None:
+            done, total = state.get("done"), state.get("total")
+            phase = {"1m": "1분봉 수집", "1h": "시간봉 집계",
+                     "1d": "일봉 집계"}.get(state.get("interval", ""), "처리")
+            if done is not None and total:
+                self.bootstrap_bar.setRange(0, int(total))
+                self.bootstrap_bar.setValue(int(done))
+                self.bootstrap_bar.setFormat(f"%v / %m  ({phase})")
+                self.bootstrap_label.setText(f"{phase} · {done}/{total}개월")
+            else:
+                self.bootstrap_bar.setRange(0, 0)
+                self.bootstrap_label.setText(f"{phase}…")
+
+        def _bootstrap_finished(self, payload: Any) -> None:
+            self._bootstrap_thread = None
+            self._bootstrap_worker = None
+            self.bootstrap_row.setVisible(False)
+            for button in self._interval_buttons.values():
+                button.setEnabled(True)
+            if payload.get("ok"):
+                self.status.setText("BTC 정본 수집 완료 · 다시 읽는 중…")
+                self._load_data()
+                return
+            if payload.get("cancelled"):
+                self.status.setText(
+                    "수집을 중단했습니다. 새로고침하면 남은 구간부터 이어 받습니다.")
+                return
+            self.status.setText(f"정본 수집 실패: {payload.get('message', '알 수 없음')}")
+
+        def _align_field_widths(self, *forms: Any) -> None:
+            """폼들의 입력 칸 폭을 가장 넓은 하나에 맞춥니다."""
+            fields = []
+            for form in forms:
+                for row in range(form.rowCount()):
+                    item = form.itemAt(
+                        row, QtWidgets.QFormLayout.ItemRole.FieldRole)
+                    widget = item.widget() if item is not None else None
+                    if widget is not None:
+                        fields.append(widget)
+            if not fields:
+                return
+            width = min(FIELD_WIDTH_CAP,
+                        max(widget.sizeHint().width() for widget in fields))
+            for widget in fields:
+                widget.setFixedWidth(width)
 
         def _request_visible_window(self, start: Any, end: Any) -> None:
             """Slide the bounded archive window after a pan/zoom reaches an edge."""

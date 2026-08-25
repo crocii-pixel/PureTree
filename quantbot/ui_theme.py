@@ -15,6 +15,11 @@ from __future__ import annotations
 from typing import Any, Dict
 
 
+#: 창을 화면에 꽉 채우되 위아래로 남겨 두는 여백(px)
+TOP_GAP = 8
+BOTTOM_GAP = 16
+
+
 def fit_available_height(widget: Any, preferred_width: int | None = None) -> None:
     """
     창을 현재 화면의 사용 가능한 **높이** 전체로 늘립니다.
@@ -31,8 +36,16 @@ def fit_available_height(widget: Any, preferred_width: int | None = None) -> Non
         geometry = screen.availableGeometry()
         width = int(preferred_width or widget.width() or geometry.width())
         width = min(max(width, widget.minimumWidth()), geometry.width())
+        # setGeometry 는 **테두리 안쪽**을 정합니다. 제목 표시줄 두께를 빼지
+        # 않으면 그만큼 창이 아래로 삐져나가 작업표시줄에 가립니다. 창이 아직
+        # 뜨기 전이라 실제 테두리를 못 재면 보수적인 기본값을 씁니다.
+        chrome = widget.frameGeometry().height() - widget.geometry().height()
+        if chrome <= 0:
+            chrome = 40
+        usable = geometry.height() - chrome - BOTTOM_GAP
+        height = min(max(usable, widget.minimumHeight()), geometry.height())
         left = max(geometry.left(), min(widget.x(), geometry.right() - width + 1))
-        widget.setGeometry(left, geometry.top(), width, geometry.height())
+        widget.setGeometry(left, geometry.top() + TOP_GAP, width, height)
     except Exception:
         # Geometry differences between Qt5/Qt6 or a not-yet-created native
         # handle must never prevent a window from opening.
@@ -189,17 +202,20 @@ QLabel#Pill[tone="danger"] {{ background-color: {c['danger_dim']}; color: {c['da
 
 /* ---------- 버튼 ---------- */
 QPushButton {{
-    background-color: {c['elevated']};
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 {c['hover']}, stop:1 {c['elevated']});
     color: {c['text']};
-    border: 1px solid {c['border']};
-    border-radius: 7px;
-    padding: 7px 18px;
-    min-width: 68px;
+    border: 1px solid {c['border_soft']};
+    border-radius: 6px;
+    padding: 5px 16px;
+    min-height: 19px;
+    min-width: 64px;
     font-weight: 500;
 }}
-QPushButton:hover  {{ background-color: {c['hover']}; border-color: #363A41; }}
-QPushButton:pressed {{ background-color: {c['border_soft']}; }}
-QPushButton:disabled {{ color: {c['text_muted']}; background-color: {c['surface']}; }}
+QPushButton:hover  {{ background: {c['hover']}; border-color: #3A3F47; }}
+QPushButton:pressed {{ background: {c['border_soft']}; }}
+QPushButton:disabled {{ color: {c['text_muted']}; background: {c['surface']};
+                        border-color: {c['border_soft']}; }}
 
 QPushButton#Primary {{
     background-color: {c['accent']};
@@ -224,27 +240,38 @@ QPushButton#Danger {{
 }}
 QPushButton#Danger:hover {{ background-color: #512725; color: #FF9B94; }}
 
-/* ---------- 입력 ---------- */
-QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {{
-    background-color: {c['elevated']};
+/* ---------- 입력 ----------
+   높이를 24px 대로 낮추고, 위가 살짝 밝은 그라디언트로 두께감만 남깁니다.
+   평소에는 테두리를 죽여 두고 hover 에서 드러나게 해 화면이 조용해집니다. */
+QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QDateEdit {{
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 {c['hover']}, stop:1 {c['elevated']});
     color: {c['text']};
-    border: 1px solid {c['border']};
-    border-radius: 7px;
-    padding: 7px 10px;
+    border: 1px solid {c['border_soft']};
+    border-radius: 6px;
+    padding: 3px 9px;
+    min-height: 19px;
     selection-background-color: {c['accent']};
     selection-color: #08130E;
 }}
-QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {{
+QLineEdit:hover, QSpinBox:hover, QDoubleSpinBox:hover,
+QComboBox:hover, QDateEdit:hover {{
+    border-color: {c['border']};
+}}
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus,
+QComboBox:focus, QDateEdit:focus, QComboBox:on {{
     border-color: {c['accent']};
+    background: {c['elevated']};
 }}
 QLineEdit:disabled {{ color: {c['text_muted']}; }}
 QLineEdit[echoMode="2"] {{ font-family: {FONT_MONO}; letter-spacing: 1px; }}
 
-QComboBox::drop-down {{ border: none; width: 26px; }}
+QComboBox::drop-down, QDateEdit::drop-down {{ border: none; width: 20px; }}
 {_chevron_rule()}
 
-QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QComboBox:disabled {{
-    background-color: {c['surface']};
+QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled,
+QComboBox:disabled, QDateEdit:disabled {{
+    background: {c['surface']};
     color: {c['text_muted']};
     border-color: {c['border_soft']};
 }}
@@ -252,17 +279,45 @@ QComboBox QAbstractItemView {{
     background-color: {c['elevated']};
     color: {c['text']};
     border: 1px solid {c['border']};
-    border-radius: 8px;
-    padding: 4px;
+    border-radius: 7px;
+    padding: 3px;
     outline: none;
     selection-background-color: {c['accent_dim']};
     selection-color: {c['accent']};
 }}
+QComboBox QAbstractItemView::item {{ min-height: 22px; padding: 0px 6px; }}
+/* 스핀 화살표는 평소엔 숨기고 마우스를 올렸을 때만 보여 줍니다. */
 QSpinBox::up-button, QSpinBox::down-button,
-QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{
+QDoubleSpinBox::up-button, QDoubleSpinBox::down-button,
+QDateEdit::up-button, QDateEdit::down-button {{
     background-color: transparent;
     border: none;
-    width: 16px;
+    width: 13px;
+}}
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow, QDateEdit::up-arrow,
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow, QDateEdit::down-arrow {{
+    width: 7px; height: 7px;
+}}
+/* 판정값처럼 숫자만 들어가는 좁은 칸은 여백과 화살표를 더 줄입니다. */
+QSpinBox[compact="true"], QDoubleSpinBox[compact="true"] {{ padding: 3px 2px 3px 5px; }}
+QSpinBox[compact="true"]::up-button, QSpinBox[compact="true"]::down-button,
+QDoubleSpinBox[compact="true"]::up-button,
+QDoubleSpinBox[compact="true"]::down-button {{ width: 11px; }}
+
+/* ---------- 진행 표시 ---------- */
+QProgressBar {{
+    background-color: {c['surface']};
+    border: 1px solid {c['border_soft']};
+    border-radius: 6px;
+    height: 14px;
+    text-align: center;
+    color: {c['text_dim']};
+    font-size: 11px;
+}}
+QProgressBar::chunk {{
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                                stop:0 {c['accent_press']}, stop:1 {c['accent']});
+    border-radius: 5px;
 }}
 
 /* ---------- 체크박스 ---------- */

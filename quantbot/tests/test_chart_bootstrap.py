@@ -1,0 +1,148 @@
+"""정본이 없을 때 차트 창이 직접 받아 오는지에 대한 회귀 테스트.
+
+예전에는 "`python -m tools.download_global_btc` 를 실행해 주세요"라는 작은
+문장만 띄웠습니다. 데이터를 읽는 중인 줄 알고 계속 기다리게 되므로, 창이
+스스로 받아 오면서 진행률을 보여 줘야 합니다.
+"""
+import os
+import time
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import pandas as pd
+import pytest
+
+from global_market_data import parse_progress
+
+#: QApplication 을 지역 변수로만 두면 테스트가 끝날 때 C++ 객체까지 지워져
+#: 다음 위젯 생성이 프로세스째 죽습니다.
+_APP = None
+
+
+def _qt():
+    try:
+        from PyQt6 import QtCore, QtGui, QtWidgets
+    except ImportError:
+        try:
+            from PyQt5 import QtCore, QtGui, QtWidgets
+        except ImportError:
+            pytest.skip("PyQt5/PyQt6 unavailable")
+    return QtCore, QtGui, QtWidgets
+
+
+def test_progress_messages_carry_a_countable_position():
+    """진행률 막대를 그리려면 '몇 개 중 몇 개'가 필요합니다."""
+    minute = parse_progress(
+        "[1m] 12/170 BTC-USD__1m__20110819-20110901__r0001__sealed.parquet")
+    assert minute["interval"] == "1m"
+    assert (minute["done"], minute["total"]) == (12, 170)
+
+    rollup = parse_progress(
+        "[1d] 3/15 BTC-USD__1d__20130101-20140101__r0001__sealed.parquet")
+    assert (rollup["done"], rollup["total"]) == (3, 15)
+
+    # 형식을 벗어나도 죽지 않고 원문을 그대로 넘깁니다.
+    free = parse_progress("catalog rebuilt")
+    assert free["done"] is None and free["name"] == "catalog rebuilt"
+
+
+def _chart_window(monkeypatch, *, empty=True):
+    global _APP
+    QtCore, QtGui, QtWidgets = _qt()
+    import global_market_data
+    import regime_chart
+
+    monkeypatch.setattr(
+        global_market_data, "ensure_global_btc_current", lambda **_: False)
+    monkeypatch.setattr(
+        global_market_data, "load_global_btc",
+        lambda *_a, **_k: pd.DataFrame() if empty else None)
+    monkeypatch.setattr(global_market_data, "bootstrap_needed", lambda *_a: True)
+
+    _APP = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    window = regime_chart.build_regime_chart_window(
+        QtCore, QtGui, QtWidgets,
+        lambda: {"regime_short_ma": 60, "regime_long_ma": 120},
+        lambda _v: None,
+        lambda: ("2023-01-01", "2024-01-01", False),
+        lambda _s, _e: None,
+    )
+    return window, _APP
+
+
+def test_missing_archive_starts_the_download_instead_of_printing_a_cli_hint(monkeypatch):
+    started = []
+    QtCore, QtGui, QtWidgets = _qt()
+    import regime_chart
+
+    window, app = _chart_window(monkeypatch)
+    # 실제 네트워크 수집 대신 호출 여부만 확인합니다.
+    monkeypatch.setattr(type(window), "_start_bootstrap",
+                        lambda self: started.append(True))
+
+    window._load_data()
+    deadline = time.monotonic() + 5.0
+    while not started and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.01)
+
+    assert started, "정본이 없는데 수집이 시작되지 않았습니다"
+    assert "download_global_btc" not in window.status.text()
+    window.close()
+    app.processEvents()
+
+
+def test_progress_row_shows_a_determinate_bar_while_collecting(monkeypatch):
+    window, app = _chart_window(monkeypatch)
+
+    # 진행 줄은 평소에 숨어 있어야 합니다. 부모 창을 띄우지 않는 테스트라
+    # isVisible() 은 항상 False 이므로 isHidden() 으로 확인합니다.
+    assert window.bootstrap_row.isHidden()
+
+    calls = []
+    monkeypatch.setattr(
+        window, "_bootstrap_thread", None, raising=False)
+    monkeypatch.setattr("threading.Thread",
+                        lambda *a, **k: calls.append((a, k)) or _NoThread())
+    window._start_bootstrap()
+    assert not window.bootstrap_row.isHidden()
+    # 총 개수를 알기 전에는 불확정(0, 0) 막대
+    assert (window.bootstrap_bar.minimum(), window.bootstrap_bar.maximum()) == (0, 0)
+    # 간격 버튼은 수집 중 잠깁니다.
+    assert not any(b.isEnabled() for b in window._interval_buttons.values())
+
+    window._bootstrap_progress(
+        {"interval": "1m", "done": 12, "total": 170, "name": "x.parquet"})
+    assert window.bootstrap_bar.maximum() == 170
+    assert window.bootstrap_bar.value() == 12
+    assert "1분봉" in window.bootstrap_label.text()
+
+    window._bootstrap_progress(
+        {"interval": "1d", "done": 3, "total": 15, "name": "y.parquet"})
+    assert window.bootstrap_bar.maximum() == 15
+    assert "일봉" in window.bootstrap_label.text()
+
+    window.close()
+    app.processEvents()
+
+
+def test_cancelled_collection_says_it_can_resume(monkeypatch):
+    window, app = _chart_window(monkeypatch)
+    monkeypatch.setattr("threading.Thread", lambda *a, **k: _NoThread())
+    window._start_bootstrap()
+
+    window._bootstrap_finished({"ok": False, "cancelled": True,
+                                "message": "사용자가 수집을 중단했습니다"})
+    assert window.bootstrap_row.isHidden()
+    assert "이어" in window.status.text()
+    # 중단 뒤에는 다시 조작할 수 있어야 합니다.
+    assert all(b.isEnabled() for b in window._interval_buttons.values())
+    window.close()
+    app.processEvents()
+
+
+class _NoThread:
+    """수집 스레드를 띄우지 않고 UI 상태만 검사하기 위한 대역."""
+
+    def start(self):
+        return None
