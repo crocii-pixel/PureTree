@@ -251,7 +251,7 @@ def _card(title: str):
 class Dashboard(QWidget):
     """봇 상태를 1초 주기로 갱신하는 미니 대시보드 창"""
 
-    COLUMNS = ["종목", "현재가", "목표가", "적용 K", "MA", "당일 상태"]
+    COLUMNS = ["종목", "현재가", "목표가", "청산기준(MA)", "적용 K", "진입 MA", "당일 상태"]
 
     def __init__(self, bot: Any, log_buffer: LogBuffer):
         super().__init__()
@@ -261,7 +261,7 @@ class Dashboard(QWidget):
         self._log_revision = -1        # 마지막으로 화면에 그린 로그 리비전
 
         self.setWindowTitle("QuantBot")
-        self.resize(780, 660)
+        self.resize(930, 660)
         if ICO_PATH.exists():
             self.setWindowIcon(QIcon(str(ICO_PATH)))
 
@@ -454,11 +454,19 @@ class Dashboard(QWidget):
             price = self._price_cache.get(ticker, 0.0)
             target = self.bot.target_prices.get(ticker, 0.0)
             above_ma = self.bot.is_above_ma.get(ticker)
+            exit_value = getattr(self.bot, "exit_ma_values", {}).get(ticker, 0.0)
+            exit_source = self.bot.signal_sources.get(ticker, "global_pending")
+            if exit_value:
+                exit_text = (f"{exit_value:,.4f} USD/USDT" if exit_source == "global"
+                             else f"{exit_value:,.0f}")
+            else:
+                exit_text = "—"
 
             cells = [
                 (ticker, ui_theme.COLORS["text"], False),
                 (f"{price:,.0f}" if price else "—", ui_theme.COLORS["text"], True),
                 (f"{target:,.0f}" if target else "—", ui_theme.COLORS["text_dim"], True),
+                (exit_text, ui_theme.COLORS.get("violet", ui_theme.COLORS["info"]), True),
                 (f"{self.bot.effective_ks.get(ticker, 0.0):.4f}",
                  ui_theme.COLORS["text_dim"], True),
                 ("충족" if above_ma else "미달",
@@ -475,6 +483,10 @@ class Dashboard(QWidget):
                 if numeric:
                     item.setTextAlignment(int(Qt.AlignmentFlag.AlignRight
                                               | Qt.AlignmentFlag.AlignVCenter))
+                if col == 3:
+                    unit = "글로벌 USD/USDT" if exit_source == "global" else "거래소 KRW"
+                    item.setToolTip(
+                        f"현재 국면의 청산 판정선 MA{self.bot.exit_ma_window()} · {unit} 기준")
                 if col == len(cells) - 1:
                     item.setToolTip(tip)
                 self.table.setItem(row, col, item)
@@ -484,7 +496,7 @@ class Dashboard(QWidget):
                     "관리 대상에서 제외되었으니 설정에서 종목 코드를 확인해주세요.")
         for offset, ticker in enumerate(invalid):
             row = len(self.bot.tickers) + offset
-            cells = [f"⚠  {ticker}", "—", "—", "—", "—", "관리 제외"]
+            cells = [f"⚠  {ticker}", "—", "—", "—", "—", "—", "관리 제외"]
             for col, text in enumerate(cells):
                 item = QTableWidgetItem(text)
                 item.setForeground(_color(ui_theme.COLORS["danger"]))

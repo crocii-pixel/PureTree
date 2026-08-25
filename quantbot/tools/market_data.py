@@ -27,11 +27,12 @@ tools/market_data.py - 백테스트용 장기 시세 수집 (ccxt 경유)
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import pandas as pd
 
@@ -60,6 +61,7 @@ def _cache_dir() -> Path:
 
 # 캐시는 저장소에 커밋하지 않습니다 (.gitignore 등록)
 CACHE_DIR = _cache_dir()
+_MEMORY_FRAMES: Dict[str, pd.DataFrame] = {}
 
 # 거래소별 시작 시점 (그 이전을 요청하면 빈 응답이 오므로 낭비를 줄임)
 EXCHANGE_START = {
@@ -74,6 +76,60 @@ DAY_MS = 86_400_000
 def _cache_path(exchange: str, symbol: str, timeframe: str) -> Path:
     safe = symbol.replace("/", "-")
     return CACHE_DIR / f"{exchange}_{safe}_{timeframe}.csv"
+
+
+def _completed_daily(df: Optional[pd.DataFrame],
+                     now: Optional[pd.Timestamp] = None) -> pd.DataFrame:
+    """KST 09:00 시작 일봉 중 이미 마감된 봉만 남깁니다."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy().sort_index()
+    index = pd.DatetimeIndex(out.index)
+    if index.tz is not None:
+        index = index.tz_convert("Asia/Seoul").tz_localize(None)
+    out.index = index
+    current = now or pd.Timestamp.now(tz="Asia/Seoul").tz_localize(None)
+    if getattr(current, "tzinfo", None) is not None:
+        current = current.tz_convert("Asia/Seoul").tz_localize(None)
+    return out[(out.index + pd.Timedelta(days=1)) <= current]
+
+
+def _cache_is_current(df: pd.DataFrame,
+                      now: Optional[pd.Timestamp] = None) -> bool:
+    if df is None or df.empty:
+        return False
+    current = now or pd.Timestamp.now(tz="Asia/Seoul").tz_localize(None)
+    if getattr(current, "tzinfo", None) is not None:
+        current = current.tz_convert("Asia/Seoul").tz_localize(None)
+    # 마지막 저장 봉 다음 봉이 아직 마감되지 않았다면 추가로 받을 것이 없습니다.
+    return pd.Timestamp(df.index[-1]) + pd.Timedelta(days=2) > current
+
+
+def _merge_daily(cached: Optional[pd.DataFrame],
+                 fetched: Optional[pd.DataFrame]) -> pd.DataFrame:
+    parts = [frame for frame in (cached, fetched)
+             if frame is not None and not frame.empty]
+    if not parts:
+        return pd.DataFrame()
+    merged = pd.concat(parts).sort_index()
+    return merged.loc[~merged.index.duplicated(keep="last")]
+
+
+def _read_frame_cache(path: Path) -> pd.DataFrame:
+    key = str(path.resolve())
+    if key in _MEMORY_FRAMES:
+        return _MEMORY_FRAMES[key].copy()
+    if not path.exists():
+        return pd.DataFrame()
+    frame = pd.read_csv(path, index_col=0, parse_dates=True)
+    _MEMORY_FRAMES[key] = frame
+    return frame.copy()
+
+
+def _write_frame_cache(path: Path, frame: pd.DataFrame) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(path)
+    _MEMORY_FRAMES[str(path.resolve())] = frame.copy()
 
 
 def fetch_ohlcv(exchange: str, symbol: str, timeframe: str = "1d",
@@ -151,8 +207,10 @@ def fetch_upbit(ticker: str, count: int = UPBIT_FULL_COUNT,
     :return: pyupbit 형식의 DataFrame. 실패 시 None
     """
     cache = _cache_path("upbit", f"KRW-{ticker}", "1d")
-    if cache.exists() and not refresh:
-        return pd.read_csv(cache, index_col=0, parse_dates=True)
+    cached = pd.DataFrame() if refresh else _completed_daily(_read_frame_cache(cache))
+    if not refresh and _cache_is_current(cached):
+        logger.debug("[메모리/CSV 캐시] 업비트 KRW-%s %d건", ticker, len(cached))
+        return cached
 
     try:
         import pyupbit
@@ -160,33 +218,63 @@ def fetch_upbit(ticker: str, count: int = UPBIT_FULL_COUNT,
         logger.error("pyupbit가 필요합니다")
         return None
     try:
-        df = pyupbit.get_ohlcv(f"KRW-{ticker}", interval="day", count=count)
-        if df is None or df.empty:
-            return None
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        df.to_csv(cache)
-        logger.info(f"[수집] 업비트 KRW-{ticker} {len(df)}건 ({df.index[0].date()}~)")
-        return df
+        request_count = count
+        if not cached.empty and not refresh:
+            now = pd.Timestamp.now(tz="Asia/Seoul").tz_localize(None)
+            missing_days = max(1, (now - pd.Timestamp(cached.index[-1])).days)
+            request_count = min(count, max(10, missing_days + 3))
+        fetched = pyupbit.get_ohlcv(
+            f"KRW-{ticker}", interval="day", count=request_count)
+        completed = _completed_daily(fetched)
+        merged = _merge_daily(cached, completed)
+        if merged.empty:
+            return cached if not cached.empty else None
+        _write_frame_cache(cache, merged)
+        added = max(0, len(merged) - len(cached))
+        logger.info(
+            "[증분 수집] 업비트 KRW-%s +%d건 (요청 %d, 총 %d)",
+            ticker, added, request_count, len(merged))
+        return merged
     except Exception as e:
         logger.error(f"업비트 KRW-{ticker} 수집 실패: {e}")
         return None
 
 
 def fetch_binance_reference(ticker: str, refresh: bool = False) -> Optional[pd.DataFrame]:
-    """K·MA 공통 기준용 Binance USDT 전체 일봉을 캐시해 반환합니다."""
+    """K·MA 공통 기준 일봉. BTC는 공용 정본, 나머지는 Binance USDT."""
     ticker = str(ticker).split("-")[-1].upper()
+    if ticker == "BTC":
+        try:
+            from global_market_data import GlobalMarketRepository
+
+            frame = GlobalMarketRepository().load("1d")
+            if not frame.empty:
+                index = pd.DatetimeIndex(frame.pop("timestamp"))
+                frame.index = index.tz_convert("Asia/Seoul").tz_localize(None)
+                return frame[["open", "high", "low", "close", "volume"]]
+        except Exception as exc:
+            logger.warning("공용 글로벌 BTC 일봉 조회 실패, Binance로 대체: %s", exc)
     cache = _cache_path("binance_reference", f"{ticker}-USDT", "1d")
-    if cache.exists() and not refresh:
-        return pd.read_csv(cache, index_col=0, parse_dates=True)
+    cached = pd.DataFrame() if refresh else _completed_daily(_read_frame_cache(cache))
+    if not refresh and _cache_is_current(cached):
+        logger.debug("[메모리/CSV 캐시] Binance %s/USDT %d건", ticker, len(cached))
+        return cached
     try:
         from reference_data import fetch_binance_history
-        df = fetch_binance_history(ticker)
-        if df is None or df.empty:
-            return None
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        df.to_csv(cache)
-        logger.info(f"[수집] Binance {ticker}/USDT 기준신호 {len(df)}건")
-        return df
+        start = "2017-01-01"
+        if not cached.empty and not refresh:
+            # 마지막 저장 봉부터 한 봉 겹쳐 받아 수정/중복을 안전하게 병합합니다.
+            start = pd.Timestamp(cached.index[-1]).strftime("%Y-%m-%d")
+        fetched = fetch_binance_history(ticker, start=start)
+        completed = _completed_daily(fetched)
+        merged = _merge_daily(cached, completed)
+        if merged.empty:
+            return cached if not cached.empty else None
+        _write_frame_cache(cache, merged)
+        logger.info(
+            "[증분 수집] Binance %s/USDT +%d건 (총 %d)",
+            ticker, max(0, len(merged) - len(cached)), len(merged))
+        return merged
     except Exception as e:
         logger.error(f"Binance {ticker}/USDT 기준신호 수집 실패: {e}")
         return None
@@ -201,6 +289,49 @@ def load_upbit_many(tickers: List[str], refresh: bool = False,
         if df is not None and len(df) >= min_rows:
             out[ticker] = df
             time.sleep(0.15)
+    return out
+
+
+def load_auto_selection_frames(refresh: bool = False) -> dict:
+    """현재 업비트 KRW 상장 ∩ Binance USDT 현물의 장기 일봉을 병렬 캐시 로딩."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import pyupbit
+    from universe_selector import binance_usdt_symbols
+
+    universe_cache = CACHE_DIR / "auto_selection_candidates.json"
+    candidates = []
+    if universe_cache.exists() and not refresh:
+        try:
+            payload = json.loads(universe_cache.read_text(encoding="utf-8"))
+            checked = pd.Timestamp(payload["checked_at"])
+            if pd.Timestamp.now(tz="UTC") - checked < pd.Timedelta(days=1):
+                candidates = [str(t).upper() for t in payload["candidates"]]
+        except Exception:
+            candidates = []
+    if not candidates:
+        upbit = {str(m).split("-")[-1].upper()
+                 for m in (pyupbit.get_tickers(fiat="KRW") or [])}
+        candidates = sorted(upbit & binance_usdt_symbols())
+        try:
+            universe_cache.parent.mkdir(parents=True, exist_ok=True)
+            universe_cache.write_text(json.dumps({
+                "checked_at": pd.Timestamp.now(tz="UTC").isoformat(),
+                "candidates": candidates,
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as exc:
+            logger.debug("자동선정 후보 캐시 저장 실패: %s", exc)
+    out = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(fetch_binance_reference, symbol, refresh): symbol
+                   for symbol in candidates}
+        for future in as_completed(futures):
+            symbol = futures[future]
+            try:
+                frame = future.result()
+                if frame is not None and len(frame) >= 20:
+                    out[symbol] = frame
+            except Exception as exc:
+                logger.debug("자동선정 %s 장기시세 실패: %s", symbol, exc)
     return out
 
 

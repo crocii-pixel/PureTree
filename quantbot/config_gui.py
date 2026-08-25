@@ -20,11 +20,14 @@ UI는 대시보드와 동일한 `ui_theme` 다크 테마를 공유합니다.
 from __future__ import annotations
 
 import logging
+import random
 import sys
 import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 import config_manager
+from backtest_history import (BacktestHistoryStore, generate_segments,
+                              make_group_id)
 from exchange_base import KeyField, get_exchange_class, list_exchanges
 
 logger = logging.getLogger("ConfigGUI")
@@ -101,21 +104,33 @@ def format_tickers(tickers: List[str]) -> str:
 
 
 DEFAULT_BACKTEST_PRESETS: List[Dict[str, Any]] = [
-    {"name": "최근 3개월", "months": 3},
+    {"name": "전체기간", "all": True},
     {"name": "최근 6개월", "months": 6},
     {"name": "최근 1년", "months": 12},
     {"name": "최근 2년", "months": 24},
-    {"name": "최근 3년", "months": 36},
-    {"name": "전체 기간", "all": True},
     {"name": "2017 상승장", "start": "2017-09-25", "end": "2017-12-17"},
     {"name": "2018 하락장", "start": "2017-12-18", "end": "2018-12-15"},
     {"name": "2020~21 상승장", "start": "2020-03-13", "end": "2021-11-10"},
     {"name": "2022 하락장", "start": "2021-11-11", "end": "2022-11-21"},
     # 앱의 era 가드 연구에서 사용한 연속 비교 구간. 실시간 신호 자체는 고정 날짜가
     # 아니라 후행 4년 CAGR 임계값으로 매일 판정합니다.
-    {"name": "성장·폭등기 벤치마크", "start": "2017-09-25", "end": "2020-12-31"},
-    {"name": "성숙기 벤치마크", "start": "2021-01-01", "end": None},
+    {"name": "폭등기", "start": "2017-09-25", "end": "2020-12-31"},
+    {"name": "성숙기", "start": "2021-01-01", "end": None},
 ]
+
+# 상단 계산 결과, 이력 컬럼 제목, 이력 셀이 같은 의미에 같은 색을 쓰도록 공유합니다.
+BACKTEST_RESULT_COLORS: Dict[str, str] = {
+    "select": "#D5DBE1",
+    "structure": "#57D7FF",
+    "period": "#F4F7FA",
+    "variant": "#FFD166",
+    "total_return": "#59F0A7",
+    "cagr": "#35E6C4",
+    "mdd": "#FF8A80",
+    "mar": "#C69CFF",
+    "win_rate": "#6FB1FF",
+    "trades": "#E8EDF2",
+}
 
 
 def backtest_presets(custom: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
@@ -253,51 +268,80 @@ def build_config_window(parent: Any = None) -> Any:
         finished = QtCore.pyqtSignal(object)
 
         def __init__(self, config: Dict[str, Any], start: Optional[Any],
-                     end: Optional[Any] = None):
+                     end: Optional[Any] = None,
+                     split_options: Optional[Dict[str, Any]] = None):
             super().__init__()
             self.config = config
             self.start = start
             self.end = end
+            self.split_options = dict(split_options or {})
 
         def run(self) -> None:
             try:
                 import pandas as pd
+                from fee_manager import resolve_fee_info
                 from tools.backtest_config import prepare_data, run_backtest
 
+                self.config = dict(self.config)
+                self.config["_fee_info"] = resolve_fee_info(self.config)
                 data, ctx, missing = prepare_data(self.config)
                 if isinstance(self.start, int):
                     start = ctx.index[-1] - pd.DateOffset(months=self.start)
                 else:
                     start = pd.Timestamp(self.start) if self.start else None
                 end = pd.Timestamp(self.end) if self.end else None
-                optimistic = run_backtest(self.config, data, ctx, start, end,
-                                          confirm_fill="target")
-                if not optimistic:
-                    raise ValueError("구간이 짧아 결과를 낼 수 없습니다")
+                split_enabled = bool(self.split_options.get("enabled"))
+                include_full = (not split_enabled
+                                or bool(self.split_options.get("include_full")))
+                full_result = {}
+                if include_full:
+                    full_result = run_backtest(
+                        self.config, data, ctx, start, end, confirm_fill="target")
+                    if not full_result:
+                        raise ValueError("선택 기간이 짧아 전체 결과를 낼 수 없습니다")
 
-                pessimistic = {}
-                if self.config.get("btc_breakout_confirm"):
-                    pessimistic = run_backtest(self.config, data, ctx, start, end,
-                                               confirm_fill="close")
-
-                baseline_config = dict(self.config)
-                baseline_config["btc_min_weight"] = 0.0
-                baseline = run_backtest(
-                    baseline_config, data, ctx, start, end, confirm_fill="target")
-
-                uncapped = {}
-                if float(self.config.get("sizing_equity_cap_krw", 0.0)) > 0:
-                    uncapped_config = dict(self.config)
-                    uncapped_config["sizing_equity_cap_krw"] = 0.0
-                    uncapped = run_backtest(
-                        uncapped_config, data, ctx, start, end, confirm_fill="target")
+                segment_results = []
+                split_seed = None
+                if split_enabled:
+                    actual_start = max(
+                        pd.Timestamp(ctx.index.min()), start or pd.Timestamp(ctx.index.min())
+                    ).date()
+                    actual_end = min(
+                        pd.Timestamp(ctx.index.max()), end or pd.Timestamp(ctx.index.max())
+                    ).date()
+                    split_seed = random.SystemRandom().randrange(1, 2 ** 31)
+                    windows = generate_segments(
+                        actual_start, actual_end,
+                        int(self.split_options["period_days"]),
+                        mode=str(self.split_options["mode"]),
+                        count=int(self.split_options.get("count", 1)),
+                        auto_count=bool(self.split_options.get("auto_count", False)),
+                        seed=split_seed,
+                    )
+                    for index, (segment_start, segment_end) in enumerate(windows, 1):
+                        result = run_backtest(
+                            self.config, data, ctx,
+                            pd.Timestamp(segment_start), pd.Timestamp(segment_end),
+                            confirm_fill="target")
+                        if result:
+                            segment_results.append({
+                                "index": index,
+                                "start": segment_start.isoformat(),
+                                "end": segment_end.isoformat(),
+                                "result": result,
+                            })
+                    if not segment_results:
+                        raise ValueError("선택한 기간일로 만들 수 있는 유효 구간이 없습니다")
 
                 self.finished.emit({
-                    "ok": True, "optimistic": optimistic,
-                    "pessimistic": pessimistic, "missing": missing,
+                    "ok": True, "optimistic": full_result,
+                    "missing": missing,
                     "tickers": sorted(data),
-                    "baseline": baseline,
-                    "uncapped": uncapped,
+                    "segments": segment_results,
+                    "split_options": self.split_options,
+                    "split_seed": split_seed,
+                    "config_snapshot": dict(self.config),
+                    "group_id": make_group_id(),
                 })
             except Exception as e:
                 self.finished.emit({"ok": False, "message": str(e)})
@@ -324,13 +368,20 @@ def build_config_window(parent: Any = None) -> Any:
     class BacktestWindow(QtWidgets.QWidget):
         """설정창과 독립적으로 계속 띄워둘 수 있는 비모달 백테스트 창."""
 
-        def __init__(self, config_provider: Any, presets_changed: Any = None, parent=None):
+        def __init__(self, config_provider: Any, presets_changed: Any = None,
+                     regime_changed: Any = None, parent=None):
             super().__init__(parent, QtCore.Qt.WindowType.Window)
             self._config_provider = config_provider
             self._presets_changed = presets_changed
+            self._regime_changed = regime_changed
+            self._history_store = BacktestHistoryStore()
+            self._config_view_dialog = None
+            from regime_scoring import scoring_config
+            self._regime_draft = scoring_config(config_provider())
+            self._chart_window = None
             self.setWindowTitle("QuantBot 백테스트")
-            self.setMinimumSize(620, 520)
-            self.resize(720, 650)
+            self.setMinimumSize(900, 650)
+            self.resize(1120, 780)
 
             outer = QtWidgets.QVBoxLayout(self)
             outer.setContentsMargins(22, 20, 22, 20)
@@ -339,8 +390,8 @@ def build_config_window(parent: Any = None) -> Any:
             title.setObjectName("Title")
             outer.addWidget(title)
             hint = QtWidgets.QLabel(
-                "설정창의 현재 입력값을 실행 시점에 가져옵니다. 저장하지 않은 변경도 반영되며, "
-                "BTC 최소비중 선택값과 0% 기준을 자동 비교합니다.")
+                "설정창의 현재 입력값을 실행 시점에 가져옵니다. 저장하지 않은 변경도 반영하며, "
+                "실행한 현재 설정 결과 하나를 이력에 저장합니다.")
             hint.setObjectName("Subtitle")
             hint.setWordWrap(True)
             outer.addWidget(hint)
@@ -348,7 +399,7 @@ def build_config_window(parent: Any = None) -> Any:
             period_card, period_layout = _card(QtWidgets, "기간")
             preset_row = QtWidgets.QHBoxLayout()
             self.preset_combo = QtWidgets.QComboBox()
-            preset_row.addWidget(QtWidgets.QLabel("프리셋"))
+            preset_row.addWidget(QtWidgets.QLabel("기간 선택"))
             preset_row.addWidget(self.preset_combo, 1)
             self.save_preset_button = QtWidgets.QPushButton("현재 기간 추가")
             self.save_preset_button.clicked.connect(self._save_custom_preset)
@@ -369,11 +420,51 @@ def build_config_window(parent: Any = None) -> Any:
             row.addWidget(self.start_date)
             row.addWidget(QtWidgets.QLabel("종료일"))
             row.addWidget(self.end_date)
-            self.all_period = QtWidgets.QCheckBox("전체 기간")
-            self.all_period.toggled.connect(
-                lambda on: (self.start_date.setDisabled(on), self.end_date.setDisabled(on)))
-            row.addWidget(self.all_period)
+            self.chart_button = QtWidgets.QPushButton("BTC 차트 보기")
+            self.chart_button.clicked.connect(self._open_regime_chart)
+            row.addWidget(self.chart_button)
             period_layout.addLayout(row)
+
+            split_row = QtWidgets.QHBoxLayout()
+            self.split_enabled = QtWidgets.QCheckBox("구간 나누기")
+            self.split_enabled.setChecked(False)
+            split_row.addWidget(self.split_enabled)
+            split_row.addWidget(QtWidgets.QLabel("기간일"))
+            self.segment_days = QtWidgets.QSpinBox()
+            self.segment_days.setRange(14, 3650)
+            self.segment_days.setValue(180)
+            self.segment_days.setSuffix("일")
+            split_row.addWidget(self.segment_days)
+            split_row.addWidget(QtWidgets.QLabel("기간선택"))
+            self.segment_mode = QtWidgets.QComboBox()
+            self.segment_mode.addItem("연속", "continuous")
+            self.segment_mode.addItem("랜덤", "random")
+            split_row.addWidget(self.segment_mode)
+            split_row.addWidget(QtWidgets.QLabel("구간수"))
+            self.segment_count = QtWidgets.QSpinBox()
+            self.segment_count.setRange(0, 1000)
+            self.segment_count.setValue(5)
+            split_row.addWidget(self.segment_count)
+            self.include_full_result = QtWidgets.QCheckBox("전체 기간 포함")
+            self.include_full_result.setChecked(False)
+            self.include_full_result.setToolTip(
+                "구간 결과와 함께 현재 선택 기간 전체의 결과도 부모 행으로 계산·저장합니다.")
+            split_row.addWidget(self.include_full_result)
+            split_row.addStretch(1)
+            period_layout.addLayout(split_row)
+            split_hint = QtWidgets.QLabel(
+                "연속은 과거→최근 순서의 안정성을, 랜덤은 시작점 변화에 대한 민감도를 확인합니다. "
+                "구간별 결과는 같은 실행 그룹으로 저장됩니다.")
+            split_hint.setObjectName("HintStrong")
+            split_hint.setWordWrap(True)
+            period_layout.addWidget(split_hint)
+            self.split_enabled.toggled.connect(self._update_split_controls)
+            self.segment_mode.currentIndexChanged.connect(self._on_segment_basis_changed)
+            self.segment_days.valueChanged.connect(self._on_segment_basis_changed)
+            self.start_date.dateChanged.connect(self._on_segment_basis_changed)
+            self.end_date.dateChanged.connect(self._on_segment_basis_changed)
+            self.start_date.dateChanged.connect(self._sync_chart_period)
+            self.end_date.dateChanged.connect(self._sync_chart_period)
             outer.addWidget(period_card)
             self._reload_presets("최근 1년")
             self.preset_combo.currentIndexChanged.connect(self._apply_preset)
@@ -391,15 +482,59 @@ def build_config_window(parent: Any = None) -> Any:
 
             self.backtest_result = QtWidgets.QLabel(
                 "기간을 지정한 뒤 실행하세요. 시세를 받는 데 10~30초 걸릴 수 있습니다.")
-            self.backtest_result.setObjectName("Hint")
+            self.backtest_result.setObjectName("BacktestSummary")
             self.backtest_result.setWordWrap(True)
             self.backtest_result.setTextFormat(QtCore.Qt.TextFormat.RichText)
             self.backtest_result.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
-            result_scroll = QtWidgets.QScrollArea()
-            result_scroll.setWidgetResizable(True)
-            result_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
-            result_scroll.setWidget(self.backtest_result)
-            outer.addWidget(result_scroll, 1)
+            outer.addWidget(self.backtest_result)
+
+            history_title = QtWidgets.QHBoxLayout()
+            history_label = QtWidgets.QLabel("결과 이력")
+            history_label.setObjectName("Title")
+            history_title.addWidget(history_label)
+            history_title.addStretch(1)
+            self.view_config_button = QtWidgets.QPushButton("백테스트 설정보기")
+            self.view_config_button.clicked.connect(self._view_selected_config)
+            history_title.addWidget(self.view_config_button)
+            self.delete_results_button = QtWidgets.QPushButton("선택 삭제")
+            self.delete_results_button.setObjectName("Danger")
+            self.delete_results_button.clicked.connect(self._delete_selected_results)
+            history_title.addWidget(self.delete_results_button)
+            self.select_all_results_button = QtWidgets.QPushButton("전체 선택")
+            self.select_all_results_button.clicked.connect(self._select_all_results)
+            history_title.insertWidget(history_title.count() - 1,
+                                       self.select_all_results_button)
+            outer.addLayout(history_title)
+
+            self.history_table = QtWidgets.QTableWidget(0, 10)
+            self.history_table.setObjectName("BacktestTable")
+            self.history_table.setHorizontalHeaderLabels([
+                "선택", "실행 구조", "테스트 기간", "설정", "누적수익",
+                "CAGR", "MDD", "MAR", "승률", "매매",
+            ])
+            header_color_keys = (
+                "select", "structure", "period", "variant", "total_return",
+                "cagr", "mdd", "mar", "win_rate", "trades",
+            )
+            for column, color_key in enumerate(header_color_keys):
+                self.history_table.horizontalHeaderItem(column).setForeground(
+                    QtGui.QBrush(QtGui.QColor(BACKTEST_RESULT_COLORS[color_key])))
+            self.history_table.verticalHeader().setVisible(False)
+            self.history_table.setAlternatingRowColors(True)
+            self.history_table.setEditTriggers(
+                QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+            self.history_table.setSelectionBehavior(
+                QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+            self.history_table.setSelectionMode(
+                QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+            self.history_table.cellClicked.connect(self._on_history_clicked)
+            header = self.history_table.horizontalHeader()
+            header.setSectionResizeMode(header.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(2, header.ResizeMode.Stretch)
+            self.history_table.verticalHeader().setDefaultSectionSize(36)
+            outer.addWidget(self.history_table, 1)
+            self._update_split_controls()
+            self._reload_history()
             self.refresh_summary()
 
         def _reload_presets(self, selected_name: Optional[str] = None) -> None:
@@ -417,15 +552,21 @@ def build_config_window(parent: Any = None) -> Any:
             if not isinstance(preset, dict):
                 return
             start, end, all_period = resolve_backtest_preset(preset)
-            self.all_period.setChecked(all_period)
+            self._all_period_selected = all_period
+            self.start_date.setDisabled(all_period)
+            self.end_date.setDisabled(all_period)
+            if all_period:
+                start = "2017-09-25"
+                end = QtCore.QDate.currentDate().toString("yyyy-MM-dd")
             if start:
                 self.start_date.setDate(QtCore.QDate.fromString(start, "yyyy-MM-dd"))
             if end:
                 self.end_date.setDate(QtCore.QDate.fromString(end, "yyyy-MM-dd"))
             self.remove_preset_button.setEnabled(bool(preset.get("custom")))
+            self._recalculate_segment_count()
 
         def _save_custom_preset(self) -> None:
-            if self.all_period.isChecked():
+            if getattr(self, "_all_period_selected", False):
                 self.backtest_result.setText("전체 기간은 이미 기본 프리셋에 있습니다.")
                 return
             name, ok = QtWidgets.QInputDialog.getText(
@@ -462,26 +603,131 @@ def build_config_window(parent: Any = None) -> Any:
             self._apply_preset()
 
         def refresh_summary(self) -> None:
-            config = self._config_provider()
+            config = self._effective_config()
             cap = float(config.get("sizing_equity_cap_krw", 0.0))
             cap_text = f"{cap:,.0f}원" if cap > 0 else "없음"
+            tickers_text = ", ".join(config.get("tickers") or [])
+            if (config.get("additional_selection_enabled")
+                    and config.get("additional_selection_mode") == "auto"):
+                tickers_text = f"{tickers_text or '고정 없음'} + 자동 {int(config.get('auto_selection_count', 6))}종"
             self.config_summary.setText(
-                f"종목 {', '.join(config.get('tickers') or [])} · "
+                f"종목 {tickers_text} · "
                 f"{config.get('position_sizing', 'equal').upper()} · "
                 f"BTC 최소비중 {float(config.get('btc_min_weight', 0.0)) * 100:.1f}% · "
-                f"신호 {config.get('signal_reference', 'local')} · "
-                f"복리상한 {cap_text}")
+                f"신호 {config.get('signal_reference', 'binance')} · "
+                f"복리상한 {cap_text} · "
+                f"장세판정 {'백테스트 적용' if self._regime_draft.get('use_for_backtest') else '연구용'}")
+
+        def _effective_config(self) -> Dict[str, Any]:
+            config = dict(self._config_provider())
+            config["regime_scoring"] = dict(self._regime_draft)
+            return config
+
+        def _chart_period(self) -> Tuple[Any, Any, bool]:
+            return (self.start_date.date().toString("yyyy-MM-dd"),
+                    self.end_date.date().toString("yyyy-MM-dd"),
+                    bool(getattr(self, "_all_period_selected", False)))
+
+        def _apply_chart_period(self, start: Any, end: Any) -> None:
+            start_qdate = QtCore.QDate.fromString(str(start)[:10], "yyyy-MM-dd")
+            end_qdate = QtCore.QDate.fromString(str(end)[:10], "yyyy-MM-dd")
+            if (not start_qdate.isValid() or not end_qdate.isValid()
+                    or start_qdate > end_qdate):
+                return
+            self._all_period_selected = False
+            self.start_date.setEnabled(True)
+            self.end_date.setEnabled(True)
+            self.start_date.blockSignals(True)
+            self.end_date.blockSignals(True)
+            self.start_date.setDate(start_qdate)
+            self.end_date.setDate(end_qdate)
+            self.start_date.blockSignals(False)
+            self.end_date.blockSignals(False)
+            # The visible preset must describe the actual dates now in use.
+            custom_name = "사용자 지정"
+            index = self.preset_combo.findText(custom_name)
+            payload = {"name": custom_name, "start": str(start)[:10],
+                       "end": str(end)[:10], "chart_selection": True}
+            self.preset_combo.blockSignals(True)
+            if index < 0:
+                self.preset_combo.addItem(custom_name, payload)
+                index = self.preset_combo.count() - 1
+            else:
+                self.preset_combo.setItemData(index, payload)
+            self.preset_combo.setCurrentIndex(index)
+            self.preset_combo.blockSignals(False)
+            self.remove_preset_button.setEnabled(False)
+            self._recalculate_segment_count()
+            self._sync_chart_period()
+
+        def _update_regime_draft(self, value: Dict[str, Any]) -> None:
+            self._regime_draft = dict(value)
+            if self._regime_changed:
+                self._regime_changed(dict(value))
+            self.refresh_summary()
+
+        def _open_regime_chart(self) -> None:
+            if self._chart_window is None:
+                from regime_chart import build_regime_chart_window
+                self._chart_window = build_regime_chart_window(
+                    QtCore, QtGui, QtWidgets,
+                    self._effective_config, self._update_regime_draft,
+                    self._chart_period, self._apply_chart_period, self)
+            else:
+                self._chart_window.sync_period()
+            self._chart_window.show()
+            self._chart_window.raise_()
+            self._chart_window.activateWindow()
+
+        def _sync_chart_period(self, _value: Any = None) -> None:
+            window = self._chart_window
+            if window is not None and window.isVisible():
+                window.sync_period()
+
+        def _update_split_controls(self, _value: Any = None) -> None:
+            enabled = self.split_enabled.isChecked()
+            random_mode = self.segment_mode.currentData() == "random"
+            for widget in (self.segment_days, self.segment_mode,
+                           self.include_full_result):
+                widget.setEnabled(enabled)
+            self.segment_count.setEnabled(enabled and random_mode)
+            self._recalculate_segment_count()
+
+        def _on_segment_basis_changed(self, _value: Any = None) -> None:
+            self._update_split_controls()
+
+        def _recalculate_segment_count(self) -> None:
+            days = max(0, self.start_date.date().daysTo(self.end_date.date()) + 1)
+            period_days = max(1, int(self.segment_days.value()))
+            count = days // period_days
+            self.segment_count.blockSignals(True)
+            self.segment_count.setValue(count)
+            self.segment_count.blockSignals(False)
+            self.segment_count.setToolTip(
+                f"선택 기간 {days:,}일 ÷ {period_days:,}일 = {count:,}개 완전 구간")
+
+        def _split_options(self) -> Dict[str, Any]:
+            return {
+                "enabled": self.split_enabled.isChecked(),
+                "period_days": int(self.segment_days.value()),
+                "mode": str(self.segment_mode.currentData()),
+                "count": int(self.segment_count.value()),
+                "auto_count": self.segment_mode.currentData() == "continuous",
+                "include_full": self.include_full_result.isChecked(),
+            }
 
         def _run_backtest(self) -> None:
-            config = self._config_provider()
-            if not config.get("tickers"):
+            config = self._effective_config()
+            if (not config.get("tickers")
+                    and not (config.get("additional_selection_enabled")
+                             and config.get("additional_selection_mode") == "auto")):
                 self.backtest_result.setText("대상 종목을 먼저 입력해주세요.")
                 return
             if float(config.get("btc_min_weight", 0.0)) > 0 and "BTC" not in config["tickers"]:
                 self.backtest_result.setText("BTC 최소비중을 사용하려면 대상 종목에 BTC가 필요합니다.")
                 return
             start = end = None
-            if not self.all_period.isChecked():
+            if not getattr(self, "_all_period_selected", False):
                 start = self.start_date.date().toString("yyyy-MM-dd")
                 end = self.end_date.date().toString("yyyy-MM-dd")
                 if start > end:
@@ -491,7 +737,7 @@ def build_config_window(parent: Any = None) -> Any:
             self.backtest_button.setEnabled(False)
             self.backtest_button.setText("계산 중...")
             self.backtest_result.setText("시세를 받아 계산하고 있습니다...")
-            worker = _BacktestWorker(config, start, end)
+            worker = _BacktestWorker(config, start, end, self._split_options())
             worker.finished.connect(self._apply_result)
             self._backtest_worker = worker
             threading.Thread(target=worker.run, daemon=True).start()
@@ -504,37 +750,264 @@ def build_config_window(parent: Any = None) -> Any:
                     f"백테스트 실패: {payload.get('message', '알 수 없는 오류')}")
                 return
             selected = payload["optimistic"]
-            baseline = payload.get("baseline") or {}
-            weight = float(self._config_provider().get("btc_min_weight", 0.0)) * 100
+            config_snapshot = dict(payload.get("config_snapshot") or {})
+            segments = payload.get("segments") or []
 
             def cell(result: Dict[str, Any], key: str, suffix: str = "%") -> str:
                 value = result.get(key)
                 return "-" if value is None else f"{value:,.2f}{suffix}"
 
-            rows = [
-                ("BTC 최소비중 0%", baseline),
-                (f"BTC 최소비중 {weight:.1f}%", selected),
-            ]
-            if payload.get("uncapped"):
-                rows.append(("같은 설정·복리상한 없음", payload["uncapped"]))
-            html = (f"<b>기간</b> {selected['시작'].date()} ~ {selected['종료'].date()} "
-                    f"({selected['일수']}일)<br><br>"
-                    "<table cellspacing='0' cellpadding='5'>"
-                    "<tr><th align='left'>설정</th><th>CAGR</th><th>MDD</th>"
-                    "<th>MAR</th><th>현금대기</th><th>매매</th></tr>")
-            for label_text, result in rows:
-                html += (f"<tr><td><b>{label_text}</b></td>"
-                         f"<td>{cell(result, 'CAGR%')}</td>"
-                         f"<td>{cell(result, 'MDD%')}</td>"
-                         f"<td>{cell(result, 'MAR', '')}</td>"
-                         f"<td>{cell(result, '현금대기율%')}</td>"
-                         f"<td>{result.get('매매', 0)}회</td></tr>")
-            html += "</table>"
+            if selected:
+                colors = BACKTEST_RESULT_COLORS
+                html = (
+                    f"<span style='color:{colors['period']};font-size:14px'><b>기간</b> "
+                    f"{str(selected['시작'])[:10]} ~ {str(selected['종료'])[:10]} "
+                    f"({selected['일수']}일)</span>&nbsp;&nbsp;"
+                    f"<span style='color:{colors['total_return']}'><b>현재 누적 {cell(selected, '총수익률%')}</b></span>&nbsp;&nbsp;"
+                    f"<span style='color:{colors['cagr']}'><b>CAGR {cell(selected, 'CAGR%')}</b></span>&nbsp;&nbsp;"
+                    f"<span style='color:{colors['mdd']}'><b>MDD {cell(selected, 'MDD%')}</b></span>&nbsp;&nbsp;"
+                    f"<span style='color:{colors['mar']}'><b>MAR {cell(selected, 'MAR', '')}</b></span>&nbsp;&nbsp;"
+                    f"<span style='color:{colors['win_rate']}'><b>승률 {cell(selected, '승률%')}</b></span>"
+                )
+            else:
+                html = (f"<span style='color:{BACKTEST_RESULT_COLORS['period']};font-size:14px'><b>구간 검증</b> "
+                        f"{segments[0]['start']} ~ {segments[-1]['end']}</span>")
+            if segments:
+                html += (f"<br><span style='color:#FFFFFF'>구간 검증 "
+                         f"<b>{len(segments)}개</b>를 같은 실행 그룹으로 저장했습니다.</span>")
             if payload.get("missing"):
-                html += f"<br>시세 부족으로 제외: {', '.join(payload['missing'])}"
-            html += ("<br><br>* 빗썸 장기 일봉 제한 때문에 앱 백테스트는 업비트 KRW "
-                     "시세를 대용합니다. 절대 수익률보다 설정 간 차이를 보세요.")
+                html += (f"<br><span style='color:#FFD166'>시세 부족 제외: "
+                         f"{', '.join(payload['missing'])}</span>")
             self.backtest_result.setText(html)
+
+            group_id = payload["group_id"]
+            split = dict(payload.get("split_options") or {})
+            meta = {
+                "confirm_fill": "target",
+                "data_proxy": "upbit_krw_daily",
+                "split": split,
+                "random_seed": payload.get("split_seed"),
+                "missing_tickers": payload.get("missing") or [],
+            }
+
+            def record(variant: str, result: Dict[str, Any], cfg: Dict[str, Any],
+                       segment_index: int = 0, segment_count: int = 0,
+                       segment_mode: str = "full") -> Dict[str, Any]:
+                # _equity/_monthly/_trades는 그래프·진단용 대용량 객체입니다.
+                # 이력 표 재현에는 요약 지표와 설정만 필요하므로 DB 비대화를 막기 위해 제외합니다.
+                stored_result = {
+                    key: value for key, value in result.items()
+                    if not str(key).startswith("_")
+                }
+                return {
+                    "group_id": group_id,
+                    "segment_index": segment_index,
+                    "segment_count": segment_count,
+                    "segment_mode": segment_mode,
+                    "start_date": str(result["시작"])[:10],
+                    "end_date": str(result["종료"])[:10],
+                    "variant": variant,
+                    "config": cfg,
+                    "result": stored_result,
+                    "meta": meta,
+                }
+
+            records = []
+            if selected:
+                variant = "전체 결과" if segments else "현재 설정"
+                records.append(record(variant, selected, config_snapshot))
+            segment_count = len(segments)
+            for segment in segments:
+                records.append(record(
+                    "구간 검증", segment["result"], config_snapshot,
+                    int(segment["index"]), segment_count,
+                    str(split.get("mode", "continuous")),
+                ))
+            try:
+                self._history_store.add_many(records)
+                self._reload_history(scroll_bottom=True)
+            except Exception as exc:
+                self.backtest_result.setText(
+                    html + f"<br><span style='color:#FF8A80'>이력 저장 실패: {exc}</span>")
+
+        def _reload_history(self, scroll_bottom: bool = False) -> None:
+            records = self._history_store.list()
+            self.history_table.setRowCount(len(records))
+            group_numbers: Dict[str, int] = {}
+            group_sizes: Dict[str, int] = {}
+            group_positions: Dict[str, int] = {}
+            for entry in records:
+                group_id = entry["group_id"]
+                if group_id not in group_numbers:
+                    group_numbers[group_id] = len(group_numbers) + 1
+                group_sizes[group_id] = group_sizes.get(group_id, 0) + 1
+            colors = BACKTEST_RESULT_COLORS
+            for row, entry in enumerate(records):
+                result = entry["result"]
+                checkbox = QtWidgets.QTableWidgetItem()
+                checkbox.setFlags(checkbox.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+                checkbox.setCheckState(QtCore.Qt.CheckState.Unchecked)
+                checkbox.setData(QtCore.Qt.ItemDataRole.UserRole, entry["id"])
+                self.history_table.setItem(row, 0, checkbox)
+                group_id = entry["group_id"]
+                position = group_positions.get(group_id, 0)
+                group_positions[group_id] = position + 1
+                group_size = group_sizes[group_id]
+                group_number = group_numbers[group_id]
+                segment_index = int(entry["segment_index"])
+                if position == 0:
+                    detail = ("전체" if segment_index == 0 else
+                              f"구간 {segment_index}/{entry['segment_count']}")
+                    tree_label = (f"실행 {group_number}" if group_size == 1 else
+                                  f"▼ 실행 {group_number} · {detail}")
+                else:
+                    branch = "└─" if position == group_size - 1 else "├─"
+                    detail = ("전체" if segment_index == 0 else
+                              f"구간 {segment_index}/{entry['segment_count']}")
+                    tree_label = f"  {branch} {detail}"
+                values = [
+                    (tree_label, colors["structure"]),
+                    (f"{entry['start_date']} ~ {entry['end_date']}", colors["period"]),
+                    (entry["variant"], colors["variant"]),
+                    (self._metric_text(result, "총수익률%"), colors["total_return"]),
+                    (self._metric_text(result, "CAGR%"), colors["cagr"]),
+                    (self._metric_text(result, "MDD%"), colors["mdd"]),
+                    (self._metric_text(result, "MAR", ""), colors["mar"]),
+                    (self._metric_text(result, "승률%"), colors["win_rate"]),
+                    (f"{int(result.get('매매', 0)):,}", colors["trades"]),
+                ]
+                for col, (value, color) in enumerate(values, 1):
+                    item = QtWidgets.QTableWidgetItem(value)
+                    item.setForeground(QtGui.QBrush(QtGui.QColor(color)))
+                    item.setData(QtCore.Qt.ItemDataRole.UserRole, entry["id"])
+                    if col >= 4:
+                        item.setTextAlignment(int(QtCore.Qt.AlignmentFlag.AlignRight |
+                                                  QtCore.Qt.AlignmentFlag.AlignVCenter))
+                    self.history_table.setItem(row, col, item)
+            if scroll_bottom and records:
+                self.history_table.scrollToBottom()
+
+        @staticmethod
+        def _metric_text(result: Dict[str, Any], key: str, suffix: str = "%") -> str:
+            value = result.get(key)
+            return "—" if value is None else f"{float(value):,.2f}{suffix}"
+
+        def _current_record_id(self) -> Optional[int]:
+            row = self.history_table.currentRow()
+            if row < 0:
+                return None
+            item = self.history_table.item(row, 0)
+            return int(item.data(QtCore.Qt.ItemDataRole.UserRole)) if item else None
+
+        def _on_history_clicked(self, _row: int, _column: int) -> None:
+            # 평소에는 행 선택만 합니다. 설정보기 창이 이미 떠 있을 때만
+            # 선택된 레코드의 저장 설정으로 내용을 즉시 교체합니다.
+            dialog = self._config_view_dialog
+            if dialog is not None and dialog.isVisible():
+                self._load_current_config_view()
+
+        def _view_selected_config(self, _index: Any = None) -> None:
+            record_id = self._current_record_id()
+            if record_id is None:
+                self.backtest_result.setText("설정을 볼 결과 행을 먼저 클릭하세요.")
+                return
+            if self._config_view_dialog is None:
+                self._build_config_view()
+            self._load_current_config_view()
+            self._config_view_dialog.show()
+            self._config_view_dialog.raise_()
+            self._config_view_dialog.activateWindow()
+
+        def _build_config_view(self) -> None:
+            dialog = QtWidgets.QDialog(self, QtCore.Qt.WindowType.Window)
+            dialog.setWindowTitle("백테스트 설정보기 · 읽기 전용")
+            dialog.setWindowModality(QtCore.Qt.WindowModality.NonModal)
+            dialog.resize(720, 680)
+            layout = QtWidgets.QVBoxLayout(dialog)
+            self._config_view_title = QtWidgets.QLabel("")
+            self._config_view_title.setObjectName("Title")
+            layout.addWidget(self._config_view_title)
+            note = QtWidgets.QLabel(
+                "결과를 계산할 때 저장한 읽기 전용 설정입니다. 이 창을 띄운 채 결과 행을 "
+                "클릭하면 해당 레코드의 설정으로 자동 전환됩니다.")
+            note.setObjectName("HintStrong")
+            note.setWordWrap(True)
+            layout.addWidget(note)
+            self._config_view_table = QtWidgets.QTableWidget(0, 2)
+            self._config_view_table.setObjectName("BacktestTable")
+            self._config_view_table.setHorizontalHeaderLabels(["설정 항목", "저장 값"])
+            self._config_view_table.verticalHeader().setVisible(False)
+            self._config_view_table.setEditTriggers(
+                QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+            view_header = self._config_view_table.horizontalHeader()
+            view_header.setSectionResizeMode(0, view_header.ResizeMode.ResizeToContents)
+            view_header.setSectionResizeMode(1, view_header.ResizeMode.Stretch)
+            layout.addWidget(self._config_view_table, 1)
+            close_button = QtWidgets.QPushButton("닫기")
+            close_button.clicked.connect(dialog.hide)
+            layout.addWidget(close_button)
+            self._config_view_dialog = dialog
+
+        def _load_current_config_view(self) -> None:
+            record_id = self._current_record_id()
+            entry = self._history_store.get(record_id) if record_id is not None else None
+            if not entry or self._config_view_dialog is None:
+                return
+            self._config_view_title.setText(
+                f"{entry['variant']} · {entry['start_date']} ~ {entry['end_date']}")
+            flattened: List[Tuple[str, Any]] = []
+            def flatten(prefix: str, value: Any) -> None:
+                if isinstance(value, dict):
+                    for key in sorted(value):
+                        flatten(f"{prefix}.{key}" if prefix else str(key), value[key])
+                else:
+                    flattened.append((prefix, value))
+            flatten("config", entry["config"])
+            flatten("backtest", entry["meta"])
+            table = self._config_view_table
+            table.setRowCount(len(flattened))
+            for row, (key, value) in enumerate(flattened):
+                lower = key.lower()
+                shown = "••••••" if any(word in lower for word in ("secret", "token", "api_key")) else str(value)
+                table.setItem(row, 0, QtWidgets.QTableWidgetItem(key))
+                table.setItem(row, 1, QtWidgets.QTableWidgetItem(shown))
+
+        def _delete_selected_results(self) -> None:
+            ids = set()
+            for row in range(self.history_table.rowCount()):
+                item = self.history_table.item(row, 0)
+                if item and item.checkState() == QtCore.Qt.CheckState.Checked:
+                    ids.add(int(item.data(QtCore.Qt.ItemDataRole.UserRole)))
+            for index in self.history_table.selectionModel().selectedRows():
+                item = self.history_table.item(index.row(), 0)
+                if item:
+                    ids.add(int(item.data(QtCore.Qt.ItemDataRole.UserRole)))
+            if not ids:
+                self.backtest_result.setText(
+                    "삭제할 결과를 체크하거나 Ctrl/Shift로 여러 행을 선택하세요.")
+                return
+            current_id = self._current_record_id()
+            answer = QtWidgets.QMessageBox.question(
+                self, "백테스트 결과 삭제", f"선택한 {len(ids)}개 결과를 삭제할까요?",
+                QtWidgets.QMessageBox.StandardButton.Yes |
+                QtWidgets.QMessageBox.StandardButton.No)
+            if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+            deleted = self._history_store.delete(sorted(ids))
+            if (self._config_view_dialog is not None
+                    and current_id in ids):
+                self._config_view_dialog.hide()
+            self._reload_history()
+            self.backtest_result.setText(f"선택한 백테스트 결과 {deleted}개를 삭제했습니다.")
+
+        def _select_all_results(self) -> None:
+            self.history_table.selectAll()
+            for row in range(self.history_table.rowCount()):
+                item = self.history_table.item(row, 0)
+                if item:
+                    item.setCheckState(QtCore.Qt.CheckState.Checked)
+            self.backtest_result.setText(
+                f"백테스트 결과 {self.history_table.rowCount()}개를 모두 선택했습니다.")
 
     class ConfigWindow(QtWidgets.QWidget):
         """거래소 선택에 따라 API Key 입력란이 동적으로 재구성되는 설정 창"""
@@ -684,9 +1157,76 @@ def build_config_window(parent: Any = None) -> Any:
             form.setSpacing(10)
             form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
 
-            self.tickers_edit = QtWidgets.QLineEdit(format_tickers(self.config.get("tickers", [])))
-            self.tickers_edit.setPlaceholderText("BTC, ETH, SOL")
-            form.addRow(QtWidgets.QLabel("대상 종목"), self.tickers_edit)
+            self.investment_strategy_combo = QtWidgets.QComboBox()
+            self.investment_strategy_combo.addItem("기간리밸런싱", "period_rebalance")
+            self.investment_strategy_combo.addItem("변동성돌파", "volatility_breakout")
+            strategy = str(self.config.get("investment_strategy", "volatility_breakout"))
+            strategy_index = self.investment_strategy_combo.findData(strategy)
+            self.investment_strategy_combo.setCurrentIndex(
+                strategy_index if strategy_index >= 0 else 1)
+            form.addRow(QtWidgets.QLabel("투자 전략"), self.investment_strategy_combo)
+
+            regime_row = QtWidgets.QHBoxLayout()
+            self.regime_short_ma_spin = QtWidgets.QSpinBox()
+            self.regime_short_ma_spin.setRange(5, 200)
+            self.regime_short_ma_spin.setValue(int(self.config.get("regime_short_ma", 60)))
+            self.regime_long_ma_spin = QtWidgets.QSpinBox()
+            self.regime_long_ma_spin.setRange(20, 400)
+            self.regime_long_ma_spin.setValue(int(self.config.get("regime_long_ma", 120)))
+            regime_row.addWidget(QtWidgets.QLabel("단기"))
+            regime_row.addWidget(self.regime_short_ma_spin)
+            regime_row.addWidget(QtWidgets.QLabel("장기"))
+            regime_row.addWidget(self.regime_long_ma_spin)
+            form.addRow(QtWidgets.QLabel("BTC 상승장 MA"), regime_row)
+
+            confirm_row = QtWidgets.QHBoxLayout()
+            self.regime_entry_days_spin = QtWidgets.QSpinBox()
+            self.regime_entry_days_spin.setRange(1, 10)
+            self.regime_entry_days_spin.setSuffix(" 일")
+            self.regime_entry_days_spin.setValue(
+                int(self.config.get("regime_entry_confirm_days", 2)))
+            self.regime_exit_days_spin = QtWidgets.QSpinBox()
+            self.regime_exit_days_spin.setRange(1, 10)
+            self.regime_exit_days_spin.setSuffix(" 일")
+            self.regime_exit_days_spin.setValue(
+                int(self.config.get("regime_exit_confirm_days", 1)))
+            confirm_row.addWidget(QtWidgets.QLabel("진입"))
+            confirm_row.addWidget(self.regime_entry_days_spin)
+            confirm_row.addWidget(QtWidgets.QLabel("해제"))
+            confirm_row.addWidget(self.regime_exit_days_spin)
+            form.addRow(QtWidgets.QLabel("국면 확인"), confirm_row)
+
+            fixed_row = QtWidgets.QHBoxLayout()
+            self.fixed_selection = QtWidgets.QCheckBox("고정")
+            self.fixed_selection.setChecked(
+                bool(self.config.get("fixed_selection_enabled", True)))
+            self.fixed_tickers_edit = QtWidgets.QLineEdit(format_tickers(
+                self.config.get("fixed_tickers", ["BTC", "ETH"])))
+            self.fixed_tickers_edit.setPlaceholderText("BTC, ETH")
+            fixed_row.addWidget(self.fixed_selection)
+            fixed_row.addWidget(self.fixed_tickers_edit, 1)
+            form.addRow(QtWidgets.QLabel("고정 종목"), fixed_row)
+
+            additional_row = QtWidgets.QHBoxLayout()
+            self.additional_selection = QtWidgets.QCheckBox("추가")
+            self.additional_selection.setChecked(
+                bool(self.config.get("additional_selection_enabled", True)))
+            self.additional_auto = QtWidgets.QRadioButton("자동 6종")
+            self.additional_manual = QtWidgets.QRadioButton("수동")
+            mode = str(self.config.get("additional_selection_mode", "manual"))
+            self.additional_auto.setChecked(mode == "auto")
+            self.additional_manual.setChecked(mode != "auto")
+            additional_row.addWidget(self.additional_selection)
+            additional_row.addWidget(self.additional_auto)
+            additional_row.addWidget(self.additional_manual)
+            additional_row.addStretch(1)
+            form.addRow(QtWidgets.QLabel("추가 방식"), additional_row)
+
+            self.additional_tickers_edit = QtWidgets.QLineEdit(format_tickers(
+                self.config.get("additional_tickers", [])))
+            self.additional_tickers_edit.setPlaceholderText("SOL, XRP, LINK")
+            self.tickers_edit = self.additional_tickers_edit  # 이전 UI 접근과 호환
+            form.addRow(QtWidgets.QLabel("추가 종목"), self.additional_tickers_edit)
 
             self.ma_spin = QtWidgets.QSpinBox()
             self.ma_spin.setRange(2, 60)
@@ -710,6 +1250,41 @@ def build_config_window(parent: Any = None) -> Any:
             self.simulation = QtWidgets.QCheckBox("시뮬레이션 강제 (실전 주문 차단 / Dry-Run)")
             self.simulation.setChecked(bool(self.config.get("force_simulation", False)))
             layout.addWidget(self.simulation)
+
+            selection_hint = QtWidgets.QLabel(
+                "자동은 BTC·ETH를 제외하고 Binance USDT 최근 10일 평균 거래대금 "
+                "상위 20개 중 7일 수익률이 0% 이상인 상위 6종을 매주 재선정합니다.")
+            selection_hint.setObjectName("Hint")
+            selection_hint.setWordWrap(True)
+            layout.addWidget(selection_hint)
+
+            self.strategy_hint = QtWidgets.QLabel()
+            self.strategy_hint.setObjectName("Hint")
+            self.strategy_hint.setWordWrap(True)
+            layout.addWidget(self.strategy_hint)
+
+            def sync_selection() -> None:
+                self.fixed_tickers_edit.setEnabled(self.fixed_selection.isChecked())
+                enabled = self.additional_selection.isChecked()
+                self.additional_auto.setEnabled(enabled)
+                self.additional_manual.setEnabled(enabled)
+                self.additional_tickers_edit.setEnabled(
+                    enabled and self.additional_manual.isChecked())
+                period = self.investment_strategy_combo.currentData() == "period_rebalance"
+                for widget in (self.regime_short_ma_spin, self.regime_long_ma_spin,
+                               self.regime_entry_days_spin, self.regime_exit_days_spin):
+                    widget.setEnabled(period)
+                self.strategy_hint.setText(
+                    "상승장에는 BTC·ETH와 자동 선정 종목을 매주 즉시 균등배분하고, "
+                    "그 외에는 변동성돌파·ATR·MA 청산으로 운용합니다."
+                    if period else
+                    "현재 방식: 종목별 변동성 돌파 신호에 따라 진입하고 ATR/균등 사이징과 MA 청산을 적용합니다.")
+
+            self.fixed_selection.toggled.connect(sync_selection)
+            self.additional_selection.toggled.connect(sync_selection)
+            self.additional_auto.toggled.connect(sync_selection)
+            self.investment_strategy_combo.currentIndexChanged.connect(sync_selection)
+            sync_selection()
             return card
 
         def _build_stability_card(self, QtWidgets):
@@ -777,15 +1352,43 @@ def build_config_window(parent: Any = None) -> Any:
             form.addRow(QtWidgets.QLabel("복리 기준자산 상한"), self.sizing_cap_spin)
 
             self.signal_reference_combo = QtWidgets.QComboBox()
-            self.signal_reference_combo.addItem("실제 거래소 일봉", "local")
-            self.signal_reference_combo.addItem("Binance USDT 공통 기준", "binance")
-            signal_reference = str(self.config.get("signal_reference", "local"))
+            self.signal_reference_combo.addItem("글로벌 공통 기준", "binance")
+            self.signal_reference_combo.addItem("실제 거래소 일봉 (호환용)", "local")
+            signal_reference = str(self.config.get("signal_reference", "binance"))
             signal_index = self.signal_reference_combo.findData(signal_reference)
             self.signal_reference_combo.setCurrentIndex(signal_index if signal_index >= 0 else 0)
             self.signal_reference_combo.setToolTip(
-                "Binance 선택 시 K와 MA 방향만 공통화합니다. 실제 목표가 범위와 ATR은 "
-                "거래 중인 KRW 거래소 데이터를 유지합니다.")
+                "BTC는 공용 Bitstamp USD 정본, 나머지는 Binance USDT로 K와 MA 방향을 "
+                "공통화합니다. 실제 목표가 범위와 ATR은 거래 중인 KRW 거래소 데이터를 유지합니다.")
             form.addRow(QtWidgets.QLabel("K·MA 신호 기준"), self.signal_reference_combo)
+
+            self.exit_timing_combo = QtWidgets.QComboBox()
+            self.exit_timing_combo.addItem("일봉 종가 확정 (다음 세션 시장가)", "daily")
+            self.exit_timing_combo.addItem("실시간 MA 이탈 즉시", "intraday")
+            exit_index = self.exit_timing_combo.findData(
+                str(self.config.get("exit_timing", "daily")))
+            self.exit_timing_combo.setCurrentIndex(exit_index if exit_index >= 0 else 0)
+            self.exit_timing_combo.setToolTip(
+                "즉시는 전일까지 확정된 MA를 당일 고정하고 현재가가 이탈하면 바로 시장가 청산합니다.")
+            form.addRow(QtWidgets.QLabel("청산 시점"), self.exit_timing_combo)
+
+            self.exit_on_selection_drop = QtWidgets.QCheckBox(
+                "자동 선정 탈락 시 즉시 전량 청산")
+            self.exit_on_selection_drop.setChecked(
+                bool(self.config.get("exit_on_selection_drop", True)))
+            self.exit_on_selection_drop.setToolTip(
+                "고정·수동 종목에는 적용하지 않습니다. TOP6 탈락 종목만 전량 시장가 청산합니다.")
+            form.addRow(QtWidgets.QLabel("주간 리밸런싱"), self.exit_on_selection_drop)
+
+            self.slippage_spin = QtWidgets.QDoubleSpinBox()
+            self.slippage_spin.setRange(0.0, 5.0)
+            self.slippage_spin.setSingleStep(0.05)
+            self.slippage_spin.setDecimals(2)
+            self.slippage_spin.setSuffix(" %")
+            self.slippage_spin.setValue(
+                float(self.config.get("backtest_slippage_rate", 0.001)) * 100)
+            self.slippage_spin.setToolTip("백테스트 시장가 체결에 수수료와 별도로 적용합니다.")
+            form.addRow(QtWidgets.QLabel("백테스트 슬리피지"), self.slippage_spin)
 
             # --- 하락장 빠른 청산 ---
             self.bear_exit_spin = QtWidgets.QSpinBox()
@@ -830,9 +1433,14 @@ def build_config_window(parent: Any = None) -> Any:
             def _sync(_=None) -> None:
                 self.risk_spin.setEnabled(self.sizing_combo.currentData() == "atr")
                 self.bear_exit_spin.setEnabled(self.bear_exit.isChecked())
+                self.exit_on_selection_drop.setEnabled(
+                    self.additional_selection.isChecked()
+                    and self.additional_auto.isChecked())
 
             self.sizing_combo.currentIndexChanged.connect(_sync)
             self.bear_exit.toggled.connect(_sync)
+            self.additional_selection.toggled.connect(_sync)
+            self.additional_auto.toggled.connect(_sync)
             _sync()
             return card
 
@@ -840,7 +1448,8 @@ def build_config_window(parent: Any = None) -> Any:
             """현재 입력값을 공급하는 독립 백테스트 창을 표시합니다."""
             if getattr(self, "_backtest_window", None) is None:
                 self._backtest_window = BacktestWindow(
-                    self.collect, self._set_backtest_presets)
+                    self.collect, self._set_backtest_presets,
+                    self._set_regime_scoring)
             self._backtest_window.refresh_summary()
             self._backtest_window.show()
             self._backtest_window.raise_()
@@ -849,6 +1458,10 @@ def build_config_window(parent: Any = None) -> Any:
         def _set_backtest_presets(self, presets: List[Dict[str, Any]]) -> None:
             """백테스트 창의 사용자 프리셋을 현재 설정 초안에 반영합니다."""
             self.config["backtest_presets"] = list(presets)
+
+        def _set_regime_scoring(self, settings: Dict[str, Any]) -> None:
+            """차트의 국면 연구값을 설정 초안에 보존합니다."""
+            self.config["regime_scoring"] = dict(settings)
 
         def _build_backtest_card(self, QtWidgets):
             """
@@ -922,7 +1535,9 @@ def build_config_window(parent: Any = None) -> Any:
         def _on_backtest(self) -> None:
             """저장 여부와 무관하게 **현재 화면 값**으로 백테스트"""
             config = self.collect()
-            if not config["tickers"]:
+            if (not config["tickers"]
+                    and not (config.get("additional_selection_enabled")
+                             and config.get("additional_selection_mode") == "auto")):
                 self.backtest_result.setText("대상 종목을 먼저 입력해주세요.")
                 return
 
@@ -1051,9 +1666,27 @@ def build_config_window(parent: Any = None) -> Any:
         def collect(self) -> Dict[str, Any]:
             """현재 입력값을 config.json 스키마로 수집"""
             config = dict(self.config)
+            fixed = parse_tickers(self.fixed_tickers_edit.text())
+            manual = parse_tickers(self.additional_tickers_edit.text())
+            fixed_enabled = bool(self.fixed_selection.isChecked())
+            additional_enabled = bool(self.additional_selection.isChecked())
+            additional_mode = "auto" if self.additional_auto.isChecked() else "manual"
+            tickers = list(fixed if fixed_enabled else [])
+            if additional_enabled and additional_mode == "manual":
+                tickers.extend(t for t in manual if t not in tickers)
             config.update({
                 "exchange": self.current_exchange(),
-                "tickers": parse_tickers(self.tickers_edit.text()),
+                "investment_strategy": self.investment_strategy_combo.currentData(),
+                "regime_short_ma": int(self.regime_short_ma_spin.value()),
+                "regime_long_ma": int(self.regime_long_ma_spin.value()),
+                "regime_entry_confirm_days": int(self.regime_entry_days_spin.value()),
+                "regime_exit_confirm_days": int(self.regime_exit_days_spin.value()),
+                "tickers": tickers,
+                "fixed_selection_enabled": fixed_enabled,
+                "fixed_tickers": fixed,
+                "additional_selection_enabled": additional_enabled,
+                "additional_selection_mode": additional_mode,
+                "additional_tickers": manual,
                 "ma_window": int(self.ma_spin.value()),
                 "fixed_k": float(self.k_spin.value()),
                 "use_dynamic_k": bool(self.dynamic_k.isChecked()),
@@ -1064,6 +1697,11 @@ def build_config_window(parent: Any = None) -> Any:
                     float(self.btc_min_weight_spin.value()) / 100, 4),
                 "sizing_equity_cap_krw": float(self.sizing_cap_spin.value()),
                 "signal_reference": self.signal_reference_combo.currentData(),
+                "exit_timing": self.exit_timing_combo.currentData(),
+                "exit_on_selection_drop": bool(
+                    self.exit_on_selection_drop.isChecked()),
+                "backtest_slippage_rate": round(
+                    float(self.slippage_spin.value()) / 100, 6),
                 "realtime_price_stream": bool(self.realtime_prices.isChecked()),
                 "bear_market_exit": bool(self.bear_exit.isChecked()),
                 "bear_exit_ma_window": int(self.bear_exit_spin.value()),
@@ -1074,7 +1712,13 @@ def build_config_window(parent: Any = None) -> Any:
 
         def _on_save(self) -> None:
             config = self.collect()
-            if not config["tickers"]:
+            if config["regime_long_ma"] <= config["regime_short_ma"]:
+                QtWidgets.QMessageBox.warning(
+                    self, "입력 확인", "BTC 상승장 장기 MA는 단기 MA보다 커야 합니다.")
+                return
+            if (not config["tickers"]
+                    and not (config.get("additional_selection_enabled")
+                             and config.get("additional_selection_mode") == "auto")):
                 QtWidgets.QMessageBox.warning(
                     self, "입력 확인", "대상 종목을 1개 이상 입력해주세요. (예: BTC, ETH, SOL)")
                 return

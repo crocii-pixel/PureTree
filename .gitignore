@@ -26,6 +26,7 @@ dist/
 
 # Runtime
 logs/
+quantbot/selection_state.json
 
 # 백테스트 시세 캐시
 quantbot/tools/_cache/

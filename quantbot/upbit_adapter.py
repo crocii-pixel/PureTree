@@ -70,6 +70,25 @@ class UpbitAdapter(ExchangeBase):
             logger.error(f"[업비트][{market}] 현재가 조회 실패: {e}")
             return None
 
+    def get_trading_fees(self, tickers=None) -> Dict[str, Any]:
+        by_symbol: Dict[str, Any] = {}
+        for ticker in (tickers or ["BTC"]):
+            symbol = self.to_symbol(ticker)
+            chance = self.client.get_chance(self.to_market(symbol))
+            if not isinstance(chance, dict) or chance.get("error"):
+                raise ExchangeError(f"업비트 수수료 응답 이상: {chance}")
+            buy = float(chance.get("bid_fee", chance.get("taker_bid_fee", 0.0005)))
+            sell = float(chance.get("ask_fee", chance.get("taker_ask_fee", 0.0005)))
+            maker = float(chance.get("maker_bid_fee", chance.get("maker_ask_fee", max(buy, sell))))
+            by_symbol[symbol] = {"buy_rate": buy, "sell_rate": sell,
+                                 "maker_rate": maker, "taker_rate": max(buy, sell)}
+        return {"exchange": self.NAME,
+                "buy_rate": max(v["buy_rate"] for v in by_symbol.values()),
+                "sell_rate": max(v["sell_rate"] for v in by_symbol.values()),
+                "maker_rate": max(v["maker_rate"] for v in by_symbol.values()),
+                "taker_rate": max(v["taker_rate"] for v in by_symbol.values()),
+                "by_symbol": by_symbol, "source": "upbit_orders_chance_api"}
+
     def get_ohlcv(self, ticker: str, count: int = 100, interval: str = "day") -> pd.DataFrame:
         """
         업비트 OHLCV 시세 조회

@@ -8,6 +8,7 @@ websocket-client>=1.6.0  # 빗썸 공개 실시간 체결/호가 그림자 기�
 # --- 데이터 / 전략 ---
 pandas>=2.0.0
 numpy>=1.24.0
+duckdb>=1.4.0           # 공용 글로벌 OHLCV Parquet 저장·조회·카탈로그
 scikit-learn>=1.3.0
 xgboost>=2.0.0
 

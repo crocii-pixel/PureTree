@@ -170,6 +170,32 @@ class CoinoneAdapter(ExchangeBase):
             logger.error(f"[코인원][{symbol}] 현재가 파싱 실패: {e}")
             return None
 
+    def get_trading_fees(self, tickers=None) -> Dict[str, Any]:
+        raw = self._request_private("/v2.1/account/trade_fee")
+        if not isinstance(raw, dict) or raw.get("result") != "success":
+            raise ExchangeError(f"코인원 수수료 응답 이상: {raw}")
+        rows = raw.get("fee_rates") or []
+        if isinstance(rows, dict):
+            rows = [rows]
+        wanted = {self.to_symbol(t) for t in (tickers or [])}
+        by_symbol: Dict[str, Any] = {}
+        for item in rows:
+            symbol = str(item.get("target_currency", item.get("currency", ""))).upper()
+            if not symbol or (wanted and symbol not in wanted):
+                continue
+            maker = float(item.get("maker", item.get("maker_fee_rate", 0.0002)))
+            taker = float(item.get("taker", item.get("taker_fee_rate", 0.0002)))
+            by_symbol[symbol] = {"buy_rate": taker, "sell_rate": taker,
+                                 "maker_rate": maker, "taker_rate": taker}
+        if not by_symbol:
+            raise ExchangeError(f"코인원 수수료 항목 없음: {raw}")
+        return {"exchange": self.NAME,
+                "buy_rate": max(v["buy_rate"] for v in by_symbol.values()),
+                "sell_rate": max(v["sell_rate"] for v in by_symbol.values()),
+                "maker_rate": max(v["maker_rate"] for v in by_symbol.values()),
+                "taker_rate": max(v["taker_rate"] for v in by_symbol.values()),
+                "by_symbol": by_symbol, "source": "coinone_trade_fee_api"}
+
     def list_markets(self):
         """코인원은 한글명을 주지 않으므로 심볼을 이름 자리에 그대로 넣습니다"""
         try:

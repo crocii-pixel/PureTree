@@ -11,6 +11,8 @@ import requests
 
 logger = logging.getLogger("ReferenceData")
 BASE_URL = "https://api.binance.com/api/v3/klines"
+PRICE_URL = "https://api.binance.com/api/v3/ticker/price"
+BITSTAMP_PRICE_URL = "https://www.bitstamp.net/api/v2/ticker/btcusd/"
 
 
 def _frame(rows: list) -> pd.DataFrame:
@@ -43,6 +45,58 @@ def fetch_binance_daily(ticker: str, limit: int = 100,
         return df if not df.empty else None
     except Exception as exc:
         logger.warning(f"[Binance 기준신호] {ticker} 일봉 조회 실패: {exc}")
+        return None
+
+
+def fetch_binance_price(ticker: str, timeout: float = 3.0) -> Optional[float]:
+    """Binance USDT 현재 체결가. 실시간 MA 이탈 비교에만 사용합니다."""
+    ticker = str(ticker).split("-")[-1].upper()
+    if ticker in {"USDT", "KRW"}:
+        return None
+    try:
+        response = requests.get(
+            PRICE_URL, params={"symbol": f"{ticker}USDT"}, timeout=timeout)
+        response.raise_for_status()
+        return float(response.json()["price"])
+    except Exception as exc:
+        logger.warning(f"[Binance 현재가] {ticker} 조회 실패: {exc}")
+        return None
+
+
+def fetch_global_daily(ticker: str, limit: int = 100,
+                       timeout: float = 8.0) -> Optional[pd.DataFrame]:
+    """공용 글로벌 일봉. BTC는 공유 Bitstamp 정본, 나머지는 Binance."""
+    ticker = str(ticker).split("-")[-1].upper()
+    if ticker != "BTC":
+        return fetch_binance_daily(ticker, limit=limit, timeout=timeout)
+    try:
+        from global_market_data import (
+            GlobalMarketRepository, ensure_global_btc_current,
+        )
+
+        ensure_global_btc_current(lock_timeout=15.0)
+        frame = GlobalMarketRepository().load_recent("1d", count=limit)
+        if frame.empty:
+            return fetch_binance_daily(ticker, limit=limit, timeout=timeout)
+        index = pd.DatetimeIndex(frame.pop("timestamp"))
+        frame.index = index.tz_convert("Asia/Seoul").tz_localize(None)
+        return frame[["open", "high", "low", "close", "volume"]]
+    except Exception as exc:
+        logger.warning("[글로벌 BTC 기준신호] 공용 저장소 조회 실패: %s", exc)
+        return fetch_binance_daily(ticker, limit=limit, timeout=timeout)
+
+
+def fetch_global_price(ticker: str, timeout: float = 3.0) -> Optional[float]:
+    """일봉과 같은 글로벌 시장의 현재가. BTC는 Bitstamp USD."""
+    ticker = str(ticker).split("-")[-1].upper()
+    if ticker != "BTC":
+        return fetch_binance_price(ticker, timeout=timeout)
+    try:
+        response = requests.get(BITSTAMP_PRICE_URL, timeout=timeout)
+        response.raise_for_status()
+        return float(response.json()["last"])
+    except Exception as exc:
+        logger.warning("[글로벌 BTC 현재가] Bitstamp 조회 실패: %s", exc)
         return None
 
 
@@ -80,4 +134,3 @@ def fetch_binance_history(ticker: str, start: str = "2017-01-01",
     except Exception as exc:
         logger.warning(f"[Binance 기준신호] {ticker} 전체 일봉 조회 실패: {exc}")
         return None
-

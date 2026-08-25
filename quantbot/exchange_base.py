@@ -270,6 +270,10 @@ class ExchangeBase(abc.ABC):
     def get_current_price(self, ticker: str) -> Optional[float]:
         """실시간 현재가(체결가) 조회. 실패 시 None 반환"""
 
+    def get_trading_fees(self, tickers: Optional[List[str]] = None) -> Dict[str, Any]:
+        """현재 계정의 시장가 수수료율(0.04%는 0.0004)을 반환합니다."""
+        raise NotImplementedError
+
     def list_markets(self) -> Optional[Dict[str, str]]:
         """
         거래소에 상장된 원화 마켓 목록을 {심볼: 한글명}으로 반환합니다.

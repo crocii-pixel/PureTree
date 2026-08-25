@@ -1829,7 +1829,7 @@ class TestPositionSizing:
         assert config_manager.DEFAULT_CONFIG["btc_min_weight"] == 0.0
         assert config_manager.DEFAULT_CONFIG["position_refill_threshold"] == 0.95
         assert config_manager.DEFAULT_CONFIG["sizing_equity_cap_krw"] == 0.0
-        assert config_manager.DEFAULT_CONFIG["signal_reference"] == "local"
+        assert config_manager.DEFAULT_CONFIG["signal_reference"] == "binance"
         assert config_manager.DEFAULT_CONFIG["realtime_price_stream"] is True
 
         bot = self._make_bot(tmp_path)
@@ -2014,9 +2014,28 @@ class TestPositionSizing:
         monkeypatch.setattr(main, "fetch_binance_daily", lambda *args, **kwargs: reference)
         bot.update_daily_settings(notify=False)
 
-        assert bot.signal_sources == {"BTC": "binance", "ETH": "binance"}
+        assert bot.signal_sources == {"BTC": "global", "ETH": "global"}
         expected = bot.strategy_engine.calculate_noise_ratio(reference, 20)
         assert bot.effective_ks["BTC"] == pytest.approx(expected)
+
+    def test_missing_global_reference_disables_ticker_instead_of_local_fallback(
+            self, tmp_path, monkeypatch):
+        import main
+
+        bot = self._make_bot(tmp_path, signal_reference="binance")
+        bot.exit_ma_values.update({"BTC": 123.0, "ETH": 456.0})
+        bot.daily_exit_due.update({"BTC": False, "ETH": True})
+        monkeypatch.setattr(main, "fetch_binance_daily", lambda *args, **kwargs: None)
+        bot.update_daily_settings(notify=False)
+
+        assert bot.signal_sources == {
+            "BTC": "global_unavailable", "ETH": "global_unavailable"}
+        assert bot.target_prices == {"BTC": 0.0, "ETH": 0.0}
+        assert not any(bot.is_above_ma.values())
+        assert bot.exit_ma_values == {"BTC": 123.0, "ETH": 456.0}
+        assert bot.exit_signal_ok("BTC")
+        assert not bot.exit_signal_ok("ETH")
+        assert bot._exit_signal_price("BTC", 100.0) is None
 
     def test_atr_indicator_excludes_in_progress_candle(self):
         """진행 중인 봉은 값이 계속 바뀌므로 ATR 계산에서 제외해야 한다"""
@@ -3381,6 +3400,46 @@ class TestBlockedLogging:
         assert "ETH" not in bot.blocked_logged
 
 
+class TestSelectionDropExit:
+    def _make_bot(self, tmp_path, paused=False):
+        from main import QuantBot
+        from trade_store import TradeStore
+
+        exchange = DummyExchange(
+            price=1000.0, krw=1_000_000.0, coin=10.0,
+            api_key="k", secret_key="s")
+        config = {
+            "exchange": "dummy", "tickers": ["BTC"], "ma_window": 10,
+            "force_simulation": False, "start_paused": paused,
+            "telegram_enabled": False, "schedule": {},
+            "explosive_era_guard": False,
+            "exit_on_selection_drop": True,
+        }
+        return QuantBot(
+            config=config, exchange=exchange, notifier=FakeNotifier(),
+            store=TradeStore(tmp_path / "selection_drop.db"))
+
+    def test_sells_full_balance_and_blocks_same_day_reentry(self, tmp_path):
+        bot = self._make_bot(tmp_path)
+        bot.selection_drop_pending = ["BTC"]
+
+        exited = bot.liquidate_selection_drops()
+
+        sells = [order for order in bot.exchange.placed if order["side"] == "sell"]
+        assert exited == ["BTC"]
+        assert sells[0]["units"] == pytest.approx(10.0)
+        assert bot.closed_today["BTC"] is True
+        assert bot.selection_drop_pending == []
+
+    def test_pause_keeps_drop_pending_without_order(self, tmp_path):
+        bot = self._make_bot(tmp_path, paused=True)
+        bot.selection_drop_pending = ["BTC"]
+
+        assert bot.liquidate_selection_drops() == []
+        assert bot.selection_drop_pending == ["BTC"]
+        assert bot.exchange.placed == []
+
+
 # ======================================================================
 # 23. 종목 코드 검증
 # ======================================================================
@@ -3491,13 +3550,13 @@ class TestTickerValidation:
 class TestBacktestPeriodPresets:
     def test_default_relative_presets_are_available(self):
         names = [item["name"] for item in config_gui.backtest_presets()]
-        for name in ("최근 3개월", "최근 6개월", "최근 1년", "최근 2년", "최근 3년"):
-            assert name in names
+        assert names[:4] == ["전체기간", "최근 6개월", "최근 1년", "최근 2년"]
+        assert "최근 3개월" not in names and "최근 3년" not in names
 
     def test_market_regime_presets_are_available(self):
         names = [item["name"] for item in config_gui.backtest_presets()]
         for name in ("2017 상승장", "2018 하락장", "2020~21 상승장", "2022 하락장",
-                     "성장·폭등기 벤치마크", "성숙기 벤치마크"):
+                     "폭등기", "성숙기"):
             assert name in names
 
     def test_relative_preset_switches_dates(self):
@@ -3507,7 +3566,7 @@ class TestBacktestPeriodPresets:
 
     def test_maturity_preset_ends_today(self):
         preset = next(item for item in config_gui.backtest_presets()
-                      if item["name"] == "성숙기 벤치마크")
+                      if item["name"] == "성숙기")
         assert config_gui.resolve_backtest_preset(preset, today="2026-08-24") == (
             "2021-01-01", "2026-08-24", False)
 

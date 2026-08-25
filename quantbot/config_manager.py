@@ -52,6 +52,17 @@ def _data_dir() -> Path:
     return _base_dir()
 
 
+def _market_data_dir() -> Path:
+    """모든 QuantBot 인스턴스가 공유하는 글로벌 시세 저장소."""
+    override = os.getenv("QUANTBOT_MARKET_DATA_DIR")
+    if override:
+        return Path(override).expanduser()
+    local_app_data = os.getenv("LOCALAPPDATA")
+    if local_app_data:
+        return Path(local_app_data) / "QuantBot" / "market_data" / "v1"
+    return Path.home() / ".quantbot" / "market_data" / "v1"
+
+
 def _env_path() -> Path:
     """
     API Key(.env) 위치.
@@ -84,6 +95,7 @@ ENV_PATH = _env_path()
 DATA_DIR = _data_dir()
 DB_PATH = DATA_DIR / "quantbot.db"
 LOG_DIR = DATA_DIR / "logs"
+MARKET_DATA_DIR = _market_data_dir()
 
 
 def ensure_data_dir() -> Path:
@@ -92,10 +104,59 @@ def ensure_data_dir() -> Path:
     return DATA_DIR
 
 
+def ensure_market_data_dir() -> Path:
+    """공용 글로벌 시세 디렉토리를 만들고 반환합니다."""
+    MARKET_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    return MARKET_DATA_DIR
+
+
 # config.json 기본 스키마
 DEFAULT_CONFIG: Dict[str, Any] = {
     "exchange": "bithumb",
+    # 기존 사용자의 주문 방식은 유지. 기간리밸런싱은 명시적으로 선택해야 켜집니다.
+    "investment_strategy": "volatility_breakout",
+    "regime_short_ma": 60,
+    "regime_long_ma": 120,
+    "regime_entry_confirm_days": 2,
+    "regime_exit_confirm_days": 1,
+    # 상승/하락 판정기는 서로 독립이며, 두 신호가 겹치거나 모두 꺼지면 안정기입니다.
+    # use_for_backtest를 켜기 전에는 기존 기간리밸런싱 규칙을 바꾸지 않습니다.
+    "regime_scoring": {
+        "enabled": True,
+        "use_for_backtest": False,
+        "use_for_live": False,
+        "bull_detector": "dual_ma",
+        "bear_detector": "lower_channel",
+        "decision_interval": "1d",
+        "short_ma": 60,
+        "long_ma": 120,
+        "macd_fast": 30,
+        "macd_slow": 60,
+        "macd_signal": 9,
+        "breakout_atr_window": 20,
+        "breakout_lower_window": 10,
+        "channel_slope_bars": 3,
+        "bull_strategy": "period_rebalance",
+        "stable_strategy": "volatility_breakout",
+        "bear_strategy": "defensive_atr",
+        "defensive_atr_multiple": 2.0,
+        "defensive_probe_fraction": 0.25,
+    },
     "tickers": ["BTC", "ETH", "SOL"],
+    # 종목 선정: 고정 종목 + 추가(자동 또는 수동). tickers는 하위 호환용 합집합입니다.
+    "fixed_selection_enabled": True,
+    "fixed_tickers": ["BTC", "ETH"],
+    "additional_selection_enabled": True,
+    "additional_selection_mode": "manual",
+    "additional_tickers": ["SOL"],
+    # 자동: Binance USDT 마감 일봉 기준 10일 평균 거래대금 TOP20 중
+    # 7일 수익률이 0 이상인 상위 6종을 매주 월요일 재선정합니다.
+    "auto_selection_count": 6,
+    "auto_liquidity_top": 20,
+    "auto_volume_days": 10,
+    "auto_return_days": 7,
+    # 자동 TOP6에서 탈락하면 기존 MA 청산을 기다리지 않고 전량 시장가 청산.
+    "exit_on_selection_drop": True,
     # 워크포워드 검증에서 MA5보다 OOS 성과가 나았던 값 (31개 구간 중 19개 우위)
     "ma_window": 10,
     "use_dynamic_k": True,
@@ -145,6 +206,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "bear_market_exit": False,
     "bear_exit_ma_window": 5,
     "regime_ma_months": 6,
+
+    # 청산 체결 시점. daily는 전일 종가로 이탈을 확정하고 다음 세션 시장가에,
+    # intraday는 당일 고정 MA를 현재가가 이탈하는 즉시 시장가에 청산합니다.
+    "exit_timing": "daily",
+    # 일봉 백테스트의 시장가 체결 불리함. 0.10% = 0.001 (수수료와 별도).
+    "backtest_slippage_rate": 0.001,
+    # API 조회/저장값이 모두 없을 때만 쓰며 거래소별 기본값이 우선합니다.
+    "fee_fallback_rate": None,
 
     # 폭등기 가드 - 위 국면 전환이 해를 끼치는 구간을 막는 안전장치.
     #
@@ -219,7 +288,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 
     # 진입 방향(MA)과 동적 K의 기준 시장. local은 실제 거래소 일봉,
     # binance는 Binance USDT 일봉을 공통 기준으로 쓰되 목표가 범위와 ATR은 현지 KRW를 씁니다.
-    "signal_reference": "local",
+    "signal_reference": "binance",
 
     # 공개 WebSocket 가격 캐시. 화면과 돌파 감시의 순차 REST 지연을 줄이며,
     # 스트림이 끊기거나 오래되면 기존 REST 조회로 자동 대체합니다.
@@ -299,6 +368,15 @@ def load_config(path: Optional[Path] = None, create_if_missing: bool = True) -> 
     try:
         with open(path, "r", encoding="utf-8") as f:
             raw = json.load(f)
+        if "fixed_tickers" not in raw:
+            legacy = [str(t).upper() for t in (raw.get("tickers") or ["BTC", "ETH"])]
+            fixed = [t for t in ("BTC", "ETH") if t in legacy]
+            if not fixed:
+                fixed = legacy[:2]
+            raw["fixed_tickers"] = fixed
+            raw["additional_tickers"] = [t for t in legacy if t not in fixed]
+            raw["additional_selection_enabled"] = bool(raw["additional_tickers"])
+            raw["additional_selection_mode"] = "manual"
         config = _merge_defaults(raw, DEFAULT_CONFIG)
         logger.info(f"설정 로딩 완료 ({path.name}) - 거래소: {config.get('exchange')}, 종목: {config.get('tickers')}")
         return config

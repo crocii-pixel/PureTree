@@ -10,12 +10,17 @@ from typing import Any, Dict, List, Optional, Tuple
 import schedule
 
 import config_manager
+from fee_manager import refresh_from_exchange, resolve_fee_info
 from exchange_base import ExchangeBase, create_exchange
 from live_price_stream import LivePriceStream
 from notifier import TelegramNotifier
-from reference_data import fetch_binance_daily
+from reference_data import (fetch_global_daily as fetch_binance_daily,
+                            fetch_global_price as fetch_binance_price)
+from regime_strategy import current_regime_from_config, is_period_rebalance
 from strategy_engine import StrategyEngine
 from trade_store import TradeStore, session_date
+from universe_selector import (automatic_enabled, select_live, selection_config,
+                               static_tickers)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -136,9 +141,20 @@ class QuantBot:
         :param store: 매매 이력 저장소 (None이면 기본 SQLite 저장소 생성)
         """
         self.config: Dict[str, Any] = config or config_manager.load_config()
+        self.investment_strategy: str = str(
+            self.config.get("investment_strategy", "volatility_breakout"))
+        self.period_strategy: bool = is_period_rebalance(self.config)
+        self.period_bull: bool = False
+        self.period_bull_previous: Optional[bool] = None
+        self.period_regime_changed: bool = False
+        self.last_period_rebalance_week: Optional[str] = None
 
-        raw_tickers: List[str] = self.config.get("tickers") or ["BTC"]
+        raw_tickers: List[str] = static_tickers(self.config) or ["BTC"]
         self.tickers: List[str] = [ExchangeBase.to_symbol(t) for t in raw_tickers]
+        self.auto_selected: List[str] = []
+        self.entry_tickers: List[str] = list(self.tickers)
+        self.selection_source: str = "fixed_manual"
+        self.selection_week: Optional[str] = None
         self.ma_window: int = int(self.config.get("ma_window", 5))
         self.use_dynamic_k: bool = bool(self.config.get("use_dynamic_k", True))
         self.k: Optional[float] = None if self.use_dynamic_k else float(self.config.get("fixed_k", 0.5))
@@ -157,6 +173,30 @@ class QuantBot:
             notifier=self.notifier,
             force_simulation=bool(self.config.get("force_simulation", False)),
         )
+        self.exit_on_selection_drop: bool = bool(
+            self.config.get("exit_on_selection_drop", True))
+        self.selection_drop_pending: List[str] = []
+        if automatic_enabled(self.config):
+            try:
+                selected = select_live(self.exchange, self.config)
+                self.auto_selected = list(selected["selected"])
+                previous = [ExchangeBase.to_symbol(t)
+                            for t in selected.get("previous_selected", [])]
+                self.selection_source = str(selected["source"])
+                self.entry_tickers = list(dict.fromkeys(
+                    self.tickers + self.auto_selected))
+                self.tickers = list(dict.fromkeys(self.entry_tickers + previous))
+                if self.exit_on_selection_drop:
+                    self.selection_drop_pending = [
+                        t for t in previous
+                        if t not in self.entry_tickers
+                    ]
+                self.selection_week = datetime.now().strftime("%G-W%V")
+            except Exception as exc:
+                logger.warning("자동 종목 선정 실패 - 고정 종목만 사용: %s", exc)
+        self.exit_timing: str = str(self.config.get("exit_timing", "daily")).lower()
+        self.fee_info: Dict[str, Any] = resolve_fee_info(self.config)
+        self._reference_price_cache: Dict[str, Tuple[float, float]] = {}
 
         # 매매 이력 저장소 (재시작 시 당일 상태 복구의 근거)
         self.store: Optional[TradeStore] = store
@@ -199,6 +239,9 @@ class QuantBot:
 
         # 주문 사이징 (equal = 1/N 균등, atr = 변동성 기반 리스크 사이징)
         self.position_sizing: str = str(self.config.get("position_sizing", "equal")).lower()
+        if self.period_strategy:
+            # 기간리밸런싱의 방어 국면은 검증된 ATR 엔진으로 고정합니다.
+            self.position_sizing = "atr"
         self.risk_per_trade: float = float(self.config.get("risk_per_trade", 0.01))
         self.atr_window: int = int(self.config.get("atr_window", 20))
         self.atr_stop_multiple: float = float(self.config.get("atr_stop_multiple", 2.0))
@@ -214,10 +257,11 @@ class QuantBot:
         self.btc_reserved_cash: float = 0.0
         self.last_recalculated_at: Optional[datetime] = None
         self.signal_reference: str = str(
-            self.config.get("signal_reference", "local")).strip().lower()
+            self.config.get("signal_reference", "binance")).strip().lower()
         if self.signal_reference not in {"local", "binance"}:
-            self.signal_reference = "local"
-        self.signal_sources: Dict[str, str] = {t: "local" for t in self.tickers}
+            self.signal_reference = "binance"
+        initial_signal = "global_pending" if self.signal_reference == "binance" else "local"
+        self.signal_sources: Dict[str, str] = {t: initial_signal for t in self.tickers}
         self.realtime_price_max_age: float = max(
             1.0, float(self.config.get("realtime_price_max_age_seconds", 30.0)))
         self.price_stream: Optional[LivePriceStream] = None
@@ -247,6 +291,10 @@ class QuantBot:
         self.market_regime: Optional[bool] = None
         # 청산 판정용 MA 상회 여부. 진입용 is_above_ma와 별도로 관리합니다.
         self.is_above_exit_ma: Dict[str, bool] = {t: False for t in self.tickers}
+        # 대시보드에 판정 결과뿐 아니라 실제 청산 기준 가격도 보여주기 위해 보존합니다.
+        # Binance 신호 사용 시 값의 단위는 USDT, 현지 신호 사용 시 KRW입니다.
+        self.exit_ma_values: Dict[str, float] = {t: 0.0 for t in self.tickers}
+        self.daily_exit_due: Dict[str, Optional[bool]] = {t: None for t in self.tickers}
 
         # GUI(트레이) 제어용 이벤트. pause_event가 set이면 매매 감시를 일시 중단합니다.
         self.pause_event = threading.Event()
@@ -501,7 +549,12 @@ class QuantBot:
         0이면 BTC도 다른 종목과 똑같이 순수 ATR/균등 사이징만 적용합니다.
         """
         equity = self.sizing_equity or self.capped_sizing_equity()
+        active_count = max(len(self.entry_tickers), 1)
         for ticker in self.tickers:
+            if ticker not in self.entry_tickers:
+                self.target_position_units[ticker] = 0.0
+                self.target_position_values[ticker] = 0.0
+                continue
             price = self.current_price(ticker) or 0.0
             if price <= 0:
                 self.target_position_units[ticker] = 0.0
@@ -510,7 +563,7 @@ class QuantBot:
             if self.position_sizing == "atr":
                 target_units = self.atr_target_units(ticker, price)
             else:
-                target_units = (equity / max(len(self.tickers), 1)) / price
+                target_units = (equity / active_count) / price
             if ticker == "BTC" and self.btc_min_weight > 0:
                 target_units = max(target_units, (equity * self.btc_min_weight) / price)
             self.target_position_units[ticker] = max(0.0, target_units)
@@ -532,6 +585,8 @@ class QuantBot:
 
     def ensure_position_target(self, ticker: str, price: float) -> None:
         """기동 직후/테스트처럼 목표 딕셔너리가 비어 있으면 해당 종목만 지연 산정."""
+        if ticker not in self.entry_tickers:
+            return
         if self.target_position_units.get(ticker, 0.0) > 0 or price <= 0:
             return
         equity = self.sizing_equity or self.capped_sizing_equity()
@@ -539,7 +594,7 @@ class QuantBot:
         if self.position_sizing == "atr":
             units = self.atr_target_units(ticker, price)
         else:
-            units = (equity / max(len(self.tickers), 1)) / price
+            units = (equity / max(len(self.entry_tickers), 1)) / price
         if ticker == "BTC" and self.btc_min_weight > 0:
             units = max(units, (equity * self.btc_min_weight) / price)
         self.target_position_units[ticker] = max(0.0, units)
@@ -938,6 +993,62 @@ class QuantBot:
             parts.append(f"⚠️ {ticker}(관리 제외)")
         return ", ".join(parts)
 
+    def _ensure_ticker_state(self, ticker: str) -> None:
+        defaults = {
+            "target_prices": 0.0, "is_above_ma": False, "effective_ks": 0.5,
+            "bought_today": False, "has_position": False, "position_units": 0.0,
+            "position_values": 0.0, "pending_buy_units": 0.0,
+            "target_position_units": 0.0, "target_position_values": 0.0,
+            "closed_today": False, "balance_zero_counts": 0,
+            "skipped_today": False, "entry_allowed": True, "filter_reason": "",
+            "atr_values": 0.0, "is_above_exit_ma": False,
+            "exit_ma_values": 0.0, "daily_exit_due": None,
+            "signal_sources": "global_pending",
+        }
+        for name, default in defaults.items():
+            state = getattr(self, name, None)
+            if isinstance(state, dict):
+                state.setdefault(ticker, default)
+        self.order_locks.setdefault(ticker, threading.Lock())
+
+    def refresh_auto_selection(self, force: bool = False) -> bool:
+        """주 1회 자동 6종을 갱신하고 과거 선정 종목은 청산 관리 대상으로 유지."""
+        if not automatic_enabled(self.config):
+            return False
+        week = datetime.now().strftime("%G-W%V")
+        if not force and self.selection_week == week:
+            return False
+        old_selected = set(self.auto_selected)
+        try:
+            result = select_live(self.exchange, self.config, force=force)
+            selected = [ExchangeBase.to_symbol(t) for t in result["selected"]]
+        except Exception as exc:
+            logger.warning("자동 종목 재선정 실패 - 기존 선정 유지: %s", exc)
+            return False
+        fixed = static_tickers(self.config)
+        new_entries = list(dict.fromkeys(fixed + selected))
+        additions = [t for t in new_entries if t not in self.tickers]
+        for ticker in additions:
+            self.tickers.append(ticker)
+            self._ensure_ticker_state(ticker)
+        self.auto_selected = selected
+        self.entry_tickers = new_entries
+        if self.exit_on_selection_drop:
+            dropped = [t for t in old_selected if t not in selected]
+            self.selection_drop_pending = list(dict.fromkeys(
+                self.selection_drop_pending + dropped))
+        self.selection_source = str(result["source"])
+        self.selection_week = week
+        if additions and self.price_stream is not None:
+            self.price_stream.stop()
+            stream = LivePriceStream(self.exchange.NAME, self.tickers)
+            self.price_stream = stream if stream.start() else None
+        logger.info(
+            "[자동 종목 선정] %s | 신규진입 %s | 청산관리 포함 %d종",
+            ", ".join(selected) or "없음", ", ".join(new_entries) or "없음",
+            len(self.tickers))
+        return True
+
     def validate_tickers(self) -> List[str]:
         """
         설정된 종목이 실제로 상장돼 있는지 확인하고, 없는 종목은 **관리에서 제외**합니다.
@@ -966,13 +1077,18 @@ class QuantBot:
             logger.info(f"[종목 확인] {t} = {markets[t]}")
 
         self.invalid_tickers = invalid
+        self.entry_tickers = [t for t in self.entry_tickers if t in valid]
+        self.auto_selected = [t for t in self.auto_selected if t in valid]
+        self.selection_drop_pending = [
+            t for t in self.selection_drop_pending if t in valid]
         if invalid:
             self.tickers = valid
             for key in ("target_prices", "is_above_ma", "effective_ks", "bought_today",
                         "has_position", "position_units", "position_values",
                         "pending_buy_units", "target_position_units", "target_position_values",
                         "closed_today", "balance_zero_counts", "skipped_today", "entry_allowed", "filter_reason",
-                        "atr_values", "is_above_exit_ma", "signal_sources", "order_locks"):
+                        "atr_values", "is_above_exit_ma", "exit_ma_values", "daily_exit_due",
+                        "signal_sources", "order_locks"):
                 d = getattr(self, key, None)
                 if isinstance(d, dict):
                     for t in invalid:
@@ -1079,6 +1195,13 @@ class QuantBot:
         옵션을 껐을 때 동작이 이전과 한 치도 달라지지 않아야 하므로,
         별도 상태(is_above_exit_ma)에 의존하지 않습니다.
         """
+        confirmed = self.daily_exit_due.get(ticker)
+        if confirmed is not None:
+            return not confirmed
+        if self.signal_sources.get(ticker) == "global_unavailable":
+            # An upstream outage blocks new entries but is not, by itself, a
+            # sell signal.  With no prior confirmed state, keep the position.
+            return True
         if self.exit_ma_window() == self.ma_window:
             return self.is_above_ma.get(ticker, False)
         return self.is_above_exit_ma.get(ticker, False)
@@ -1379,7 +1502,7 @@ class QuantBot:
             lines.append(
                 f"• <b>{label}</b> (현재가: {cur_price:,.0f}원)\n"
                 f"  - 당일 목표가: {tp:,.0f}원 (적용K: {eff_k:.4f})\n"
-                f"  - 신호 데이터: {self.signal_sources.get(ticker, 'local')}\n"
+                f"  - 신호 데이터: {self.signal_sources.get(ticker, 'global_pending')}\n"
                 f"  - 목표/보유/추가룸: {target_value:,.0f} / {held:,.0f} / {room:,.0f}원\n"
                 f"  - MA{self.ma_window} 상회: {ma_ok} | "
                 f"오늘 실제 매수: <b>{'체결' if bought else '없음'}</b>{blocked}"
@@ -1400,6 +1523,14 @@ class QuantBot:
         )
 
         summary_lines = []
+        self.refresh_auto_selection()
+        self.fee_info = refresh_from_exchange(self.exchange, self.tickers)
+        logger.info(
+            "[수수료] 매수 %.4f%% / 매도 %.4f%% (%s)",
+            self.fee_info["buy_rate"] * 100,
+            self.fee_info["sell_rate"] * 100,
+            self.fee_info["source"],
+        )
 
         # 국면 판정은 종목과 무관하므로 루프 밖에서 1회만 (API 호출 절약)
         self.market_regime = self.detect_market_regime()
@@ -1420,7 +1551,7 @@ class QuantBot:
                     df, ticker=ticker, use_dynamic_k=self.use_dynamic_k
                 )
 
-                # 선택 시 Binance USDT 일봉에서 방향(MA)과 동적 K를 공통으로 가져옵니다.
+                # 글로벌 일봉에서 방향(MA)과 동적 K를 공통으로 가져옵니다.
                 # 목표가의 시가/전일범위와 ATR은 실제 주문이 체결되는 KRW 거래소 데이터를
                 # 유지해 환율·김치프리미엄·현지 변동성을 버리지 않습니다.
                 signal_df = df
@@ -1438,18 +1569,28 @@ class QuantBot:
                         eval_res["target_price"] = self.strategy_engine.calculate_target_price(
                             df, k=effective_k, use_dynamic_k=False)
                         signal_df = reference_df
-                        self.signal_sources[ticker] = "binance"
+                        self.signal_sources[ticker] = "global"
                     else:
-                        logger.warning(f"[{ticker}] Binance 기준신호 없음 - 현지 일봉으로 대체")
+                        self.target_prices[ticker] = 0.0
+                        self.is_above_ma[ticker] = False
+                        self.signal_sources[ticker] = "global_unavailable"
+                        logger.error(
+                            f"[{ticker}] 글로벌 기준신호 없음 - 국내 데이터로 대체하지 않고 "
+                            "해당 종목 매매를 중지합니다")
+                        continue
 
                 self.target_prices[ticker] = eval_res["target_price"]
                 self.is_above_ma[ticker] = eval_res["is_above_ma"]
                 # 하락 국면이면 더 짧은 MA로 청산을 판정 (진입 기준은 그대로)
-                self.is_above_exit_ma[ticker] = (
-                    self.is_above_ma[ticker] if exit_ma == self.ma_window
-                    else float(signal_df["close"].iloc[-1])
-                    > self.strategy_engine.calculate_ma(signal_df, exit_ma)
+                exit_ma_value = (
+                    float(eval_res.get("ma_value") or 0.0)
+                    if exit_ma == self.ma_window
+                    else float(self.strategy_engine.calculate_ma(signal_df, exit_ma))
                 )
+                self.exit_ma_values[ticker] = exit_ma_value
+                previous_close = float(signal_df["close"].iloc[-2])
+                self.is_above_exit_ma[ticker] = previous_close > exit_ma_value
+                self.daily_exit_due[ticker] = previous_close <= exit_ma_value
                 self.effective_ks[ticker] = eval_res["effective_k"]
                 if reset_session_state:
                     self.bought_today[ticker] = False
@@ -1480,6 +1621,8 @@ class QuantBot:
                     df, self.atr_window)
 
                 allowed, reason = self.evaluate_entry_filters(ticker)
+                if ticker not in self.entry_tickers:
+                    allowed, reason = False, "자동 선정 제외(청산 관리만)"
                 self.entry_allowed[ticker] = allowed
                 self.filter_reason[ticker] = reason
 
@@ -1531,6 +1674,73 @@ class QuantBot:
         self.restore_daily_state()
         logger.info("=" * 65)
 
+    def refresh_period_regime(self) -> bool:
+        """Recompute the period strategy state from completed global BTC candles."""
+        if not self.period_strategy:
+            return False
+        score_config = self.config.get("regime_scoring") or {}
+        long_window = int(score_config.get(
+            "long_ma", self.config.get("regime_long_ma", 120)))
+        need = max(long_window + 90, 220)
+        try:
+            if bool(score_config.get("use_for_live", False)):
+                logger.error(
+                    "[기간리밸런싱] 연구용 3국면 라우팅은 실거래에 아직 지원되지 "
+                    "않습니다. 기존 확인형 글로벌 MA 판정을 유지합니다.")
+            frame = fetch_binance_daily("BTC", limit=need)
+            if frame is None or len(frame) < long_window + 2:
+                logger.warning("[기간리밸런싱] 글로벌 BTC 국면 데이터 부족 - 기존 상태 유지")
+                return False
+            state = current_regime_from_config(frame["close"], self.config)
+        except Exception as exc:
+            logger.error("[기간리밸런싱] 글로벌 BTC 국면 산출 실패: %s", exc)
+            return False
+        previous = self.period_bull_previous
+        self.period_bull = state
+        self.period_regime_changed = previous is not None and previous != state
+        self.period_bull_previous = state
+        logger.info("[기간리밸런싱] 글로벌 BTC 국면=%s%s", "상승장" if state else "방어",
+                    " (전환)" if self.period_regime_changed else "")
+        return state
+
+    def execute_period_rebalance(self) -> List[str]:
+        """Sell managed positions and distribute available KRW equally."""
+        if self.pause_event.is_set() or not self.period_bull:
+            return []
+        names = [t for t in self.entry_tickers if t in self.tickers]
+        if not names:
+            return []
+        for ticker in self.tickers:
+            units = self.exchange.get_balance(ticker, use_available=True)
+            price = self.current_price(ticker) or 0.0
+            if units <= 0 or units * price < self.exchange.MIN_ORDER_KRW:
+                continue
+            code = (self.store.next_order_code(self.exchange.NAME, ticker, self.trade_date())
+                    if self.store is not None else None)
+            result = self.exchange.sell_market(ticker, units=units, order_code=code)
+            if result:
+                self._record_order(result, "sell", ticker)
+        available = float(self.exchange.get_balance("KRW", use_available=True) or 0.0)
+        budget = available / len(names) if names else 0.0
+        bought = []
+        for ticker in names:
+            if budget < self.exchange.MIN_ORDER_KRW:
+                break
+            code = (self.store.next_order_code(self.exchange.NAME, ticker, self.trade_date())
+                    if self.store is not None else None)
+            result = self.exchange.buy_market(ticker, budget_krw=budget, order_code=code)
+            if result:
+                self._record_order(result, "buy", ticker)
+                self.bought_today[ticker] = True
+                bought.append(ticker)
+        self.last_period_rebalance_week = datetime.now().strftime("%G-W%V")
+        self.sync_positions(notify=False)
+        if bought:
+            self.notifier.send_message(
+                "🔄 <b>[기간리밸런싱 즉시 진입]</b>\n" +
+                "\n".join(f"• {ticker}: 균등 시장가 매수" for ticker in bought))
+        return bought
+
     def daily_routine(self):
         """
         [일일 루틴] 일봉 갱신 직후 실행.
@@ -1541,7 +1751,22 @@ class QuantBot:
         이제는 먼저 새 세션의 지표를 산출한 뒤, 그 결과로 보유/청산을 결정합니다.
         """
         self.update_daily_settings()   # 1) 평가 (읽기 전용)
-        self.rebalance_positions()     # 2) 결과 반영 (매도/보유 결정)
+        if self.period_strategy:
+            self.refresh_period_regime()
+            week = datetime.now().strftime("%G-W%V")
+            if self.period_bull:
+                if self.period_regime_changed or self.last_period_rebalance_week != week:
+                    self.execute_period_rebalance()
+                return
+            if self.period_regime_changed:
+                # 상승장 균등 포지션을 정리한 뒤 다음 세션부터 ATR 돌파로 방어 운용.
+                self.liquidate_position()
+        self.liquidate_selection_drops()
+        if self.exit_timing == "daily":
+            self.rebalance_positions()     # 2) 종가 확정 결과 반영
+        else:
+            for ticker in self.tickers:
+                self.check_intraday_exit(ticker)
 
     def rebalance_positions(self):
         """
@@ -1652,6 +1877,116 @@ class QuantBot:
 
         logger.info("=" * 65)
 
+    def liquidate_selection_drops(self) -> List[str]:
+        """자동 TOP6 탈락 종목을 전량 시장가 청산하고 당일 재진입을 차단."""
+        if (not self.exit_on_selection_drop or self.pause_event.is_set()
+                or not self.selection_drop_pending):
+            return []
+        exited: List[str] = []
+        for ticker in list(self.selection_drop_pending):
+            lock = self.order_locks.get(ticker)
+            if lock is None or not lock.acquire(blocking=False):
+                continue
+            try:
+                price = self.current_price(ticker) or 0.0
+                units = self.exchange.get_balance(ticker, use_available=True)
+                if units <= 0 or units * price < self.exchange.MIN_ORDER_KRW:
+                    self.selection_drop_pending.remove(ticker)
+                    continue
+                order_code = (self.store.next_order_code(
+                    self.exchange.NAME, ticker, self.trade_date())
+                    if self.store is not None else None)
+                result = self.exchange.sell_market(
+                    ticker, units=units, order_code=order_code)
+                if not result:
+                    continue
+                self._record_order(result, "sell", ticker)
+                self.has_position[ticker] = False
+                self.position_units[ticker] = 0.0
+                self.position_values[ticker] = 0.0
+                self.pending_buy_units[ticker] = 0.0
+                self.target_position_units[ticker] = 0.0
+                self.target_position_values[ticker] = 0.0
+                self.closed_today[ticker] = True
+                self.selection_drop_pending.remove(ticker)
+                exited.append(ticker)
+                if self.store is not None:
+                    self.store.upsert_daily_state(
+                        self.exchange.NAME, ticker, self.trade_date(),
+                        has_position=False, position_units=0.0, position_value=0.0,
+                        target_units=0.0, target_value=0.0)
+            except Exception as exc:
+                logger.error("[%s] 자동 선정 탈락 청산 실패: %s", ticker, exc)
+            finally:
+                lock.release()
+        if exited:
+            self.notifier.send_message(
+                "🔁 <b>[자동 선정 탈락 청산]</b>\n"
+                + "\n".join(f"• {ticker}: 전량 시장가 매도" for ticker in exited))
+        return exited
+
+    def _exit_signal_price(self, ticker: str, local_price: float) -> Optional[float]:
+        source = self.signal_sources.get(ticker)
+        if source in {"global_pending", "global_unavailable"}:
+            return None
+        if source != "global":
+            return local_price
+        cached = self._reference_price_cache.get(ticker)
+        now = time.monotonic()
+        if cached and now - cached[1] <= 2.0:
+            return cached[0]
+        price = fetch_binance_price(ticker)
+        if price is not None:
+            self._reference_price_cache[ticker] = (price, now)
+        return price
+
+    def check_intraday_exit(self, ticker: str,
+                            local_price: Optional[float] = None) -> bool:
+        """전일까지 확정된 MA를 현재가가 이탈하면 한 번만 즉시 시장가 청산."""
+        if self.exit_timing != "intraday" or self.closed_today.get(ticker, False):
+            return False
+        threshold = float(self.exit_ma_values.get(ticker, 0.0) or 0.0)
+        if threshold <= 0:
+            return False
+        local_price = local_price or self.current_price(ticker)
+        if local_price is None or local_price <= 0:
+            return False
+        signal_price = self._exit_signal_price(ticker, local_price)
+        if signal_price is None or signal_price > threshold:
+            return False
+
+        lock = self.order_locks[ticker]
+        if not lock.acquire(blocking=False):
+            return False
+        try:
+            units = self.exchange.get_balance(ticker, use_available=True)
+            if units <= 0 or units * local_price < self.exchange.MIN_ORDER_KRW:
+                return False
+            order_code = (self.store.next_order_code(
+                self.exchange.NAME, ticker, self.trade_date())
+                if self.store is not None else None)
+            result = self.exchange.sell_market(
+                ticker, units=units, order_code=order_code)
+            if not result:
+                return False
+            self._record_order(result, "sell", ticker)
+            self.has_position[ticker] = False
+            self.position_units[ticker] = 0.0
+            self.position_values[ticker] = 0.0
+            self.pending_buy_units[ticker] = 0.0
+            self.closed_today[ticker] = True
+            if self.store is not None:
+                self.store.upsert_daily_state(
+                    self.exchange.NAME, ticker, self.trade_date(),
+                    has_position=False, position_units=0.0, position_value=0.0)
+            self.notifier.send_message(
+                f"🔴 <b>[{ticker} 실시간 청산]</b> "
+                f"현재 {signal_price:,.4f} ≤ MA {threshold:,.4f} "
+                f"(현지 체결가 약 {local_price:,.0f}원)")
+            return True
+        finally:
+            lock.release()
+
     def monitor_market(self):
         """
         [실시간 감시 루틴] 1초 간격 호출.
@@ -1660,9 +1995,17 @@ class QuantBot:
         """
         if self.pause_event.is_set():
             return
+        self.liquidate_selection_drops()
 
+        if self.period_strategy and self.period_bull:
+            return
         for ticker in self.tickers:
             try:
+                monitored_price: Optional[float] = None
+                if self.exit_timing == "intraday":
+                    monitored_price = self.current_price(ticker)
+                    if self.check_intraday_exit(ticker, monitored_price):
+                        continue
                 target_price = self.target_prices.get(ticker, 0.0)
                 is_above_ma = self.is_above_ma.get(ticker, False)
 
@@ -1676,7 +2019,7 @@ class QuantBot:
                         ticker, f"진입 필터: {self.filter_reason.get(ticker, '사유 미상')}")
                     continue
 
-                current_price: Optional[float] = self.current_price(ticker)
+                current_price: Optional[float] = monitored_price or self.current_price(ticker)
                 if current_price is None or current_price <= 0:
                     continue
 
@@ -1764,6 +2107,10 @@ class QuantBot:
 
         # 2. 봇 시작 시 즉시 세팅 수행 (끝에서 당일 상태를 복구)
         self.update_daily_settings()
+        # 기간리밸런싱은 재시작 직후에도 현재 국면을 먼저 확정해야 상승장에서
+        # 실시간 변동성돌파 감시가 잘못 주문을 내지 않습니다.
+        if self.period_strategy:
+            self.refresh_period_regime()
 
         # 3. 스케줄러 등록
         #    일봉 갱신 직후 '평가 -> 포지션 재조정' 순서로 한 번에 처리합니다.

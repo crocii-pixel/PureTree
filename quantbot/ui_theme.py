@@ -42,6 +42,10 @@ COLORS: Dict[str, str] = {
     "danger": "#F2726B",       # 오류/정지
     "danger_dim": "#3A1F1E",
     "info": "#6BA8F2",
+    "cyan": "#57D7FF",
+    "violet": "#C69CFF",
+    "gold": "#FFD166",
+    "mint": "#59F0A7",
 }
 
 FONT_UI = '"Segoe UI Variable Text", "Segoe UI", "맑은 고딕", "Malgun Gothic", sans-serif'
@@ -133,6 +137,18 @@ QLabel#Hint {{
     color: {c['text_muted']};
     font-size: 11px;
 }}
+QLabel#HintStrong {{
+    color: {c['text_dim']};
+    font-size: 12px;
+}}
+QLabel#BacktestSummary {{
+    background-color: {c['elevated']};
+    color: #FFFFFF;
+    border: 1px solid #3B4149;
+    border-radius: 9px;
+    padding: 12px 14px;
+    font-size: 13px;
+}}
 
 /* ---------- 상태 배지 ---------- */
 QLabel#Pill {{
@@ -177,6 +193,12 @@ QPushButton#Ghost {{
     color: {c['text_dim']};
 }}
 QPushButton#Ghost:hover {{ background-color: {c['elevated']}; color: {c['text']}; }}
+QPushButton#Danger {{
+    background-color: {c['danger_dim']};
+    color: {c['danger']};
+    border-color: #6B3331;
+}}
+QPushButton#Danger:hover {{ background-color: #512725; color: #FF9B94; }}
 
 /* ---------- 입력 ---------- */
 QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {{
@@ -259,6 +281,21 @@ QHeaderView::section {{
     font-size: 11px;
     font-weight: 600;
     letter-spacing: 0.5px;
+}}
+QTableWidget#BacktestTable {{
+    background-color: #111419;
+    alternate-background-color: #1A1F26;
+    border: 1px solid #323943;
+    gridline-color: #252B33;
+    color: #F4F7FA;
+}}
+QTableWidget#BacktestTable::item {{
+    padding: 7px 9px;
+    border-bottom: 1px solid #2A3038;
+}}
+QTableWidget#BacktestTable::item:selected {{
+    background-color: #244A5C;
+    color: #FFFFFF;
 }}
 QTableCornerButton::section {{ background-color: {c['surface']}; border: none; }}
 

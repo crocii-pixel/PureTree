@@ -43,7 +43,6 @@ import pandas as pd
 logger = logging.getLogger("BacktestConfig")
 
 INITIAL_CAPITAL = 10_000_000.0
-FEE_RATE = 0.0005 * 2          # 왕복 마찰비용 (수수료 + 슬리피지 근사)
 NOISE_WINDOW = 20              # 동적 K 산출 기간
 BTC_DECLINE_WINDOW = 20
 
@@ -63,7 +62,8 @@ def add_indicators(raw: pd.DataFrame, ma_windows: List[int], atr_window: int) ->
 
     prev_close = d["close"].shift(1)
     for w in set(ma_windows):
-        d[f"above_ma{w}"] = prev_close >= prev_close.rolling(w).mean()
+        d[f"ma{w}"] = prev_close.rolling(w).mean()
+        d[f"above_ma{w}"] = prev_close >= d[f"ma{w}"]
 
     true_range = pd.concat([
         d["high"] - d["low"],
@@ -84,6 +84,23 @@ def _align_by_date(series: pd.Series, target_index: pd.Index) -> pd.Series:
     return pd.Series(source.reindex(target_dates).values, index=target_index)
 
 
+def _align_asof(series: pd.Series, target_index: pd.Index) -> pd.Series:
+    """Use the latest regime decision available at each domestic session time."""
+    source = series.dropna().sort_index().copy()
+    if source.empty:
+        return pd.Series(index=target_index, dtype=series.dtype)
+    source_index = pd.DatetimeIndex(source.index)
+    target_dates = pd.DatetimeIndex(target_index)
+    if source_index.tz is not None:
+        source_index = source_index.tz_convert("Asia/Seoul").tz_localize(None)
+    if target_dates.tz is not None:
+        target_dates = target_dates.tz_convert("Asia/Seoul").tz_localize(None)
+    source.index = source_index
+    positions = source.index.searchsorted(target_dates, side="right") - 1
+    values = [source.iloc[pos] if pos >= 0 else np.nan for pos in positions]
+    return pd.Series(values, index=target_index)
+
+
 def attach_reference_signals(local: pd.DataFrame, reference: pd.DataFrame,
                              ma_windows: List[int], atr_window: int) -> pd.DataFrame:
     """현지 가격 프레임에 Binance K·MA 열만 날짜 기준으로 붙입니다."""
@@ -93,13 +110,19 @@ def attach_reference_signals(local: pd.DataFrame, reference: pd.DataFrame,
     for window in set(ma_windows):
         out[f"signal_above_ma{window}"] = _align_by_date(
             ref[f"above_ma{window}"], out.index).fillna(out[f"above_ma{window}"]).astype(bool)
+        out[f"signal_ma{window}"] = _align_by_date(
+            ref[f"ma{window}"], out.index).fillna(out[f"ma{window}"])
+    for column in ("open", "low"):
+        out[f"signal_{column}"] = _align_by_date(ref[column], out.index)
+    out["signal_N"] = _align_by_date(ref["N"], out.index).fillna(out["N"])
     out["signal_target"] = out["open"] + out["prev_range"] * out["signal_k"]
     return out
 
 
 def market_context(btc_raw: pd.DataFrame, config: Dict[str, Any],
                    era_source: Optional[pd.DataFrame] = None,
-                   signal_source: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+                   signal_source: Optional[pd.DataFrame] = None,
+                   regime_source: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """
     종목과 무관한 시장 상태를 일봉 인덱스로 만듭니다.
 
@@ -111,6 +134,8 @@ def market_context(btc_raw: pd.DataFrame, config: Dict[str, Any],
 
     # BTC 당일 돌파 여부 (동반 돌파 확인용)
     signal_raw = signal_source if signal_source is not None else btc_raw
+    ctx["regime_close"] = _align_by_date(
+        pd.to_numeric(signal_raw["close"], errors="coerce"), ctx.index)
     b = add_indicators(signal_raw, [int(config.get("ma_window", 10))],
                        int(config.get("atr_window", 20)))
     ma = int(config.get("ma_window", 10))
@@ -142,6 +167,32 @@ def market_context(btc_raw: pd.DataFrame, config: Dict[str, Any],
         ctx["explosive"] = False
     ctx["era_cagr"] = era
 
+    # 복합 국면 진단도 동일한 글로벌 BTC 원본에서 한 번만 계산합니다. 차트와
+    # 기간리밸런싱 백테스트가 이 열을 공유하므로 서로 다른 거래소 가격으로
+    # 반대 국면을 내는 문제가 생기지 않습니다.
+    try:
+        from regime_scoring import build_regime_frame
+        diagnostic = build_regime_frame(
+            regime_source if regime_source is not None else signal_raw, config)
+        for source, target in (
+            ("direction_score", "regime_score"),
+            ("expansion_score", "regime_expansion"),
+            ("breadth", "regime_breadth"),
+            ("coverage", "regime_coverage"),
+            ("hard_exit", "regime_hard_exit"),
+            ("risk_on", "regime_risk_on"),
+            ("regime", "regime_label"),
+            ("haltu_score", "regime_dual_ma"),
+            ("log_macd_score", "regime_log_macd"),
+            ("breakout_score", "regime_breakout"),
+            ("lower_channel_score", "regime_lower_channel"),
+            ("bull_signal", "regime_bull_signal"),
+            ("bear_signal", "regime_bear_signal"),
+        ):
+            ctx[target] = _align_asof(diagnostic[source], ctx.index)
+    except (ValueError, KeyError) as exc:
+        logger.warning("복합 국면 진단 생성 실패: %s", exc)
+
     return ctx.fillna({"btc_broke": False, "btc_declining": False})
 
 
@@ -165,6 +216,12 @@ def run_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
         두 값을 모두 돌려 **구간으로** 읽는 것이 정직합니다.
     :return: 지표 딕셔너리 (자산곡선·월별수익 포함)
     """
+    score_cfg = config.get("regime_scoring") or {}
+    if (str(config.get("investment_strategy", "volatility_breakout")) == "period_rebalance"
+            or bool(score_cfg.get("use_for_backtest", False))):
+        from tools.backtest_period import run_period_backtest
+        return run_period_backtest(config, data, ctx, start, end)
+
     ma = int(config.get("ma_window", 10))
     bear_ma = int(config.get("bear_exit_ma_window", 5))
     sizing = str(config.get("position_sizing", "equal")).lower()
@@ -177,7 +234,13 @@ def run_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
     sizing_cap = max(0.0, float(config.get("sizing_equity_cap_krw", 0.0)))
     refill_threshold = max(
         0.0, min(1.0, float(config.get("position_refill_threshold", 0.95))))
-    use_reference = str(config.get("signal_reference", "local")).lower() == "binance"
+    use_reference = str(config.get("signal_reference", "binance")).lower() == "binance"
+    exit_timing = str(config.get("exit_timing", "daily")).lower()
+    slippage = max(0.0, float(config.get("backtest_slippage_rate", 0.001) or 0.0))
+    from fee_manager import resolve_fee_info
+    fee_info = resolve_fee_info(config)
+    buy_fee = float(fee_info["buy_rate"])
+    sell_fee = float(fee_info["sell_rate"])
 
     tickers = list(data)
     dates = sorted(set().union(*[set(df.index) for df in data.values()]))
@@ -197,6 +260,10 @@ def run_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
     blocked = {"btc_confirm": 0, "btc_decline": 0}
     buy_orders = 0
     cash_ratios: List[float] = []
+    auto_selection = bool(
+        config.get("additional_selection_enabled")
+        and str(config.get("additional_selection_mode", "manual")).lower() == "auto")
+    exit_on_selection_drop = bool(config.get("exit_on_selection_drop", True))
 
     for date in dates:
         row_ctx = ctx.loc[date]
@@ -204,7 +271,15 @@ def run_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
         # 폭등기에는 모든 보조 옵션이 해제됩니다 (들고 가는 것이 최선인 구간)
         exit_ma = bear_ma if (use_bear_exit and not explosive
                               and not bool(row_ctx["bull"])) else ma
+        active_tickers = [
+            ticker for ticker in tickers
+            if date in data[ticker].index
+            and (not auto_selection
+                 or bool(data[ticker].loc[date].get("auto_selected", False)))
+        ]
+        active_count = max(len(active_tickers), 1)
 
+        closed_today = set()
         # ---------- 1) 청산 ----------
         for ticker in list(positions):
             df = data[ticker]
@@ -213,12 +288,39 @@ def run_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
             r = df.loc[date]
             exit_col = (f"signal_above_ma{exit_ma}" if use_reference
                         and f"signal_above_ma{exit_ma}" in r.index else f"above_ma{exit_ma}")
-            if bool(r[exit_col]):
+            exit_price = None
+            exit_reason = None
+            if (auto_selection and exit_on_selection_drop
+                    and not bool(r.get("auto_selected", False))):
+                exit_price = float(r["open"])
+                exit_reason = "selection_drop"
+            elif exit_timing == "intraday":
+                ma_col = (f"signal_ma{exit_ma}" if use_reference
+                          and f"signal_ma{exit_ma}" in r.index else f"ma{exit_ma}")
+                stop = float(r[ma_col])
+                signal_open = (float(r.get("signal_open", r["open"]))
+                               if use_reference else float(r["open"]))
+                signal_low = (float(r.get("signal_low", r["low"]))
+                              if use_reference else float(r["low"]))
+                if signal_open <= stop:
+                    exit_price = float(r["open"])
+                    exit_reason = "ma_intraday_gap"
+                elif signal_low <= stop:
+                    ratio = (float(r["open"]) / signal_open
+                             if use_reference and signal_open > 0 else 1.0)
+                    exit_price = stop * ratio
+                    exit_reason = "ma_intraday"
+            elif not bool(r[exit_col]):
+                exit_price = float(r["open"])
+                exit_reason = "ma_daily"
+            if exit_price is None:
                 continue
             pos = positions.pop(ticker)
-            proceeds = pos["units"] * float(r["open"]) * (1 - FEE_RATE)
+            proceeds = pos["units"] * exit_price * (1 - slippage) * (1 - sell_fee)
             cash += proceeds
+            closed_today.add(ticker)
             trades.append({"date": date, "ticker": ticker,
+                           "reason": exit_reason,
                            "return": proceeds / pos["cost"] - 1.0,
                            "profit": proceeds - pos["cost"]})
 
@@ -239,7 +341,7 @@ def run_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
                 if sizing == "atr":
                     btc_atr_units = (sizing_equity * risk) / (stop_mult * float(br["N"]))
                 else:
-                    btc_atr_units = (sizing_equity / len(tickers)) / btc_price
+                    btc_atr_units = (sizing_equity / active_count) / btc_price
                 btc_target_units = max(
                     btc_atr_units, (sizing_equity * btc_min_weight) / btc_price)
                 held_units = positions.get("BTC", {}).get("units", 0.0)
@@ -248,10 +350,14 @@ def run_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
 
         # ---------- 2) 진입 ----------
         for ticker in tickers:
+            if ticker in closed_today:
+                continue
             df = data[ticker]
             if date not in df.index:
                 continue
             r = df.loc[date]
+            if auto_selection and not bool(r.get("auto_selected", False)):
+                continue
             target_col = ("signal_target" if use_reference
                           and "signal_target" in r.index else "target")
             ma_col = (f"signal_above_ma{ma}" if use_reference
@@ -274,10 +380,11 @@ def run_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
             # BTC 확인을 기다리다 늦게 들어가는 경우를 비관적으로 모사
             if use_confirm and not is_btc and not explosive and confirm_fill == "close":
                 entry = max(entry, float(r["close"]))
+            entry *= (1 + slippage)
             if sizing == "atr":
                 target_units = (sizing_equity * risk) / (stop_mult * float(r["N"]))
             else:
-                target_units = (sizing_equity / len(tickers)) / entry
+                target_units = (sizing_equity / active_count) / entry
             if is_btc and btc_min_weight > 0:
                 target_units = max(
                     target_units, (sizing_equity * btc_min_weight) / entry)
@@ -286,13 +393,13 @@ def run_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
             if held_units >= target_units * refill_threshold:
                 continue
             gap_units = max(0.0, target_units - held_units)
-            budget = gap_units * entry * (1 + FEE_RATE)
+            budget = gap_units * entry * (1 + buy_fee)
             spendable = cash if is_btc else max(0.0, cash - btc_reserved)
             budget = min(budget, spendable)
             if budget <= 0:
                 continue
 
-            bought_units = budget / (entry * (1 + FEE_RATE))
+            bought_units = budget / (entry * (1 + buy_fee))
             old = positions.get(ticker, {"units": 0.0, "cost": 0.0, "entry": entry})
             positions[ticker] = {"units": old["units"] + bought_units,
                                  "cost": old["cost"] + budget, "entry": entry}
@@ -300,6 +407,26 @@ def run_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
             buy_orders += 1
             if is_btc:
                 btc_reserved = max(0.0, btc_reserved - budget)
+
+            # 진입과 이탈이 한 일봉에 함께 보이면 보수적으로 진입 후 청산합니다.
+            if exit_timing == "intraday":
+                stop_col = (f"signal_ma{exit_ma}" if use_reference
+                            and f"signal_ma{exit_ma}" in r.index else f"ma{exit_ma}")
+                stop = float(r[stop_col])
+                signal_low = (float(r.get("signal_low", r["low"]))
+                              if use_reference else float(r["low"]))
+                if signal_low <= stop:
+                    signal_open = float(r.get("signal_open", r["open"]))
+                    ratio = (float(r["open"]) / signal_open
+                             if use_reference and signal_open > 0 else 1.0)
+                    fill = min(entry / (1 + slippage), stop * ratio) * (1 - slippage)
+                    pos = positions.pop(ticker)
+                    proceeds = pos["units"] * fill * (1 - sell_fee)
+                    cash += proceeds
+                    trades.append({"date": date, "ticker": ticker,
+                                   "return": proceeds / pos["cost"] - 1.0,
+                                   "profit": proceeds - pos["cost"]})
+                    closed_today.add(ticker)
 
         holdings = sum(
             p["units"] * float(data[t].loc[date, "close"])
@@ -315,7 +442,7 @@ def run_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
     for ticker, pos in list(positions.items()):
         df = data[ticker]
         price = float(df.loc[last, "close"]) if last in df.index else pos["entry"]
-        proceeds = pos["units"] * price * (1 - FEE_RATE)
+        proceeds = pos["units"] * price * (1 - slippage) * (1 - sell_fee)
         cash += proceeds
         trades.append({"date": last, "ticker": ticker,
                        "return": proceeds / pos["cost"] - 1.0,
@@ -353,6 +480,13 @@ def run_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
         "양의달_비율%": round(float((monthly > 0).mean()) * 100, 1) if len(monthly) else None,
         "차단_동반돌파": blocked["btc_confirm"],
         "차단_BTC하락": blocked["btc_decline"],
+        "fee_info": fee_info,
+        "slippage_rate": slippage,
+        "exit_timing": exit_timing,
+        "selection_mode": "auto" if auto_selection else "fixed_manual",
+        "exit_on_selection_drop": exit_on_selection_drop,
+        "selection_drop_exits": sum(
+            1 for trade in trades if trade.get("reason") == "selection_drop"),
         "_equity": equity_series,
         "_monthly": monthly,
         "_trades": trades,
@@ -368,21 +502,34 @@ def prepare_data(config: Dict[str, Any], refresh: bool = False):
 
     :return: (종목별 지표 DataFrame, 시장 상태 DataFrame, 제외된 종목)
     """
-    from tools.market_data import fetch_binance_reference, fetch_ohlcv, fetch_upbit
+    from tools.market_data import (fetch_binance_reference, fetch_ohlcv, fetch_upbit,
+                                   load_auto_selection_frames)
+    from universe_selector import (automatic_enabled, build_weekly_schedule,
+                                   selection_config, static_tickers)
 
     ma = int(config.get("ma_window", 10))
     bear_ma = int(config.get("bear_exit_ma_window", 5))
     atr_w = int(config.get("atr_window", 20))
     windows = [ma, bear_ma]
 
-    tickers = [str(t).upper() for t in (config.get("tickers") or ["BTC"])]
+    tickers = [str(t).upper() for t in (static_tickers(config) or ["BTC"])]
+    selection_frames: Dict[str, pd.DataFrame] = {}
+    selection_schedule: Dict[pd.Timestamp, List[str]] = {}
+    if automatic_enabled(config):
+        selection_frames = load_auto_selection_frames(refresh=refresh)
+        btc_calendar = fetch_upbit("BTC", refresh=refresh)
+        selection_schedule = build_weekly_schedule(
+            selection_frames, config, btc_calendar.index if btc_calendar is not None else [])
+        selected_union = sorted({
+            ticker for chosen in selection_schedule.values() for ticker in chosen})
+        tickers = list(dict.fromkeys(tickers + selected_union))
     if "BTC" not in tickers:
         tickers = ["BTC"] + tickers          # 기준 종목은 항상 필요
 
     data: Dict[str, pd.DataFrame] = {}
     missing: List[str] = []
     references: Dict[str, pd.DataFrame] = {}
-    use_reference = str(config.get("signal_reference", "local")).lower() == "binance"
+    use_reference = str(config.get("signal_reference", "binance")).lower() == "binance"
     for ticker in tickers:
         raw = fetch_upbit(ticker, refresh=refresh)
         if raw is None or len(raw) < 200:
@@ -390,12 +537,28 @@ def prepare_data(config: Dict[str, Any], refresh: bool = False):
             continue
         local = add_indicators(raw, windows, atr_w)
         if use_reference:
-            reference = fetch_binance_reference(ticker, refresh=refresh)
+            reference = selection_frames.get(ticker)
+            if reference is None:
+                reference = fetch_binance_reference(ticker, refresh=refresh)
             if reference is not None and len(reference) >= 200:
                 references[ticker] = reference
                 local = attach_reference_signals(local, reference, windows, atr_w)
             else:
-                logger.warning(f"[{ticker}] Binance 백테스트 기준신호 없음 - 현지 신호로 대체")
+                logger.warning(
+                    f"[{ticker}] 글로벌 백테스트 기준신호 없음 - 국내 데이터로 "
+                    "대체하지 않고 제외")
+                missing.append(ticker)
+                continue
+        if automatic_enabled(config):
+            opts = selection_config(config)
+            fixed = set(opts["fixed"] if opts["fixed_enabled"] else [])
+            chosen_by_date = {
+                pd.Timestamp(day).normalize(): set(chosen)
+                for day, chosen in selection_schedule.items()}
+            local["auto_selected"] = [
+                ticker in fixed or ticker in chosen_by_date.get(pd.Timestamp(day).normalize(), set())
+                for day in local.index
+            ]
         data[ticker] = local
 
     if "BTC" not in data:
@@ -403,10 +566,81 @@ def prepare_data(config: Dict[str, Any], refresh: bool = False):
 
     btc_raw = fetch_upbit("BTC", refresh=refresh)
     era_source = fetch_ohlcv("bitstamp", "BTC/USD")     # 폭등기 판정용 15년치
-    ctx = market_context(btc_raw, config, era_source, references.get("BTC"))
+    # 국면은 설정의 현지/글로벌 K 선택과 무관하게 항상 글로벌 BTC를 사용합니다.
+    global_btc = None
+    regime_btc = None
+    regime_dataset_id = None
+    from regime_scoring import scoring_config
+    score_cfg = scoring_config(config)
+    regime_interval = str(score_cfg.get("decision_interval", "1d"))
+    composite_requested = bool(score_cfg.get("use_for_backtest", False))
+    try:
+        from global_market_data import (DATASET_ID, ensure_global_btc_current,
+                                        load_global_btc)
+        ensure_global_btc_current(lock_timeout=15.0)
+        global_btc = load_global_btc("1d")
+        if global_btc is not None and not global_btc.empty:
+            index = pd.DatetimeIndex(pd.to_datetime(
+                global_btc.pop("timestamp"), utc=True, errors="coerce"))
+            global_btc.index = index.tz_convert("Asia/Seoul").tz_localize(None)
+            global_btc = global_btc[["open", "high", "low", "close", "volume"]]
+            regime_dataset_id = DATASET_ID
+            regime_btc = global_btc
+            if composite_requested and regime_interval != "1d":
+                from regime_chart import (CHART_INTERVAL_SECONDS,
+                                          aggregate_chart_frame)
+                source_interval = ("1d" if regime_interval in {"1w", "1mo"}
+                                   else regime_interval)
+                warmup_bars = max(
+                    420, int(score_cfg.get("long_ma", 120)) + 10,
+                    int(score_cfg.get("macd_slow", 60))
+                    + int(score_cfg.get("macd_signal", 9)) + 190)
+                first_local = pd.Timestamp(btc_raw.index.min())
+                last_local = pd.Timestamp(btc_raw.index.max())
+                start = first_local - pd.Timedelta(
+                    seconds=CHART_INTERVAL_SECONDS[regime_interval] * warmup_bars)
+                end = last_local + pd.Timedelta(days=2)
+                raw_regime = load_global_btc(source_interval, start=start, end=end)
+                raw_regime = aggregate_chart_frame(raw_regime, regime_interval)
+                regime_index = pd.DatetimeIndex(pd.to_datetime(
+                    raw_regime.pop("timestamp"), utc=True, errors="coerce"))
+                raw_regime.index = regime_index.tz_convert(
+                    "Asia/Seoul").tz_localize(None)
+                regime_btc = raw_regime[["open", "high", "low", "close", "volume"]]
+                if len(regime_btc) < max(
+                        int(score_cfg.get("long_ma", 120)),
+                        int(score_cfg.get("macd_slow", 60))) + 5:
+                    raise RuntimeError(
+                        f"{regime_interval} 국면 판정 데이터가 부족합니다")
+                regime_dataset_id = f"{DATASET_ID}:{regime_interval}"
+    except Exception as exc:
+        logger.warning("공용 BTC 정본 조회 실패: %s", exc)
+        if composite_requested:
+            raise RuntimeError(
+                f"{regime_interval} 공용 BTC 국면 데이터를 준비하지 못했습니다: {exc}") from exc
+    if ((global_btc is None or len(global_btc) < 200 or regime_btc is None)
+            and composite_requested):
+        raise RuntimeError(
+            "복합 국면 백테스트에는 공용 Bitstamp BTC 정본이 필요합니다. "
+            "먼저 `python -m tools.download_global_btc`를 실행해 주세요.")
+    if global_btc is None or len(global_btc) < 200:
+        global_btc = references.get("BTC")
+        if global_btc is None or len(global_btc) < 200:
+            global_btc = fetch_binance_reference("BTC", refresh=refresh)
+        regime_dataset_id = "binance-btc-usdt-fallback"
+    if global_btc is None or len(global_btc) < 200:
+        global_btc = era_source
+        regime_dataset_id = "bitstamp-ccxt-era-fallback"
+    if global_btc is None or len(global_btc) < 200:
+        raise RuntimeError("글로벌 BTC 일봉이 없어 국면을 판정할 수 없습니다")
+    regime_btc = regime_btc if regime_btc is not None else global_btc
+    ctx = market_context(btc_raw, config, era_source, global_btc, regime_btc)
+    ctx.attrs["regime_dataset_id"] = regime_dataset_id
+    ctx.attrs["regime_last_completed"] = str(regime_btc.index[-1])
+    ctx.attrs["regime_decision_interval"] = regime_interval
 
     # 매매 대상에서 BTC를 뺐다면 지표만 쓰고 매매에서는 제외
-    if "BTC" not in [str(t).upper() for t in (config.get("tickers") or [])]:
+    if "BTC" not in [str(t).upper() for t in static_tickers(config)]:
         data.pop("BTC", None)
 
     return data, ctx, missing

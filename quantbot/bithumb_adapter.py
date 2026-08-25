@@ -67,6 +67,18 @@ class BithumbAdapter(ExchangeBase):
             logger.error(f"[빗썸][{symbol}] 현재가 조회 실패: {e}")
             return None
 
+    def get_trading_fees(self, tickers=None) -> Dict[str, Any]:
+        by_symbol: Dict[str, Any] = {}
+        for ticker in (tickers or ["BTC"]):
+            symbol = self.to_symbol(ticker)
+            fee = float(self.client.get_trading_fee(symbol, "KRW"))
+            by_symbol[symbol] = {"buy_rate": fee, "sell_rate": fee,
+                                 "maker_rate": fee, "taker_rate": fee}
+        rate = max(v["taker_rate"] for v in by_symbol.values())
+        return {"exchange": self.NAME, "buy_rate": rate, "sell_rate": rate,
+                "maker_rate": rate, "taker_rate": rate,
+                "by_symbol": by_symbol, "source": "bithumb_private_api"}
+
     # 공통 봉 이름 -> pybithumb 표기.
     # pybithumb만 1시간봉을 'hour'로 부르기 때문에 공통 이름을 그대로 넘기면 KeyError가 납니다.
     NATIVE_INTERVALS = {
