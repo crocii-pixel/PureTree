@@ -50,6 +50,10 @@ class ArchiveCancelled(RuntimeError):
     """사용자가 아카이브 수집을 중단했습니다."""
 
 
+class ArchiveDependencyError(RuntimeError):
+    """수집에 필요한 패키지가 없습니다. 내려받기 전에 걸러 냅니다."""
+
+
 def parse_progress(message: str) -> Dict[str, object]:
     """진행 메시지를 {interval, done, total, name} 으로 풀어 냅니다."""
     match = PROGRESS_RE.match(str(message).strip())
@@ -68,6 +72,32 @@ def parse_progress(message: str) -> Dict[str, object]:
 def bootstrap_needed(root: Optional[Path] = None) -> bool:
     """정본이 아직 한 번도 수집되지 않았는지."""
     return not GlobalMarketRepository(root).sealed_files("1m")
+
+
+def missing_requirements() -> List[str]:
+    """
+    수집을 **시작하기 전에** 없는 필수 패키지를 알려 줍니다.
+
+    파일을 봉인할 때 duckdb 가 필요한데, 예전에는 그 시점에야 확인했습니다.
+    한 달치를 다 내려받은 다음 저장에 실패하니 받은 것이 통째로 버려지고,
+    패키지를 깔고 돌아와도 처음부터 다시 받아야 했습니다.
+    """
+    missing: List[str] = []
+    try:
+        import duckdb  # noqa: F401
+    except ImportError:
+        missing.append("duckdb")
+    return missing
+
+
+def require_archive_dependencies() -> None:
+    """없으면 네트워크를 쓰기 전에 즉시 중단합니다."""
+    missing = missing_requirements()
+    if missing:
+        names = " ".join(missing)
+        raise ArchiveDependencyError(
+            f"시세 저장에 필요한 패키지가 없습니다: {names}\n"
+            f"pip install {names} 로 설치한 뒤 다시 시도해 주세요.")
 
 
 SUPPORTED_MINUTES = (1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30)
@@ -661,6 +691,8 @@ class BitstampBTCArchive:
     def backfill_minutes(self, end_exclusive: Optional[object] = None, workers: int = 8,
                          progress: Optional[Callable[[str], None]] = None,
                          should_cancel: Optional[Callable[[], bool]] = None) -> List[Path]:
+        # 한 바이트라도 받기 전에 저장할 수 있는지부터 확인합니다.
+        require_archive_dependencies()
         self.initialize_metadata()
         end_ts = _utc(end_exclusive) if end_exclusive is not None else pd.Timestamp.now(tz="UTC").floor("D")
         if end_ts > pd.Timestamp.now(tz="UTC").floor("D"):
@@ -737,6 +769,7 @@ class BitstampBTCArchive:
     def run(self, end_exclusive: Optional[object] = None, workers: int = 8,
             progress: Optional[Callable[[str], None]] = None,
             should_cancel: Optional[Callable[[], bool]] = None) -> Dict[str, object]:
+        require_archive_dependencies()
         end_ts = _utc(end_exclusive) if end_exclusive is not None else pd.Timestamp.now(tz="UTC").floor("D")
         minute_files = self.backfill_minutes(
             end_ts, workers=workers, progress=progress, should_cancel=should_cancel)

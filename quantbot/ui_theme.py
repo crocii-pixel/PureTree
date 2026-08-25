@@ -36,16 +36,24 @@ def fit_available_height(widget: Any, preferred_width: int | None = None) -> Non
         geometry = screen.availableGeometry()
         width = int(preferred_width or widget.width() or geometry.width())
         width = min(max(width, widget.minimumWidth()), geometry.width())
-        # setGeometry 는 **테두리 안쪽**을 정합니다. 제목 표시줄 두께를 빼지
-        # 않으면 그만큼 창이 아래로 삐져나가 작업표시줄에 가립니다. 창이 아직
-        # 뜨기 전이라 실제 테두리를 못 재면 보수적인 기본값을 씁니다.
+        # 크기는 **테두리 안쪽**, 위치는 **테두리 포함**입니다. 그래서 높이는
+        # 제목 표시줄 두께를 빼서 정하고(안 빼면 아래가 작업표시줄에 가림),
+        # 위치는 resize + move 로 잡습니다. setGeometry 로 y 를 주면 그 값이
+        # 안쪽 좌표라서 제목 표시줄이 화면 위로 밀려 나갑니다.
         chrome = widget.frameGeometry().height() - widget.geometry().height()
         if chrome <= 0:
-            chrome = 40
-        usable = geometry.height() - chrome - BOTTOM_GAP
+            chrome = 40          # 아직 안 떠서 실제 테두리를 못 잴 때
+        usable = geometry.height() - chrome - TOP_GAP - BOTTOM_GAP
         height = min(max(usable, widget.minimumHeight()), geometry.height())
         left = max(geometry.left(), min(widget.x(), geometry.right() - width + 1))
-        widget.setGeometry(left, geometry.top() + TOP_GAP, width, height)
+        top = geometry.top() + TOP_GAP
+        # 최소 높이가 화면보다 큰 창(작은 노트북)은 아래로 넘칩니다. 그럴 때는
+        # 위로 끌어올려서 **제목 표시줄만은 잡을 수 있게** 합니다.
+        overflow = (top + height + chrome) - (geometry.bottom() + 1)
+        if overflow > 0:
+            top = max(geometry.top(), top - overflow)
+        widget.resize(width, height)
+        widget.move(left, top)
     except Exception:
         # Geometry differences between Qt5/Qt6 or a not-yet-created native
         # handle must never prevent a window from opening.

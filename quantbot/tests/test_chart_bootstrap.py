@@ -141,6 +141,66 @@ def test_cancelled_collection_says_it_can_resume(monkeypatch):
     app.processEvents()
 
 
+def test_missing_duckdb_stops_before_a_single_byte_is_downloaded(monkeypatch, tmp_path):
+    """14년치를 다 받은 뒤 저장 단계에서 막히면 받은 것이 통째로 버려집니다.
+
+    실제로 그렇게 되어, 패키지를 깔고 돌아와도 처음부터 다시 받아야 했습니다.
+    네트워크를 쓰기 전에 걸러 내야 합니다.
+    """
+    import builtins
+
+    import requests
+    from global_market_data import (ArchiveDependencyError, BitstampBTCArchive,
+                                    missing_requirements)
+
+    real_import = builtins.__import__
+
+    def no_duckdb(name, *args, **kwargs):
+        if name == "duckdb" or name.startswith("duckdb."):
+            raise ImportError("simulated: duckdb not installed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_duckdb)
+    monkeypatch.delitem(__import__("sys").modules, "duckdb", raising=False)
+
+    hits = []
+    monkeypatch.setattr(requests, "get",
+                        lambda *a, **k: hits.append(a[:1]) or None)
+
+    assert missing_requirements() == ["duckdb"]
+    with pytest.raises(ArchiveDependencyError) as excinfo:
+        BitstampBTCArchive(tmp_path).run()
+    assert "pip install duckdb" in str(excinfo.value)
+    assert not hits, "패키지가 없는데 내려받기부터 시작했습니다"
+    assert not list(tmp_path.rglob("*.parquet"))
+
+
+def test_chart_shows_the_install_command_instead_of_starting(monkeypatch):
+    """수집을 시작하지 않고, 무엇을 깔아야 하는지 보여 줍니다."""
+    import global_market_data
+
+    window, app = _chart_window(monkeypatch)
+    monkeypatch.setattr(global_market_data, "missing_requirements",
+                        lambda: ["duckdb"])
+    threads = []
+    monkeypatch.setattr("threading.Thread",
+                        lambda *a, **k: threads.append(a) or _NoThread())
+
+    window._start_bootstrap()
+
+    assert not threads, "패키지가 없는데 수집 스레드를 띄웠습니다"
+    assert window._bootstrap_thread is None
+    assert "pip install duckdb" in window.bootstrap_label.text()
+    assert "pip install duckdb" in window.status.text()
+    assert not window.bootstrap_row.isHidden()
+    # 안내는 닫을 수 있어야 합니다.
+    assert window.bootstrap_cancel.text() == "닫기"
+    window._cancel_bootstrap()
+    assert window.bootstrap_row.isHidden()
+    window.close()
+    app.processEvents()
+
+
 class _NoThread:
     """수집 스레드를 띄우지 않고 UI 상태만 검사하기 위한 대역."""
 

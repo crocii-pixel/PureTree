@@ -1624,6 +1624,23 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
             """정본이 없으면 안내문 대신 직접 받아 옵니다."""
             if self._bootstrap_thread is not None:
                 return
+            from global_market_data import missing_requirements
+            missing = missing_requirements()
+            if missing:
+                # 14년치를 다 받은 뒤에 저장 단계에서 막히면 받은 것이 전부
+                # 버려집니다. 시작하기 전에 멈춥니다.
+                names = " ".join(missing)
+                self.status.setText(f"설치 필요: pip install {names}")
+                self.bootstrap_row.setVisible(True)
+                self.bootstrap_bar.setRange(0, 1)
+                self.bootstrap_bar.setValue(0)
+                self.bootstrap_bar.setFormat("수집 불가")
+                self.bootstrap_label.setText(
+                    f"시세 저장에 {names} 가 필요합니다 · pip install {names}")
+                self.bootstrap_cancel.setText("닫기")
+                self.bootstrap_cancel.setEnabled(True)
+                return
+            self.bootstrap_cancel.setText("중단")
             self.status.setText("BTC 정본 최초 수집 중…")
             self.bootstrap_label.setText("Bitstamp BTC/USD 1분봉 내려받는 중…")
             self.bootstrap_bar.setRange(0, 0)
@@ -1641,6 +1658,8 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
 
         def _cancel_bootstrap(self) -> None:
             if self._bootstrap_worker is None:
+                # 아직 시작도 못 한 상태(패키지 부족)면 안내만 접습니다.
+                self.bootstrap_row.setVisible(False)
                 return
             self._bootstrap_worker.cancel()
             self.bootstrap_cancel.setEnabled(False)

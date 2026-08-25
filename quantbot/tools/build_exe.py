@@ -45,6 +45,7 @@ HIDDEN_IMPORTS: List[str] = [
     "schedule",
     "gui_manager",     # 트레이 GUI (main.py에서 지연 import)
     "config_gui",      # 설정 창 (main.py에서 지연 import)
+    "duckdb",          # 공용 BTC 정본 Parquet 저장·조회 (지연 import)
 ]
 
 # .exe에 포함할 데이터 파일 (원본 경로, 번들 내 위치)
