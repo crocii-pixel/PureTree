@@ -76,6 +76,8 @@ def test_reference_data_reads_shared_btc_archive(monkeypatch):
 
     monkeypatch.setattr(global_market_data, "ensure_global_btc_current", lambda **kwargs: True)
     monkeypatch.setattr(global_market_data, "GlobalMarketRepository", FakeRepository)
+    # 진행 중 봉 조회는 네트워크를 타므로 테스트에서는 막습니다.
+    monkeypatch.setattr(reference_data, "_bitstamp_daily", lambda **_kwargs: None)
     result = reference_data.fetch_global_daily("BTC", limit=10)
     assert result is not None
     assert list(result.columns) == ["open", "high", "low", "close", "volume"]
