@@ -25,8 +25,9 @@ def test_defaults_use_independent_detectors_without_weights_or_thresholds():
     assert cfg["bull_strategy"] == "period_rebalance"
     assert cfg["bear_strategy"] == "defensive_atr"
     assert cfg["defensive_take_profit_pct"] == 0.05
-    assert cfg["bull_atr_multiple"] == 1.0
-    assert cfg["bear_atr_multiple"] == 1.0
+    assert cfg["atr_multiple"] == 1.0
+    assert cfg["bull_atr_window"] == 10
+    assert cfg["bear_atr_window"] == 2
     assert not any("weight" in key or "threshold" in key for key in cfg)
 
 
@@ -136,27 +137,48 @@ def test_strategy_validation_rejects_invalid_methods_and_periods():
         "3국면 전략 라우팅은 현재 백테스트 전용입니다."]
 
 
-def test_atr_up_and_down_thresholds_are_independent_and_effective():
+def test_atr_up_and_down_windows_move_only_their_own_level():
+    """상승·하락은 배수가 아니라 **ATR 기간**으로 갈립니다.
+
+    한쪽 기간만 바꿨는데 반대쪽 레벨까지 흔들리면 두 방향이 얽혀 있다는 뜻이라
+    ``ATR % [1] 기간: 상승[10] 하락[2]`` 설정이 의도대로 동작하지 않습니다.
+    """
     prices = frame(periods=90)
     prices["open"] = prices["close"]
     prices["high"] = prices["close"] * 1.04
     prices["low"] = prices["close"] * 0.96
-    upward = build_regime_frame(prices, {"regime_scoring": {
-        "breakout_atr_window": 5,
-        "bull_atr_multiple": 0.1,
-        "bear_atr_multiple": 10.0,
+    base = build_regime_frame(prices, {"regime_scoring": {
+        "atr_multiple": 1.0, "bull_atr_window": 10, "bear_atr_window": 10,
     }})
-    downward = build_regime_frame(prices, {"regime_scoring": {
-        "breakout_atr_window": 5,
-        "bull_atr_multiple": 10.0,
-        "bear_atr_multiple": 0.1,
+    bull_changed = build_regime_frame(prices, {"regime_scoring": {
+        "atr_multiple": 1.0, "bull_atr_window": 3, "bear_atr_window": 10,
     }})
-    assert upward["breakout_upper_event"].fillna(False).any()
-    assert not upward["breakout_lower_event"].fillna(False).any()
-    assert downward["breakout_lower_event"].fillna(False).any()
-    assert not downward["breakout_upper_event"].fillna(False).any()
-    assert not upward["atr_upper_level"].equals(downward["atr_upper_level"])
-    assert not upward["atr_lower_level"].equals(downward["atr_lower_level"])
+    bear_changed = build_regime_frame(prices, {"regime_scoring": {
+        "atr_multiple": 1.0, "bull_atr_window": 10, "bear_atr_window": 3,
+    }})
+    assert base["atr_upper_level"].notna().any()
+    assert base["atr_lower_level"].notna().any()
+    assert not base["atr_upper_level"].equals(bull_changed["atr_upper_level"])
+    assert base["atr_lower_level"].equals(bull_changed["atr_lower_level"])
+    assert base["atr_upper_level"].equals(bear_changed["atr_upper_level"])
+    assert not base["atr_lower_level"].equals(bear_changed["atr_lower_level"])
+
+
+def test_single_atr_multiple_scales_both_directions():
+    prices = frame(periods=90)
+    prices["open"] = prices["close"]
+    prices["high"] = prices["close"] * 1.04
+    prices["low"] = prices["close"] * 0.96
+    tight = build_regime_frame(prices, {"regime_scoring": {
+        "atr_multiple": 0.1, "bull_atr_window": 5, "bear_atr_window": 5,
+    }})
+    wide = build_regime_frame(prices, {"regime_scoring": {
+        "atr_multiple": 20.0, "bull_atr_window": 5, "bear_atr_window": 5,
+    }})
+    assert tight["breakout_upper_event"].fillna(False).any()
+    assert tight["breakout_lower_event"].fillna(False).any()
+    assert not wide["breakout_upper_event"].fillna(False).any()
+    assert not wide["breakout_lower_event"].fillna(False).any()
 
 
 def test_lower_channel_keeps_last_angle_on_straight_continuation():

@@ -167,6 +167,7 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
 
     class PriceChart(QtWidgets.QWidget):
         viewChanged = QtCore.pyqtSignal(object, object)
+        windowRequested = QtCore.pyqtSignal(object, object)
 
         def __init__(self):
             super().__init__()
@@ -197,6 +198,9 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
             self._diagnostic_index = pd.DatetimeIndex([])
             self._static_pixmap = None
             self._static_key = None
+            self._macd_fraction = 0.24
+            self._splitter_dragging = False
+            self._edge_feedback: Optional[str] = None
 
         def set_interval(self, interval: str) -> None:
             labels = dict(CHART_INTERVALS)
@@ -255,6 +259,7 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
             self._refresh_analysis_regions()
             self._static_pixmap = None
             self._static_key = None
+            self._edge_feedback = None
             if self._view_start is None and not data.empty:
                 self._view_start = _timestamp(data.index[0])
                 self._view_end = _timestamp(data.index[-1])
@@ -300,27 +305,27 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
                 end = upper
             return max(lower, start), min(upper, end)
 
-        def set_period(self, start: Any, end: Any, all_period: bool = False) -> None:
+        def set_period(self, start: Any, end: Any, all_period: bool = False,
+                       reset_view: bool = True) -> None:
             if self._data.empty:
                 return
             first, last = _timestamp(self._data.index[0]), _timestamp(self._data.index[-1])
-            if all_period:
-                start_ts, end_ts = first, last
-            else:
-                requested_start, requested_end = _period_bounds(start, end)
-                start_ts = max(first, requested_start)
-                end_ts = min(last, requested_end)
+            requested_start, requested_end = _period_bounds(start, end)
+            start_ts, end_ts = requested_start, requested_end
             if start_ts >= end_ts:
-                end_ts = min(last, start_ts + self._minimum_span())
+                end_ts = start_ts + pd.Timedelta(seconds=self._bar_seconds)
             self._period_start, self._period_end = start_ts, end_ts
-            # An explicit backtest range is authoritative.  Do not silently
-            # inherit a zoom span from another interval or enlarge it to the
-            # chart's ordinary wheel-zoom minimum.
-            self._view_start, self._view_end = start_ts, end_ts
-            self._focus_time = start_ts + (end_ts - start_ts) / 2
-            self._focus_ratio = 0.5
+            if reset_view:
+                visible_start = max(first, start_ts)
+                visible_end = min(last, end_ts)
+                if visible_start >= visible_end:
+                    visible_start, visible_end = first, last
+                self._view_start, self._view_end = visible_start, visible_end
+                self._focus_time = visible_start + (visible_end - visible_start) / 2
+                self._focus_ratio = 0.5
             self._refresh_analysis_regions()
-            self.viewChanged.emit(self._view_start, self._view_end)
+            if reset_view:
+                self.viewChanged.emit(self._view_start, self._view_end)
             self._static_pixmap = None
             self._static_key = None
             self.update()
@@ -355,8 +360,8 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
         def _layout(self) -> Tuple[Any, Any, Any]:
             outer = self.rect().adjusted(62, 18, -18, -36)
             ribbon_height = 28 if self._show_conditions else 0
-            macd_height = int(outer.height() * 0.24) if self._show_macd else 0
-            gap = 14 if macd_height else 0
+            macd_height = int(outer.height() * self._macd_fraction) if self._show_macd else 0
+            gap = 10 if macd_height else 0
             price = QtCore.QRectF(
                 outer.left(), outer.top(), outer.width(),
                 max(100, outer.height() - ribbon_height - macd_height - gap))
@@ -366,6 +371,13 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
                 outer.left(), ribbon.bottom() + gap, outer.width(), macd_height)
             return price, ribbon, macd
 
+        def _macd_splitter_rect(self) -> Any:
+            _price, ribbon, macd = self._layout()
+            if not self._show_macd or macd.height() <= 0:
+                return QtCore.QRectF()
+            return QtCore.QRectF(macd.left(), macd.top() - 6,
+                                 macd.width(), 10)
+
         def _visible(self) -> pd.DataFrame:
             if self._data.empty or self._view_start is None or self._view_end is None:
                 return self._data.iloc[0:0]
@@ -374,6 +386,16 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
             return self._data.iloc[left:right]
 
         def _visible_diagnostic(self) -> pd.DataFrame:
+            diagnostic = self._diagnostic
+            if diagnostic.empty or self._view_start is None or self._view_end is None:
+                return diagnostic.iloc[0:0]
+            left = int(self._diagnostic_index.searchsorted(
+                self._view_start, side="left"))
+            right = int(self._diagnostic_index.searchsorted(
+                self._view_end, side="right"))
+            return diagnostic.iloc[left:right]
+
+        def _visible_analysis_diagnostic(self) -> pd.DataFrame:
             diagnostic = self._analysis_diagnostic()
             if diagnostic.empty or self._view_start is None or self._view_end is None:
                 return diagnostic.iloc[0:0]
@@ -647,6 +669,7 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
             price_rect, ribbon_rect, macd_rect = self._layout()
             visible = self._visible()
             diagnostic = self._visible_diagnostic()
+            analysis_diagnostic = self._visible_analysis_diagnostic()
             domain = self._price_domain(visible)
             cache_key = (
                 self.width(), self.height(), self._view_start, self._view_end,
@@ -661,8 +684,14 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
                 self._draw_regime_background(base, price_rect)
                 self._draw_grid(base, price_rect, domain)
                 self._draw_price(base, price_rect, visible, diagnostic, domain)
-                self._draw_ribbons(base, ribbon_rect, diagnostic)
+                self._draw_ribbons(base, ribbon_rect, analysis_diagnostic)
                 self._draw_macd(base, macd_rect, diagnostic)
+                if self._show_macd:
+                    handle = self._macd_splitter_rect()
+                    base.fillRect(handle, QtGui.QColor("#273246"))
+                    base.setPen(QtGui.QPen(QtGui.QColor("#64748B"), 1))
+                    base.drawLine(QtCore.QPointF(handle.left(), handle.center().y()),
+                                  QtCore.QPointF(handle.right(), handle.center().y()))
                 base.setPen(QtGui.QColor("#DDE7F4"))
                 base.drawText(QtCore.QRectF(price_rect.left() + 8, 0, 460, 22),
                               int(QtCore.Qt.AlignmentFlag.AlignLeft |
@@ -687,15 +716,37 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
                 painter.save()
                 painter.setClipRect(content)
                 painter.fillRect(content, QtGui.QColor("#0F1724"))
-                painter.drawPixmap(int(round(self._drag_preview_dx)), 0,
-                                   self._static_pixmap)
+                source = self._static_pixmap.copy(
+                    int(content.left()), int(content.top()),
+                    max(1, int(content.width())), max(1, int(content.height())))
+                painter.drawPixmap(int(round(content.left() + self._drag_preview_dx)),
+                                   int(content.top()), source)
                 painter.restore()
+            if self._edge_feedback:
+                at_left = self._edge_feedback == "left"
+                x = price_rect.left() if at_left else price_rect.right() - 4
+                color = QtGui.QColor("#F5B03E")
+                painter.fillRect(QtCore.QRectF(x, price_rect.top(), 4,
+                                               price_rect.height()), color)
+                label = "데이터 시작" if at_left else "데이터 끝"
+                label_rect = QtCore.QRectF(
+                    price_rect.left() + 10 if at_left else price_rect.right() - 100,
+                    price_rect.center().y() - 14, 90, 28)
+                painter.fillRect(label_rect, QtGui.QColor("#111827"))
+                painter.setPen(color)
+                painter.drawText(label_rect, int(QtCore.Qt.AlignmentFlag.AlignCenter), label)
             self._draw_crosshair(painter, price_rect, domain)
             painter.end()
 
         def mousePressEvent(self, event: Any) -> None:
             point = _event_pos(event)
             price_rect, _, _ = self._layout()
+            if (event.button() == QtCore.Qt.MouseButton.LeftButton
+                    and self._macd_splitter_rect().contains(point)):
+                self._splitter_dragging = True
+                self.setCursor(QtCore.Qt.CursorShape.SplitVCursor)
+                event.accept()
+                return
             if event.button() == QtCore.Qt.MouseButton.LeftButton and price_rect.contains(point):
                 if (self._data.empty or self._view_start is None
                         or self._view_end is None):
@@ -715,6 +766,15 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
 
         def mouseMoveEvent(self, event: Any) -> None:
             point = _event_pos(event)
+            if self._splitter_dragging:
+                outer = self.rect().adjusted(62, 18, -18, -36)
+                fraction = (outer.bottom() - point.y()) / max(outer.height(), 1)
+                self._macd_fraction = float(np.clip(fraction, 0.12, 0.55))
+                self._static_pixmap = None
+                self._static_key = None
+                self.update()
+                event.accept()
+                return
             self._crosshair = point
             self._preview_drag_to(point)
             self.update()
@@ -731,6 +791,12 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
 
         def mouseReleaseEvent(self, event: Any) -> None:
             point = _event_pos(event)
+            if self._splitter_dragging:
+                self._splitter_dragging = False
+                self.setCursor(QtCore.Qt.CursorShape.ArrowCursor)
+                self.update()
+                event.accept()
+                return
             if self._drag_origin is not None and self._drag_range is not None:
                 start, end = self._drag_range
                 price_rect, _, _ = self._layout()
@@ -738,10 +804,17 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
                     seconds = (end - start).total_seconds()
                     delta = -(point.x() - self._drag_origin.x()) / max(
                         price_rect.width(), 1.0) * seconds
+                    desired_start = start + pd.Timedelta(seconds=delta)
+                    desired_end = end + pd.Timedelta(seconds=delta)
+                    first, last, _maximum = self._view_limits()
+                    self._edge_feedback = (
+                        "left" if desired_start < first else
+                        "right" if desired_end > last else None)
                     self._view_start, self._view_end = self._clamp_view(
-                        start + pd.Timedelta(seconds=delta),
-                        end + pd.Timedelta(seconds=delta))
+                        desired_start, desired_end)
                     self.viewChanged.emit(self._view_start, self._view_end)
+                    if self._edge_feedback:
+                        self.windowRequested.emit(desired_start, desired_end)
                 if (self._view_start is not None and self._view_end is not None
                         and price_rect.contains(point)):
                     self._focus_time = self._time_at(point.x(), price_rect)
@@ -775,9 +848,16 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
                 0.0, 1.0))
             new_start = anchor - new_span * ratio
             new_end = new_start + new_span
+            first, last, _maximum = self._view_limits()
+            needs_more = new_start < first or new_end > last
+            # 가장자리를 벗어나지 않는 확대·축소는 "데이터 끝" 표시를 지웁니다.
+            self._edge_feedback = ("left" if new_start < first else
+                                   "right" if new_end > last else None)
             self._view_start, self._view_end = self._clamp_view(new_start, new_end)
             self._focus_time, self._focus_ratio = anchor, ratio
             self.viewChanged.emit(self._view_start, self._view_end)
+            if needs_more:
+                self.windowRequested.emit(new_start, new_end)
             self.update()
             event.accept()
 
@@ -837,6 +917,7 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
             self.setWindowTitle("QuantBot · BTC 국면 차트")
             self.setMinimumSize(920, 620)
             self.resize(1280, 780)
+            ui_theme.fit_available_width(self, 780)
             self._data = pd.DataFrame()
             self._load_generation = 0
             self._interval_buttons: Dict[str, Any] = {}
@@ -911,6 +992,7 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
 
             splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
             self.chart = PriceChart()
+            self.chart.windowRequested.connect(self._request_visible_window)
             splitter.addWidget(self.chart)
             panel = QtWidgets.QScrollArea()
             panel.setWidgetResizable(True)
@@ -946,6 +1028,15 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
             self.inputs: Dict[str, Any] = {}
             detector_group = QtWidgets.QGroupBox("장세 판정 방식")
             detector_form = QtWidgets.QFormLayout(detector_group)
+            detector_form.setHorizontalSpacing(6)
+            detector_form.setVerticalSpacing(5)
+            detector_form.setFieldGrowthPolicy(
+                QtWidgets.QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint)
+            # 라벨 칸은 가장 긴 라벨 기준으로 잡히므로, 왼쪽 정렬이면 짧은 라벨이
+            # 입력란에서 멀리 떨어져 보입니다. 오른쪽으로 붙입니다.
+            detector_form.setLabelAlignment(
+                QtCore.Qt.AlignmentFlag.AlignRight
+                | QtCore.Qt.AlignmentFlag.AlignVCenter)
             for key, label in (("bull_detector", "상승장 찾기"),
                                ("bear_detector", "하락장 찾기")):
                 combo = QtWidgets.QComboBox()
@@ -959,7 +1050,9 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
 
             parameter_group = QtWidgets.QGroupBox("판정값")
             parameter_layout = QtWidgets.QVBoxLayout(parameter_group)
+            parameter_layout.setSpacing(4)
             ma_row = QtWidgets.QHBoxLayout()
+            ma_row.setSpacing(4)
             self.inputs["short_ma"] = QtWidgets.QSpinBox()
             self.inputs["short_ma"].setRange(5, 200)
             self.inputs["short_ma"].setMaximumWidth(76)
@@ -970,10 +1063,12 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
             ma_row.addWidget(self.inputs["short_ma"])
             ma_row.addWidget(QtWidgets.QLabel("장기"))
             ma_row.addWidget(self.inputs["long_ma"])
+            ma_row.addStretch(1)
             parameter_layout.addWidget(QtWidgets.QLabel("이중 이동평균 추세"))
             parameter_layout.addLayout(ma_row)
 
             macd_row = QtWidgets.QHBoxLayout()
+            macd_row.setSpacing(4)
             for key, label in (("macd_fast", "빠름"), ("macd_slow", "느림"),
                                ("macd_signal", "신호")):
                 widget = QtWidgets.QSpinBox()
@@ -982,26 +1077,31 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
                 self.inputs[key] = widget
                 macd_row.addWidget(QtWidgets.QLabel(label))
                 macd_row.addWidget(widget)
+            macd_row.addStretch(1)
             parameter_layout.addWidget(QtWidgets.QLabel("로그 MACD"))
             parameter_layout.addLayout(macd_row)
 
             atr_row = QtWidgets.QHBoxLayout()
-            self.inputs["breakout_atr_window"] = QtWidgets.QSpinBox()
-            self.inputs["breakout_atr_window"].setRange(2, 120)
-            self.inputs["breakout_atr_window"].setMaximumWidth(72)
-            atr_row.addWidget(QtWidgets.QLabel("기간"))
-            atr_row.addWidget(self.inputs["breakout_atr_window"])
-            for key, label in (("bull_atr_multiple", "상승기준"),
-                               ("bear_atr_multiple", "하락기준")):
-                widget = QtWidgets.QDoubleSpinBox()
-                widget.setRange(0.1, 20.0)
-                widget.setSingleStep(0.1)
-                widget.setDecimals(1)
-                widget.setSuffix(" ATR")
-                widget.setMaximumWidth(92)
+            atr_row.setSpacing(4)
+            threshold = QtWidgets.QDoubleSpinBox()
+            threshold.setRange(0.1, 20.0)
+            threshold.setSingleStep(0.1)
+            threshold.setDecimals(1)
+            threshold.setMaximumWidth(68)
+            self.inputs["atr_multiple"] = threshold
+            atr_row.addWidget(QtWidgets.QLabel("ATR %"))
+            atr_row.addWidget(threshold)
+            atr_row.addWidget(QtWidgets.QLabel("기간:"))
+            for key, label, default in (("bull_atr_window", "상승", 10),
+                                        ("bear_atr_window", "하락", 2)):
+                widget = QtWidgets.QSpinBox()
+                widget.setRange(2, 120)
+                widget.setValue(default)
+                widget.setMaximumWidth(62)
                 self.inputs[key] = widget
                 atr_row.addWidget(QtWidgets.QLabel(label))
                 atr_row.addWidget(widget)
+            atr_row.addStretch(1)
             parameter_layout.addWidget(QtWidgets.QLabel("ATR 변동성 판정"))
             parameter_layout.addLayout(atr_row)
 
@@ -1021,6 +1121,13 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
 
             strategy_group = QtWidgets.QGroupBox("장세별 백테스트 전략")
             strategy_form = QtWidgets.QFormLayout(strategy_group)
+            strategy_form.setHorizontalSpacing(6)
+            strategy_form.setVerticalSpacing(5)
+            strategy_form.setFieldGrowthPolicy(
+                QtWidgets.QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint)
+            strategy_form.setLabelAlignment(
+                QtCore.Qt.AlignmentFlag.AlignRight
+                | QtCore.Qt.AlignmentFlag.AlignVCenter)
             for key, label in (("bull_strategy", "상승기"),
                                ("stable_strategy", "안정기"),
                                ("bear_strategy", "하락기")):
@@ -1033,7 +1140,12 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
             for multiple in (2.0, 4.0, 6.0, 8.0):
                 atr_combo.addItem(f"{multiple:g} ATR", multiple)
             self.inputs["defensive_atr_multiple"] = atr_combo
-            strategy_form.addRow("하락기 예약매수", atr_combo)
+            strategy_form.addRow("ATR 하단 거리", atr_combo)
+            entry_method = QtWidgets.QComboBox()
+            entry_method.addItem("ATR 하단", "atr")
+            entry_method.addItem("하방 채널선 돌파", "lower_channel")
+            self.inputs["defensive_entry_method"] = entry_method
+            strategy_form.addRow("예약매수 방식", entry_method)
             probe = QtWidgets.QDoubleSpinBox()
             probe.setRange(5.0, 100.0)
             probe.setSuffix(" %")
@@ -1052,6 +1164,8 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
             stop_atr.setSingleStep(0.1)
             stop_atr.setSuffix(" ATR")
             stop_atr.setDecimals(1)
+            stop_atr.setToolTip(
+                "예약 주문 기준선이 아니라 실제 체결가에서 이 ATR 배수만큼 내려가면 손절합니다.")
             self.inputs["defensive_stop_atr_multiple"] = stop_atr
             strategy_form.addRow("예약 체결분 손절", stop_atr)
             cancel_buffer = QtWidgets.QDoubleSpinBox()
@@ -1072,9 +1186,6 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
             bottom = QtWidgets.QHBoxLayout()
             self.period_label = QtWidgets.QLabel("")
             bottom.addWidget(self.period_label, 1)
-            apply_button = QtWidgets.QPushButton("백테스트 기간으로 화면 복원")
-            apply_button.clicked.connect(self.sync_period)
-            bottom.addWidget(apply_button)
             outer.addLayout(bottom)
 
             self.log_check.toggled.connect(
@@ -1146,13 +1257,6 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
         def _change_interval(self, interval: str) -> None:
             if interval == self._requested_interval:
                 return
-            _start, _end, all_period = period_provider()
-            if all_period and interval not in FULL_PERIOD_INTERVALS:
-                self._interval_buttons[self._current_interval].setChecked(True)
-                self.status.setText(
-                    "전체기간은 메모리 안전을 위해 D/W/M만 지원합니다. "
-                    "분·시봉은 기간을 지정해 주세요.")
-                return
             if interval == self._current_interval:
                 # Clicking the still-visible interval cancels an outstanding
                 # request for another interval.
@@ -1161,24 +1265,33 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
                 self._interval_buttons[self._current_interval].setChecked(True)
                 self._update_status()
                 return
-            raw_start, raw_end, _all_period = period_provider()
-            target = None
+            raw_start, raw_end, all_period = period_provider()
+            archive_start = pd.Timestamp("2011-08-19")
+            archive_end = _timestamp(pd.Timestamp.now(tz="UTC").floor("D"))
             if all_period:
-                archive_start = pd.Timestamp("2011-08-19")
-                archive_end = _timestamp(pd.Timestamp.now(tz="UTC").floor("D"))
-                target = {
-                    "time": archive_start + (archive_end - archive_start) / 2,
-                    "ratio": 0.5, "span": archive_end - archive_start,
-                }
+                period_start, period_end = archive_start, archive_end
             else:
-                start, end = _period_bounds(raw_start, raw_end)
-                span = max(end - start, pd.Timedelta(seconds=1))
-                target = {
-                    "time": start + span / 2,
-                    "ratio": 0.5,
-                    "span": span,
-                }
-            self._request_interval(interval, target, full_period=all_period)
+                period_start, period_end = _period_bounds(raw_start, raw_end)
+            period_span = max(period_end - period_start, pd.Timedelta(seconds=1))
+            if interval in FULL_PERIOD_INTERVALS:
+                # D/W/M 은 기간 전체를 한눈에 보는 용도이므로 백테스트 기간으로
+                # 복원합니다.  분·시봉에서 돌아왔을 때도 마찬가지입니다.
+                target = {"time": period_start + period_span / 2, "ratio": 0.5,
+                          "span": period_span, "restore_period": True}
+            else:
+                # 분·시봉은 항상 한 화면 분량만 봅니다.  몇 년치 기간을 분봉으로
+                # 통째로 읽으면 메모리가 바닥나고 창이 멈춥니다.
+                # 보고 있던 지점을 그대로 기준 삼아 그 주변만 잘라 옵니다.
+                current = self.chart.anchor_state()
+                span = min(period_span, pd.Timedelta(
+                    seconds=CHART_INTERVAL_SECONDS[interval]
+                    * DEFAULT_VISIBLE_BARS[interval]))
+                focus = current.get("time") if current else period_end
+                ratio = float(current.get("ratio", 0.5)) if current else 1.0
+                target = {"time": _timestamp(focus), "ratio": ratio, "span": span}
+            self._request_interval(
+                interval, target,
+                full_period=bool(all_period and interval in FULL_PERIOD_INTERVALS))
 
         def _request_interval(self, interval: str,
                               anchor: Optional[Mapping[str, Any]] = None,
@@ -1227,25 +1340,26 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
 
         def _load_data(self, _checked: Any = False) -> None:
             raw_start, raw_end, all_period = period_provider()
-            state = None
-            if all_period and self._current_interval not in FULL_PERIOD_INTERVALS:
-                self._current_interval = "1d"
-                self._requested_interval = "1d"
-                self.chart.set_interval("1d")
-                self._interval_buttons["1d"].setChecked(True)
-            if state is None:
-                seconds = CHART_INTERVAL_SECONDS[self._current_interval]
-                if all_period:
-                    start = pd.Timestamp("2011-08-19")
-                    end = _timestamp(pd.Timestamp.now(tz="UTC").floor("D"))
-                    span = end - start
-                else:
-                    start, end = _period_bounds(raw_start, raw_end)
-                    span = max(end - start, pd.Timedelta(
-                        seconds=seconds * MIN_VISIBLE_BARS[self._current_interval]))
-                state = {"time": start + span / 2, "ratio": 0.5, "span": span}
+            seconds = CHART_INTERVAL_SECONDS[self._current_interval]
+            if all_period:
+                start = pd.Timestamp("2011-08-19")
+                end = _timestamp(pd.Timestamp.now(tz="UTC").floor("D"))
+            else:
+                start, end = _period_bounds(raw_start, raw_end)
+            period_span = max(end - start, pd.Timedelta(seconds=seconds))
+            if self._current_interval in FULL_PERIOD_INTERVALS:
+                state = {"time": start + period_span / 2, "ratio": 0.5,
+                         "span": period_span, "restore_period": True}
+            else:
+                # 분·시봉은 기간 전체를 담지 않습니다.  15년 아카이브의 한가운데를
+                # 보여주는 것보다 가장 최근 구간을 오른쪽 끝에 붙여 여는 편이 낫습니다.
+                span = min(period_span, pd.Timedelta(
+                    seconds=seconds * DEFAULT_VISIBLE_BARS[self._current_interval]))
+                state = {"time": end, "ratio": 1.0, "span": span}
             self._request_interval(
-                self._current_interval, state, full_period=all_period)
+                self._current_interval, state,
+                full_period=bool(all_period
+                                 and self._current_interval in FULL_PERIOD_INTERVALS))
 
         def _data_loaded(self, payload: Dict[str, Any]) -> None:
             if int(payload.get("generation", -1)) != self._load_generation:
@@ -1272,9 +1386,22 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
                 button.setEnabled(True)
             self._update_status()
             self._recalculate()
-            # The backtest period, not a stale interval-specific viewport, is
-            # the source of truth after every asynchronous load.
-            self.sync_period()
+            raw_start, raw_end, all_period = period_provider()
+            if all_period:
+                raw_start = pd.Timestamp("2011-08-19")
+                raw_end = _timestamp(pd.Timestamp.now(tz="UTC").floor("D"))
+            anchor = payload.get("anchor") or {}
+            # D/W/M 로 돌아왔을 때는 기간을 그대로 복원합니다.  중심점+폭으로
+            # 되돌리면 나눗셈 오차가 남아 경계가 1나노초씩 어긋납니다.
+            restore_period = bool(anchor.get("restore_period"))
+            self.chart.set_period(raw_start, raw_end, all_period,
+                                  reset_view=restore_period)
+            if not restore_period:
+                visible_span = payload.get("visible_span") or anchor.get("span")
+                if anchor.get("time") is not None and visible_span is not None:
+                    self.chart.restore_anchor(anchor["time"], anchor.get("ratio", 0.5),
+                                              pd.Timedelta(visible_span))
+            self._update_period_label()
 
         def _update_status(self) -> None:
             if self._data.empty:
@@ -1366,25 +1493,44 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
                 self._requested_interval = self._current_interval
                 self._interval_buttons[self._current_interval].setChecked(True)
             start, end, all_period = period_provider()
-            if all_period and (self._current_interval not in FULL_PERIOD_INTERVALS
-                               or not self._loaded_full_period):
-                self._load_data()
-                return
-            if not all_period:
+            if all_period:
+                requested_start = pd.Timestamp("2011-08-19")
+                requested_end = _timestamp(pd.Timestamp.now(tz="UTC").floor("D"))
+            else:
                 requested_start, requested_end = _period_bounds(start, end)
-                first, last = (_timestamp(self._data.index[0]),
-                               _timestamp(self._data.index[-1]))
-                if requested_start < first or requested_end > last:
-                    span = max(requested_end - requested_start,
-                               pd.Timedelta(seconds=1))
-                    self._request_interval(self._current_interval, {
-                        "time": requested_start + span / 2,
-                        "ratio": 0.5,
-                        "span": span,
-                    })
-                    return
-            self.chart.set_period(start, end, all_period)
+            period_span = max(requested_end - requested_start, pd.Timedelta(seconds=1))
+            if self._current_interval not in FULL_PERIOD_INTERVALS:
+                span = min(period_span, pd.Timedelta(
+                    seconds=CHART_INTERVAL_SECONDS[self._current_interval]
+                    * DEFAULT_VISIBLE_BARS[self._current_interval]))
+                self._request_interval(self._current_interval, {
+                    "time": requested_end, "ratio": 1.0, "span": span,
+                }, full_period=False)
+                return
+            first, last = (_timestamp(self._data.index[0]),
+                           _timestamp(self._data.index[-1]))
+            if (requested_start < first or requested_end > last
+                    or (all_period and not self._loaded_full_period)):
+                self._request_interval(self._current_interval, {
+                    "time": requested_start + period_span / 2, "ratio": 0.5,
+                    "span": period_span, "restore_period": True,
+                }, full_period=all_period)
+                return
+            self.chart.set_period(requested_start, requested_end, all_period)
             self._update_period_label()
+
+        def _request_visible_window(self, start: Any, end: Any) -> None:
+            """Slide the bounded archive window after a pan/zoom reaches an edge."""
+            if self._current_interval in FULL_PERIOD_INTERVALS:
+                return
+            start_ts, end_ts = _timestamp(start), _timestamp(end)
+            if start_ts >= end_ts:
+                return
+            span = end_ts - start_ts
+            self._request_interval(self._current_interval, {
+                "time": start_ts + span / 2,
+                "ratio": 0.5, "span": span,
+            }, full_period=False)
 
         def _apply_period(self) -> None:
             start, end = self.chart.selected_period()

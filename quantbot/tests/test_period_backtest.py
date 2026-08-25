@@ -362,3 +362,92 @@ def test_unfilled_atr_reservation_locks_cash_away_from_breakout():
     assert result["atr_locked_cash_max_pct"] > 0
     assert result["atr_reservations_expired"] > 0
     assert result["매수주문"] == 0
+
+
+def _defensive_frame(ma_ok):
+    """하락기 예약매수만 동작하도록 K 돌파를 막아 둔 프레임."""
+    frame = market_frame()
+    frame["low"] = frame["open"] - frame["N"] * 3.0
+    frame["target"] = frame["open"] + frame["N"] * 20.0   # K 돌파 차단
+    frame["above_ma10"] = ma_ok
+    frame["above_ma3"] = ma_ok
+    frame["auto_selected"] = True
+    return frame
+
+
+def _defensive_config(**scoring):
+    merged = {
+        "use_for_backtest": True,
+        "bear_strategy": "defensive_atr",
+        "defensive_atr_multiple": 2.0,
+        "defensive_probe_fraction": 0.25,
+    }
+    merged.update(scoring)
+    return {
+        "exchange": "bithumb", "investment_strategy": "period_rebalance",
+        "regime_scoring": merged,
+        "ma_window": 10, "bear_exit_ma_window": 3,
+        "risk_per_trade": 0.01, "atr_stop_multiple": 2.0,
+        "_fee_info": {"buy_rate": 0.0004, "sell_rate": 0.0004},
+    }
+
+
+def test_ma_exit_does_not_liquidate_the_reservation_bucket():
+    """MA 이탈로 예약 체결분까지 팔면 익절·손절이 영원히 0으로 남습니다.
+
+    하락기에는 거의 매일 MA 아래이므로, 전날 채워진 예약분이 다음 날 아침
+    ``ma_daily`` 로 사라집니다. 그러면 체결가 기준 익절선·손절선에 닿을 기회가
+    아예 없어져 집계가 항상 0이 됩니다.
+    """
+    data = {"BTC": _defensive_frame(ma_ok=False)}
+    ctx = pd.DataFrame({
+        "explosive": False, "bull": False, "regime_label": "하락",
+    }, index=data["BTC"].index)
+    result = run_period_backtest(_defensive_config(), data, ctx)
+
+    assert result["atr_lower_buys"] > 0
+    exits = (result["atr_probe_take_profit_exits"]
+             + result["atr_probe_stop_exits"])
+    assert exits > 0, "예약 체결분이 자기 익절·손절로 한 번도 빠져나오지 못했습니다"
+    reasons = {trade["reason"] for trade in result["_trades"]}
+    assert reasons & {"atr_probe_take_profit", "atr_probe_stop"}
+
+
+def test_reservation_stop_is_measured_from_the_fill_not_the_order_line():
+    """손절선은 예약 주문선이 아니라 **체결가**에서 내려간 거리입니다.
+
+    주문선 기준이면 체결되자마자 손절 조건이 성립해 사자마자 팔게 됩니다.
+    손절 배수를 넉넉히 키우면 손절이 사라지고 익절만 남아야 합니다.
+    """
+    data = {"BTC": _defensive_frame(ma_ok=False)}
+    ctx = pd.DataFrame({
+        "explosive": False, "bull": False, "regime_label": "하락",
+    }, index=data["BTC"].index)
+
+    tight = run_period_backtest(
+        _defensive_config(defensive_stop_atr_multiple=0.5), data, ctx)
+    loose = run_period_backtest(
+        _defensive_config(defensive_stop_atr_multiple=20.0), data, ctx)
+
+    assert tight["atr_lower_buys"] > 0
+    assert loose["atr_lower_buys"] > 0
+    assert loose["atr_probe_stop_exits"] < tight["atr_probe_stop_exits"]
+    assert loose["atr_probe_stop_exits"] == 0
+
+
+def test_lower_channel_entry_method_places_different_reservations():
+    """예약매수 방식으로 '하방 채널선 돌파'를 고르면 기준선이 달라져야 합니다."""
+    data = {"BTC": _defensive_frame(ma_ok=False)}
+    ctx = pd.DataFrame({
+        "explosive": False, "bull": False, "regime_label": "하락",
+    }, index=data["BTC"].index)
+
+    atr_run = run_period_backtest(
+        _defensive_config(defensive_entry_method="atr"), data, ctx)
+    channel_run = run_period_backtest(
+        _defensive_config(defensive_entry_method="lower_channel",
+                          breakout_lower_window=10), data, ctx)
+
+    assert atr_run["defensive_entry_method"] == "atr"
+    assert channel_run["defensive_entry_method"] == "lower_channel"
+    assert channel_run["atr_lower_buys"] != atr_run["atr_lower_buys"]

@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 
 from fee_manager import resolve_fee_info
+from regime_scoring import _project_lower_channel
 from regime_strategy import regime_from_config
 
 INITIAL_CAPITAL = 10_000_000.0
@@ -55,6 +56,10 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
         "판정 준비": "cash",
     }
     defensive_multiple = float(scoring.get("defensive_atr_multiple", 2.0))
+    defensive_entry_method = str(
+        scoring.get("defensive_entry_method", "atr")).lower()
+    if defensive_entry_method not in {"atr", "lower_channel"}:
+        defensive_entry_method = "atr"
     probe_fraction = float(np.clip(
         scoring.get("defensive_probe_fraction", 0.25), 0.01, 1.0))
     probe_take_profit = float(np.clip(
@@ -87,6 +92,20 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
     locked_cash_ratios = []
     previous_strategy = None
 
+    reservation_channels: Dict[str, pd.Series] = {}
+    if defensive_entry_method == "lower_channel":
+        channel_window = max(2, int(scoring.get("breakout_lower_window", 10)))
+        slope_bars = max(1, int(scoring.get("channel_slope_bars", 3)))
+        for ticker, frame in data.items():
+            low_column = ("signal_low" if use_reference
+                          and "signal_low" in frame.columns else "low")
+            completed_lows = pd.to_numeric(
+                frame[low_column], errors="coerce").shift(1)
+            raw_lower = completed_lows.rolling(
+                channel_window, min_periods=channel_window).min()
+            reservation_channels[ticker] = _project_lower_channel(
+                raw_lower, slope_bars)["lower_channel_line"]
+
     def active(date):
         return [ticker for ticker, frame in data.items()
                 if date in frame.index and bool(frame.loc[date].get("auto_selected", True))]
@@ -105,18 +124,42 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
         column = preferred if exact and preferred in row.index else "close"
         return float(row[column])
 
-    def sell(ticker, date, reason, close=False, fill_price=None):
+    def sell(ticker, date, reason, close=False, fill_price=None,
+             keep_probe=False):
+        """
+        보유분 청산.
+
+        ``keep_probe`` 를 켜면 **예약 체결분은 남깁니다.**  MA 이탈은 돌파
+        포지션에 대한 신호이고, 예약 체결분에는 체결가 기준의 익절·손절이 따로
+        걸려 있습니다.  둘을 같이 팔면 하락기에는 다음 날 아침마다 MA 이탈로
+        예약분이 사라져서 익절·손절이 **한 번도 성립하지 않습니다.**
+        """
         nonlocal cash
-        pos = positions.pop(ticker)
+        pos = positions[ticker]
+        probe_units = float(pos.get("probe_units", 0.0))
+        spare_probe = bool(keep_probe) and probe_units > 0
+        if spare_probe:
+            probe_cost = float(pos.get("probe_cost", 0.0))
+            units = float(pos["units"]) - probe_units
+            cost = float(pos["cost"]) - probe_cost
+            if units <= 1e-12:
+                return
+            pos["units"] = probe_units
+            pos["cost"] = probe_cost
+            pos["core_units"] = pos["breakout_units"] = 0.0
+            pos["core_cost"] = pos["breakout_cost"] = 0.0
+        else:
+            pos = positions.pop(ticker)
+            units, cost = float(pos["units"]), float(pos["cost"])
         r, exact = row_at_or_before(ticker, date)
         price_column = "close" if close or not exact else "open"
         raw_price = float(fill_price) if fill_price is not None else float(r[price_column])
         price = raw_price * (1 - slippage)
-        proceeds = pos["units"] * price * (1 - sell_fee)
+        proceeds = units * price * (1 - sell_fee)
         cash += proceeds
         trades.append({"date": date, "ticker": ticker, "reason": reason,
-                       "return": proceeds / pos["cost"] - 1.0,
-                       "profit": proceeds - pos["cost"]})
+                       "return": proceeds / cost - 1.0 if cost > 0 else 0.0,
+                       "profit": proceeds - cost})
 
     def buy_equal(date, names):
         nonlocal cash, buy_orders
@@ -142,7 +185,7 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
                                  "core_units": units, "breakout_units": 0.0,
                                  "probe_units": 0.0, "core_cost": budget,
                                  "breakout_cost": 0.0, "probe_cost": 0.0,
-                                 "probe_entry": 0.0}
+                                 "probe_entry": 0.0, "probe_atr": 0.0}
             cash -= budget
             buy_orders += 1
 
@@ -151,7 +194,7 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
             "units": 0.0, "cost": 0.0, "entry": entry,
             "core_units": 0.0, "breakout_units": 0.0, "probe_units": 0.0,
             "core_cost": 0.0, "breakout_cost": 0.0, "probe_cost": 0.0,
-            "probe_entry": 0.0})
+            "probe_entry": 0.0, "probe_atr": 0.0})
         old["units"] += units
         old["cost"] += budget
         old[bucket] = old.get(bucket, 0.0) + units
@@ -186,6 +229,7 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
         pos[cost_key] = 0.0
         if bucket == "probe_units":
             pos["probe_entry"] = 0.0
+            pos["probe_atr"] = 0.0
         if pos["units"] <= 1e-12:
             positions.pop(ticker, None)
         return True
@@ -243,21 +287,25 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
                                  if use_reference and signal_open > 0 else 1.0)
                         fill, reason = stop * ratio, "ma_intraday"
                     if fill is not None:
-                        sell(ticker, date, reason, fill_price=fill)
+                        sell(ticker, date, reason, fill_price=fill,
+                             keep_probe=True)
                         closed_today.add(ticker)
                 elif not bool(r[exit_col]):
-                    sell(ticker, date, "ma_daily")
+                    sell(ticker, date, "ma_daily", keep_probe=True)
                     closed_today.add(ticker)
 
                 # ATR reservation fills are a separate bucket.  A take-profit
                 # or ATR stop never liquidates unrelated core/breakout units.
-                if ticker not in positions or ticker in closed_today:
+                # ``closed_today`` 는 돌파분이 정리됐다는 뜻일 뿐이라 여기서
+                # 건너뛰면 안 됩니다.  같은 날 MA 이탈로 돌파분을 팔았어도
+                # 예약 체결분은 자기 익절·손절선을 그대로 봅니다.
+                if ticker not in positions:
                     continue
                 pos = positions[ticker]
                 if float(pos.get("probe_units", 0.0)) <= 0:
                     continue
                 probe_entry = float(pos.get("probe_entry", 0.0))
-                local_atr = float(r.get("N", np.nan))
+                local_atr = float(pos.get("probe_atr", r.get("N", np.nan)))
                 if (not np.isfinite(probe_entry) or probe_entry <= 0
                         or not np.isfinite(local_atr) or local_atr <= 0):
                     continue
@@ -340,8 +388,15 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
                             or not np.isfinite(signal_atr) or signal_open <= 0
                             or signal_atr <= 0):
                         continue
-                    lower_target = signal_open - defensive_multiple * signal_atr
+                    if defensive_entry_method == "lower_channel":
+                        channel = reservation_channels.get(ticker)
+                        lower_target = (float(channel.get(date, np.nan))
+                                        if channel is not None else np.nan)
+                    else:
+                        lower_target = signal_open - defensive_multiple * signal_atr
                     if lower_target <= 0:
+                        continue
+                    if not np.isfinite(lower_target):
                         continue
                     lower_ratio = lower_target / signal_open
                     raw_entry = max(1e-12, float(r["open"]) * lower_ratio)
@@ -378,7 +433,7 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
                         reservation_ambiguous += 1
                     open_reservations[ticker] = {
                         "budget": budget, "raw_entry": raw_entry,
-                        "lower_hit": lower_hit,
+                        "lower_hit": lower_hit, "local_atr": local_atr,
                     }
                     locked_cash += budget
                     if ticker == "BTC":
@@ -400,6 +455,7 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
                 entry = float(reservation["raw_entry"]) * (1 + slippage)
                 bought = budget / (entry * (1 + buy_fee))
                 add_position(ticker, bought, budget, entry, "probe_units")
+                positions[ticker]["probe_atr"] = float(reservation["local_atr"])
                 cash -= budget
                 buy_orders += 1
                 lower_buy_orders += 1
@@ -489,6 +545,7 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
         "regime_decision_interval": ctx.attrs.get("regime_decision_interval", "1d"),
         "phase_strategies": phase_strategies,
         "defensive_atr_multiple": defensive_multiple,
+        "defensive_entry_method": defensive_entry_method,
         "defensive_probe_fraction": probe_fraction,
         "defensive_take_profit_pct": probe_take_profit,
         "defensive_stop_atr_multiple": probe_stop_multiple,

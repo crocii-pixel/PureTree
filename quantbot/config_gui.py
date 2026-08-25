@@ -365,6 +365,16 @@ def build_config_window(parent: Any = None) -> Any:
                 return True
             return False
 
+    class _HistoryTable(QtWidgets.QTableWidget):
+        deletePressed = QtCore.pyqtSignal()
+
+        def keyPressEvent(self, event: Any) -> None:
+            if event.key() == QtCore.Qt.Key.Key_Delete:
+                self.deletePressed.emit()
+                event.accept()
+                return
+            super().keyPressEvent(event)
+
     class BacktestWindow(QtWidgets.QWidget):
         """설정창과 독립적으로 계속 띄워둘 수 있는 비모달 백테스트 창."""
 
@@ -386,6 +396,7 @@ def build_config_window(parent: Any = None) -> Any:
             self.setWindowTitle("QuantBot 백테스트")
             self.setMinimumSize(900, 650)
             self.resize(1120, 780)
+            ui_theme.fit_available_width(self, 780)
 
             outer = QtWidgets.QVBoxLayout(self)
             outer.setContentsMargins(22, 20, 22, 20)
@@ -507,20 +518,16 @@ def build_config_window(parent: Any = None) -> Any:
             self.delete_results_button.setObjectName("Danger")
             self.delete_results_button.clicked.connect(self._delete_selected_results)
             history_title.addWidget(self.delete_results_button)
-            self.select_all_results_button = QtWidgets.QPushButton("전체 선택")
-            self.select_all_results_button.clicked.connect(self._select_all_results)
-            history_title.insertWidget(history_title.count() - 1,
-                                       self.select_all_results_button)
             outer.addLayout(history_title)
 
-            self.history_table = QtWidgets.QTableWidget(0, 10)
+            self.history_table = _HistoryTable(0, 9)
             self.history_table.setObjectName("BacktestTable")
             self.history_table.setHorizontalHeaderLabels([
-                "선택", "실행 구조", "테스트 기간", "설정", "누적수익",
+                "실행 구조", "테스트 기간", "설정", "누적수익",
                 "CAGR", "MDD", "MAR", "승률", "매매",
             ])
             header_color_keys = (
-                "select", "structure", "period", "variant", "total_return",
+                "structure", "period", "variant", "total_return",
                 "cagr", "mdd", "mar", "win_rate", "trades",
             )
             for column, color_key in enumerate(header_color_keys):
@@ -535,9 +542,10 @@ def build_config_window(parent: Any = None) -> Any:
             self.history_table.setSelectionMode(
                 QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
             self.history_table.cellClicked.connect(self._on_history_clicked)
+            self.history_table.deletePressed.connect(self._delete_selected_results)
             header = self.history_table.horizontalHeader()
             header.setSectionResizeMode(header.ResizeMode.ResizeToContents)
-            header.setSectionResizeMode(2, header.ResizeMode.Stretch)
+            header.setSectionResizeMode(1, header.ResizeMode.Stretch)
             self.history_table.verticalHeader().setDefaultSectionSize(36)
             outer.addWidget(self.history_table, 1)
             self._update_split_controls()
@@ -865,11 +873,6 @@ def build_config_window(parent: Any = None) -> Any:
             colors = BACKTEST_RESULT_COLORS
             for row, entry in enumerate(records):
                 result = entry["result"]
-                checkbox = QtWidgets.QTableWidgetItem()
-                checkbox.setFlags(checkbox.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
-                checkbox.setCheckState(QtCore.Qt.CheckState.Unchecked)
-                checkbox.setData(QtCore.Qt.ItemDataRole.UserRole, entry["id"])
-                self.history_table.setItem(row, 0, checkbox)
                 group_id = entry["group_id"]
                 position = group_positions.get(group_id, 0)
                 group_positions[group_id] = position + 1
@@ -897,11 +900,11 @@ def build_config_window(parent: Any = None) -> Any:
                     (self._metric_text(result, "승률%"), colors["win_rate"]),
                     (f"{int(result.get('매매', 0)):,}", colors["trades"]),
                 ]
-                for col, (value, color) in enumerate(values, 1):
+                for col, (value, color) in enumerate(values):
                     item = QtWidgets.QTableWidgetItem(value)
                     item.setForeground(QtGui.QBrush(QtGui.QColor(color)))
                     item.setData(QtCore.Qt.ItemDataRole.UserRole, entry["id"])
-                    if col >= 4:
+                    if col >= 3:
                         item.setTextAlignment(int(QtCore.Qt.AlignmentFlag.AlignRight |
                                                   QtCore.Qt.AlignmentFlag.AlignVCenter))
                     self.history_table.setItem(row, col, item)
@@ -944,6 +947,7 @@ def build_config_window(parent: Any = None) -> Any:
             dialog.setWindowTitle("백테스트 설정보기 · 읽기 전용")
             dialog.setWindowModality(QtCore.Qt.WindowModality.NonModal)
             dialog.resize(720, 680)
+            ui_theme.fit_available_width(dialog, 680)
             layout = QtWidgets.QVBoxLayout(dialog)
             self._config_view_title = QtWidgets.QLabel("")
             self._config_view_title.setObjectName("Title")
@@ -995,17 +999,13 @@ def build_config_window(parent: Any = None) -> Any:
 
         def _delete_selected_results(self) -> None:
             ids = set()
-            for row in range(self.history_table.rowCount()):
-                item = self.history_table.item(row, 0)
-                if item and item.checkState() == QtCore.Qt.CheckState.Checked:
-                    ids.add(int(item.data(QtCore.Qt.ItemDataRole.UserRole)))
             for index in self.history_table.selectionModel().selectedRows():
                 item = self.history_table.item(index.row(), 0)
                 if item:
                     ids.add(int(item.data(QtCore.Qt.ItemDataRole.UserRole)))
             if not ids:
                 self.backtest_result.setText(
-                    "삭제할 결과를 체크하거나 Ctrl/Shift로 여러 행을 선택하세요.")
+                    "삭제할 결과를 클릭하거나 Ctrl/Shift로 여러 행을 선택하세요.")
                 return
             current_id = self._current_record_id()
             answer = QtWidgets.QMessageBox.question(
@@ -1021,15 +1021,6 @@ def build_config_window(parent: Any = None) -> Any:
             self._reload_history()
             self.backtest_result.setText(f"선택한 백테스트 결과 {deleted}개를 삭제했습니다.")
 
-        def _select_all_results(self) -> None:
-            self.history_table.selectAll()
-            for row in range(self.history_table.rowCount()):
-                item = self.history_table.item(row, 0)
-                if item:
-                    item.setCheckState(QtCore.Qt.CheckState.Checked)
-            self.backtest_result.setText(
-                f"백테스트 결과 {self.history_table.rowCount()}개를 모두 선택했습니다.")
-
     class ConfigWindow(QtWidgets.QWidget):
         """거래소 선택에 따라 API Key 입력란이 동적으로 재구성되는 설정 창"""
 
@@ -1038,6 +1029,7 @@ def build_config_window(parent: Any = None) -> Any:
             self.setWindowTitle("QuantBot 설정")
             self.setMinimumWidth(560)
             self.resize(600, 780)
+            ui_theme.fit_available_width(self, 780)
 
             ensure_icon()
             if ICO_PATH.exists():

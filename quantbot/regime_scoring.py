@@ -30,9 +30,9 @@ DEFAULT_REGIME_SCORE_CONFIG: Dict[str, Any] = {
     "macd_fast": 30,
     "macd_slow": 60,
     "macd_signal": 9,
-    "breakout_atr_window": 20,
-    "bull_atr_multiple": 1.0,
-    "bear_atr_multiple": 1.0,
+    "atr_multiple": 1.0,
+    "bull_atr_window": 10,
+    "bear_atr_window": 2,
     "breakout_lower_window": 10,
     "channel_slope_bars": 3,
     # Backtest-only strategy routing.  Live trading remains a separate opt-in.
@@ -40,6 +40,7 @@ DEFAULT_REGIME_SCORE_CONFIG: Dict[str, Any] = {
     "stable_strategy": "volatility_breakout",
     "bear_strategy": "defensive_atr",
     "defensive_atr_multiple": 2.0,
+    "defensive_entry_method": "atr",
     "defensive_probe_fraction": 0.25,
     # ATR lower orders are rebuilt from the latest completed candle every day.
     # Filled probe units are managed separately from core/breakout holdings.
@@ -124,12 +125,12 @@ def scoring_config(config: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]
     result["macd_slow"] = max(
         result["macd_fast"] + 1, int(result.get("macd_slow", 60)))
     result["macd_signal"] = max(2, int(result.get("macd_signal", 9)))
-    result["breakout_atr_window"] = max(
-        2, int(result.get("breakout_atr_window", 20)))
-    result["bull_atr_multiple"] = float(np.clip(
-        float(result.get("bull_atr_multiple", 1.0) or 1.0), 0.1, 20.0))
-    result["bear_atr_multiple"] = float(np.clip(
-        float(result.get("bear_atr_multiple", 1.0) or 1.0), 0.1, 20.0))
+    # 배수는 하나만 두고 상승·하락을 **ATR 기간**으로 가릅니다.  짧은 기간은
+    # 최근 변동성에 민감해 하락을 빨리 잡고, 긴 기간은 상승을 늦게·확실하게 잡습니다.
+    result["atr_multiple"] = float(np.clip(
+        float(result.get("atr_multiple", 1.0) or 1.0), 0.1, 20.0))
+    result["bull_atr_window"] = max(2, int(result.get("bull_atr_window", 10)))
+    result["bear_atr_window"] = max(2, int(result.get("bear_atr_window", 2)))
     result["breakout_lower_window"] = max(
         2, int(result.get("breakout_lower_window", 10)))
     result["channel_slope_bars"] = max(
@@ -141,6 +142,8 @@ def scoring_config(config: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]
     multiple = float(result.get("defensive_atr_multiple", 2.0) or 2.0)
     result["defensive_atr_multiple"] = min((2.0, 4.0, 6.0, 8.0),
                                               key=lambda value: abs(value - multiple))
+    if result.get("defensive_entry_method") not in {"atr", "lower_channel"}:
+        result["defensive_entry_method"] = "atr"
     result["defensive_probe_fraction"] = float(np.clip(
         float(result.get("defensive_probe_fraction", 0.25) or 0.25), 0.01, 1.0))
     result["defensive_take_profit_pct"] = float(np.clip(
@@ -169,6 +172,12 @@ def validate_scoring_config(config: Optional[Mapping[str, Any]] = None,
             errors.append("MACD 느림 기간은 빠름 기간보다 커야 합니다.")
         if int(merged["breakout_lower_window"]) < 2:
             errors.append("하방 채널 기간은 2봉 이상이어야 합니다.")
+        if int(merged.get("bull_atr_window", 10)) < 2:
+            errors.append("상승 ATR 기간은 2봉 이상이어야 합니다.")
+        if int(merged.get("bear_atr_window", 2)) < 2:
+            errors.append("하락 ATR 기간은 2봉 이상이어야 합니다.")
+        if float(merged.get("atr_multiple", 1.0)) <= 0:
+            errors.append("ATR 배수는 0보다 커야 합니다.")
         if float(merged["defensive_take_profit_pct"]) <= 0:
             errors.append("예약 체결분 익절률은 0보다 커야 합니다.")
         if float(merged["defensive_stop_atr_multiple"]) <= 0:
@@ -184,6 +193,9 @@ def validate_scoring_config(config: Optional[Mapping[str, Any]] = None,
         errors.append("하락 판정 방식을 선택해 주세요.")
     if str(merged.get("decision_interval", "")) not in DECISION_INTERVAL_IDS:
         errors.append("장세 판정 시간 간격을 선택해 주세요.")
+    if str(merged.get("defensive_entry_method", "atr")) not in {
+            "atr", "lower_channel"}:
+        errors.append("예약매수 방식을 선택해 주세요.")
     for phase, label in (("bull", "상승기"), ("stable", "안정기"),
                          ("bear", "하락기")):
         if str(merged.get(f"{phase}_strategy", "")) not in STRATEGY_IDS:
@@ -266,9 +278,9 @@ def _log_macd_component(close: pd.Series, fast: int, slow: int,
     })
 
 
-def _breakout_component(frame: pd.DataFrame, atr_window: int,
-                        lower_window: int, bull_atr_multiple: float,
-                        bear_atr_multiple: float) -> pd.DataFrame:
+def _breakout_component(frame: pd.DataFrame, bull_atr_window: int,
+                        bear_atr_window: int, lower_window: int,
+                        atr_multiple: float) -> pd.DataFrame:
     candle_range = (frame["high"] - frame["low"]).replace(0, np.nan)
     noise = 1.0 - (frame["close"] - frame["open"]).abs() / candle_range
     dynamic_k = noise.shift(1).rolling(20, min_periods=20).mean().fillna(0.5)
@@ -281,19 +293,22 @@ def _breakout_component(frame: pd.DataFrame, atr_window: int,
         (frame["high"] - previous_close).abs(),
         (frame["low"] - previous_close).abs(),
     ], axis=1).max(axis=1)
-    atr = true_range.rolling(atr_window, min_periods=atr_window).mean().shift(1)
+    bull_atr = true_range.rolling(
+        bull_atr_window, min_periods=bull_atr_window).mean().shift(1)
+    bear_atr = true_range.rolling(
+        bear_atr_window, min_periods=bear_atr_window).mean().shift(1)
     lower_window = max(2, int(lower_window))
     exit_level = frame["low"].shift(1).rolling(
         lower_window, min_periods=lower_window).min()
     # Directional ATR levels are separate.  Both are known at the bar open:
     # the anchor is the previous close and ATR contains completed bars only.
-    atr_upper_level = previous_close + atr * float(bull_atr_multiple)
-    atr_lower_level = previous_close - atr * float(bear_atr_multiple)
+    atr_upper_level = previous_close + bull_atr * float(atr_multiple)
+    atr_lower_level = previous_close - bear_atr * float(atr_multiple)
     upper_event = frame["high"] >= atr_upper_level
     lower_event = frame["low"] <= atr_lower_level
     # A daily bar cannot reveal intrabar ordering; downside wins conservatively.
     event = pd.Series(np.nan, index=frame.index, dtype=float)
-    ready = atr.notna() & target.notna() & exit_level.notna()
+    ready = bull_atr.notna() & bear_atr.notna() & target.notna() & exit_level.notna()
     event.loc[ready] = 0.0
     event.loc[ready & upper_event] = 1.0
     event.loc[ready & lower_event] = -1.0
@@ -314,7 +329,9 @@ def _breakout_component(frame: pd.DataFrame, atr_window: int,
         "breakout_upper_event": upper_event.shift(1).where(ready.shift(1)),
         "breakout_lower_event": lower_event.shift(1).where(ready.shift(1)),
         "breakout_ambiguous": (upper_event & lower_event).shift(1).where(ready.shift(1)),
-        "atr": atr,
+        "atr": bull_atr,
+        "bull_atr": bull_atr,
+        "bear_atr": bear_atr,
     })
 
 
@@ -416,8 +433,8 @@ def build_regime_frame(frame: pd.DataFrame,
     macd = _log_macd_component(
         prices["close"], cfg["macd_fast"], cfg["macd_slow"], cfg["macd_signal"])
     breakout = _breakout_component(
-        prices, cfg["breakout_atr_window"], cfg["breakout_lower_window"],
-        cfg["bull_atr_multiple"], cfg["bear_atr_multiple"])
+        prices, cfg["bull_atr_window"], cfg["bear_atr_window"],
+        cfg["breakout_lower_window"], cfg["atr_multiple"])
     out = prices.join(haltu).join(macd).join(breakout)
     channel = _project_lower_channel(
         out["exit_level"], int(cfg["channel_slope_bars"]))

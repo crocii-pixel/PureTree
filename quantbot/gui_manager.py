@@ -251,13 +251,20 @@ def _card(title: str):
 class Dashboard(QWidget):
     """봇 상태를 1초 주기로 갱신하는 미니 대시보드 창"""
 
-    COLUMNS = ["종목", "현재가", "목표가", "청산기준(MA)", "적용 K", "진입 MA", "당일 상태"]
+    #: 판정은 글로벌 시세(USD)로 하고 주문만 KRW로 나가므로, 현재가를 두 통화로
+    #: 나란히 놓고 매수·매도 기준은 판정 통화인 USD로 통일합니다.
+    COLUMNS = ["종목", "현재가(KRW)", "현재가(USD)", "매수기준(USD)",
+               "매도기준(USD)", "적용 K", "진입 MA", "당일 상태"]
+    #: 값을 가운데로 정렬할 컬럼 (숫자는 오른쪽, 나머지는 왼쪽)
+    CENTERED_COLUMNS = (5, 6, 7)
+    NUMERIC_COLUMNS = (1, 2, 3, 4)
 
     def __init__(self, bot: Any, log_buffer: LogBuffer):
         super().__init__()
         self.bot = bot
         self.log_buffer = log_buffer
         self._price_cache: Dict[str, float] = {}
+        self._usd_cache: Dict[str, float] = {}
         self._log_revision = -1        # 마지막으로 화면에 그린 로그 리비전
 
         self.setWindowTitle("QuantBot")
@@ -266,6 +273,8 @@ class Dashboard(QWidget):
             self.setWindowIcon(QIcon(str(ICO_PATH)))
 
         self._build_ui()
+        # 컬럼이 8개로 늘어 좁은 창에서는 숫자가 잘립니다. 화면 가용 폭을 씁니다.
+        ui_theme.fit_available_width(self, 660)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
@@ -398,6 +407,29 @@ class Dashboard(QWidget):
         """트레이 쪽에서 조회한 현재가를 공유 (중복 API 호출 방지)"""
         self._price_cache[ticker] = price
 
+    def set_reference_price(self, ticker: str, price: float) -> None:
+        """신호 시장(글로벌 USD) 현재가를 공유"""
+        self._usd_cache[ticker] = price
+
+    @staticmethod
+    def _usd_text(value: float) -> str:
+        """
+        USD 표기. 단위는 컬럼 제목이 이미 말해 주므로 숫자만 씁니다.
+
+        기본은 소수점 2자리입니다. 다만 1달러 미만 종목까지 2자리로 자르면
+        도지(0.2185)와 그 매수기준(0.2241)이 **둘 다 "0.22"** 로 찍혀서 돌파
+        여부를 눈으로 확인할 수 없습니다. 그래서 1달러 미만은 유효숫자를
+        남깁니다.
+        """
+        if not value:
+            return "—"
+        value = float(value)
+        if abs(value) >= 1:
+            return f"{value:,.2f}"
+        if abs(value) >= 0.01:
+            return f"{value:,.4f}"
+        return f"{value:,.6f}"
+
     def refresh(self) -> None:
         """봇 상태를 읽어 화면 갱신 (네트워크 호출 없음 - 메모리 상태만 사용)"""
         exchange = self.bot.exchange
@@ -452,23 +484,20 @@ class Dashboard(QWidget):
                 status, tone, tip = "대기", ui_theme.COLORS["text_muted"], "돌파 신호 대기 중"
 
             price = self._price_cache.get(ticker, 0.0)
-            target = self.bot.target_prices.get(ticker, 0.0)
+            usd_price = self._usd_cache.get(ticker, 0.0)
+            buy_usd = getattr(self.bot, "signal_targets", {}).get(ticker, 0.0)
+            sell_usd = getattr(self.bot, "exit_ma_values", {}).get(ticker, 0.0)
             above_ma = self.bot.is_above_ma.get(ticker)
-            exit_value = getattr(self.bot, "exit_ma_values", {}).get(ticker, 0.0)
-            exit_source = self.bot.signal_sources.get(ticker, "global_pending")
-            if exit_value:
-                exit_text = (f"{exit_value:,.4f} USD/USDT" if exit_source == "global"
-                             else f"{exit_value:,.0f}")
-            else:
-                exit_text = "—"
+            signal_source = self.bot.signal_sources.get(ticker, "global_pending")
+            dim = ui_theme.COLORS["text_dim"]
 
             cells = [
                 (ticker, ui_theme.COLORS["text"], False),
                 (f"{price:,.0f}" if price else "—", ui_theme.COLORS["text"], True),
-                (f"{target:,.0f}" if target else "—", ui_theme.COLORS["text_dim"], True),
-                (exit_text, ui_theme.COLORS.get("violet", ui_theme.COLORS["info"]), True),
-                (f"{self.bot.effective_ks.get(ticker, 0.0):.4f}",
-                 ui_theme.COLORS["text_dim"], True),
+                (self._usd_text(usd_price), ui_theme.COLORS["text"], True),
+                (self._usd_text(buy_usd), dim, True),
+                (self._usd_text(sell_usd), dim, True),
+                (f"{self.bot.effective_ks.get(ticker, 0.0):.4f}", dim, False),
                 ("충족" if above_ma else "미달",
                  ui_theme.COLORS["accent"] if above_ma else ui_theme.COLORS["text_muted"], False),
                 (status, tone, False),
@@ -477,18 +506,25 @@ class Dashboard(QWidget):
             if name:
                 cells[0] = (f"{ticker}  {name}", ui_theme.COLORS["text"], False)
 
+            krw_target = self.bot.target_prices.get(ticker, 0.0)
+            unit = "글로벌 USD" if signal_source == "global" else "거래소 KRW"
+            tooltips = {
+                2: f"신호 시장 현재가 · {unit} 기준",
+                3: (f"돌파 매수 판정선 · {unit} 기준\n"
+                    f"실제 주문 목표가 {krw_target:,.0f} KRW"),
+                4: f"청산 판정선 MA{self.bot.exit_ma_window()} · {unit} 기준",
+                len(cells) - 1: tip,
+            }
             for col, (text, color, numeric) in enumerate(cells):
                 item = QTableWidgetItem(text)
                 item.setForeground(_color(color))
                 if numeric:
                     item.setTextAlignment(int(Qt.AlignmentFlag.AlignRight
                                               | Qt.AlignmentFlag.AlignVCenter))
-                if col == 3:
-                    unit = "글로벌 USD/USDT" if exit_source == "global" else "거래소 KRW"
-                    item.setToolTip(
-                        f"현재 국면의 청산 판정선 MA{self.bot.exit_ma_window()} · {unit} 기준")
-                if col == len(cells) - 1:
-                    item.setToolTip(tip)
+                elif col in self.CENTERED_COLUMNS:
+                    item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
+                if col in tooltips:
+                    item.setToolTip(tooltips[col])
                 self.table.setItem(row, col, item)
 
         # 제외된 종목 - 붉게, 경고 표시와 함께
@@ -496,13 +532,16 @@ class Dashboard(QWidget):
                     "관리 대상에서 제외되었으니 설정에서 종목 코드를 확인해주세요.")
         for offset, ticker in enumerate(invalid):
             row = len(self.bot.tickers) + offset
-            cells = [f"⚠  {ticker}", "—", "—", "—", "—", "—", "관리 제외"]
+            cells = ([f"⚠  {ticker}"] + ["—"] * (len(self.COLUMNS) - 2)
+                     + ["관리 제외"])
             for col, text in enumerate(cells):
                 item = QTableWidgetItem(text)
                 item.setForeground(_color(ui_theme.COLORS["danger"]))
-                if 0 < col < len(cells) - 1:
+                if col in self.NUMERIC_COLUMNS:
                     item.setTextAlignment(int(Qt.AlignmentFlag.AlignRight
                                               | Qt.AlignmentFlag.AlignVCenter))
+                elif col in self.CENTERED_COLUMNS:
+                    item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
                 item.setToolTip(warn_tip)
                 self.table.setItem(row, col, item)
 
@@ -704,6 +743,7 @@ class TrayApplication:
         def worker() -> None:
             try:
                 prices: Dict[str, float] = {}
+                usd_prices: Dict[str, float] = {}
                 for ticker in self.bot.tickers:
                     try:
                         price = self.bot.current_price(ticker)
@@ -711,8 +751,18 @@ class TrayApplication:
                             prices[ticker] = float(price)
                     except Exception:
                         continue
+                    try:
+                        # 신호 시장 현재가는 없을 수도 있습니다(로컬 신호 종목).
+                        # 실패해도 KRW 현재가 갱신까지 막지는 않습니다.
+                        usd = self.bot.reference_price(ticker)
+                        if usd:
+                            usd_prices[ticker] = float(usd)
+                    except Exception:
+                        pass
                 for ticker, price in prices.items():
                     self.dashboard.set_price(ticker, price)
+                for ticker, price in usd_prices.items():
+                    self.dashboard.set_reference_price(ticker, price)
             finally:
                 self._price_refreshing = False
 

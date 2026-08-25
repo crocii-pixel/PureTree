@@ -100,8 +100,12 @@ def test_native_chart_builds_and_renders_without_webengine(monkeypatch):
         app.processEvents()
         time.sleep(0.01)
     assert window._current_interval == "1h"
+    # 백테스트 기간은 그대로지만, 시봉 화면은 기간 전체가 아니라 한 화면 분량만
+    # 담습니다.  8개월치를 1시간봉으로 모두 그리면 창이 멈춰 버립니다.
     assert window.chart.backtest_period() == expected_period
-    assert (window.chart._view_start, window.chart._view_end) == expected_period
+    hour_view = (window.chart._view_start, window.chart._view_end)
+    assert hour_view != expected_period
+    assert hour_view[1] - hour_view[0] < expected_period[1] - expected_period[0]
     window._interval_buttons["1d"].click()
     deadline = time.monotonic() + 3.0
     while window._current_interval != "1d" and time.monotonic() < deadline:
@@ -119,8 +123,9 @@ def test_native_chart_builds_and_renders_without_webengine(monkeypatch):
     assert saved["bear_detector"] == "lower_channel"
     assert saved["decision_interval"] == "1d"
     assert window.chart.backtest_period() == expected_period
-    assert "bull_atr_multiple" in window.inputs
-    assert "bear_atr_multiple" in window.inputs
+    assert "atr_multiple" in window.inputs
+    assert "bull_atr_window" in window.inputs
+    assert "bear_atr_window" in window.inputs
     analysis = window.chart._analysis_diagnostic()
     assert not analysis.empty
     normalized = pd.DatetimeIndex([
@@ -328,7 +333,7 @@ def test_all_period_requests_the_archive_start_instead_of_recent_default(monkeyp
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     window = build_regime_chart_window(
         QtCore, QtGui, QtWidgets,
-        lambda: {"regime_scoring": {"decision_interval": "1m"}},
+        lambda: {"regime_scoring": {"decision_interval": "1d"}},
         lambda _value: None,
         lambda: ("2017-09-25", "2026-08-24", True),
         lambda _start, _end: None,
@@ -341,5 +346,215 @@ def test_all_period_requests_the_archive_start_instead_of_recent_default(monkeyp
     assert calls[0][0] == "1d"
     assert calls[0][1] == pd.Timestamp("2011-08-19")
     assert calls[0][2] - calls[0][1] > pd.Timedelta(days=5_000)
+    window.close()
+    app.processEvents()
+
+
+def test_indicators_survive_an_intraday_switch(monkeypatch):
+    """분봉으로 바꾼 뒤에도 보조선·판정 리본·MACD가 남아 있어야 합니다.
+
+    예전에는 화면 구간과 분석 구간이 하나로 묶여 있어서, 간격을 바꾸면 분석
+    구간이 화면 밖으로 밀려나 캔들만 남고 지표가 통째로 사라졌습니다.
+    """
+    try:
+        from PyQt6 import QtCore, QtGui, QtWidgets
+    except ImportError:
+        try:
+            from PyQt5 import QtCore, QtGui, QtWidgets
+        except ImportError:
+            pytest.skip("PyQt5/PyQt6 unavailable")
+
+    import global_market_data
+    from regime_chart import CHART_INTERVAL_SECONDS, build_regime_chart_window
+
+    rng = np.random.default_rng(11)
+
+    def load(interval, start=None, end=None):
+        step = pd.Timedelta(seconds=CHART_INTERVAL_SECONDS.get(interval, 86_400))
+        first = pd.Timestamp(start or "2022-01-01", tz="UTC")
+        last = pd.Timestamp(end or "2024-06-01", tz="UTC")
+        index = pd.date_range(first, last, freq=step)[-4000:]
+        close = 100 * np.exp(np.cumsum(rng.normal(0.001, 0.03, len(index))))
+        return pd.DataFrame({
+            "open": close * 0.995, "high": close * 1.03,
+            "low": close * 0.97, "close": close,
+            "volume": np.arange(len(index), dtype=float),
+        }, index=index).reset_index(names="timestamp")
+
+    monkeypatch.setattr(global_market_data, "ensure_global_btc_current", lambda **_: True)
+    monkeypatch.setattr(global_market_data, "load_global_btc", load)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    window = build_regime_chart_window(
+        QtCore, QtGui, QtWidgets,
+        lambda: {"regime_short_ma": 60, "regime_long_ma": 120},
+        lambda _value: None,
+        lambda: ("2023-01-01", "2024-01-01", False),
+        lambda _start, _end: None,
+    )
+    deadline = time.monotonic() + 6.0
+    while window._data.empty and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.01)
+    window.resize(1280, 780)
+    window.show()
+    app.processEvents()
+
+    overlay_columns = ("ma_short", "ma_long", "buy_target",
+                       "atr_upper_level", "atr_lower_level",
+                       "lower_channel_line")
+
+    def assert_drawable(tag):
+        visible = window.chart._visible_diagnostic()
+        assert not visible.empty, tag
+        for column in overlay_columns:
+            assert column in visible, f"{tag}: {column}"
+            assert visible[column].notna().any(), f"{tag}: {column}"
+        for column in ("log_macd", "log_macd_signal", "log_macd_histogram"):
+            assert visible[column].notna().any(), f"{tag}: {column}"
+        assert window.chart._regions, tag
+        ribbons = window.chart._visible_analysis_diagnostic()
+        assert not ribbons.empty, tag
+        assert not window.chart.grab().isNull(), tag
+
+    assert_drawable("1d")
+    for interval in ("1h", "15m", "1d"):
+        window._interval_buttons[interval].click()
+        deadline = time.monotonic() + 6.0
+        while window._current_interval != interval and time.monotonic() < deadline:
+            app.processEvents()
+            time.sleep(0.01)
+        app.processEvents()
+        assert window._current_interval == interval
+        assert_drawable(interval)
+    window.close()
+    app.processEvents()
+
+
+def test_all_period_with_minute_bars_loads_one_screen_not_the_archive(monkeypatch):
+    """전체기간 + 분봉이 15년치 분봉을 요청하면 창이 멈춥니다.
+
+    분·시봉은 판정 간격을 1d로 바꿔치기하지 말고(설정에 되쓰이므로) 요청 구간만
+    한 화면 크기로 좁혀야 합니다.
+    """
+    try:
+        from PyQt6 import QtCore, QtGui, QtWidgets
+    except ImportError:
+        try:
+            from PyQt5 import QtCore, QtGui, QtWidgets
+        except ImportError:
+            pytest.skip("PyQt5/PyQt6 unavailable")
+
+    import global_market_data
+    from regime_chart import build_regime_chart_window
+
+    calls = []
+
+    def load(interval, start=None, end=None):
+        calls.append((interval, pd.Timestamp(start), pd.Timestamp(end)))
+        return _frame().reset_index(names="timestamp")
+
+    monkeypatch.setattr(global_market_data, "ensure_global_btc_current", lambda **_: True)
+    monkeypatch.setattr(global_market_data, "load_global_btc", load)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    window = build_regime_chart_window(
+        QtCore, QtGui, QtWidgets,
+        lambda: {"regime_scoring": {"decision_interval": "1m"}},
+        lambda _value: None,
+        lambda: ("2017-09-25", "2026-08-24", True),
+        lambda _start, _end: None,
+    )
+    deadline = time.monotonic() + 3.0
+    while not calls and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.01)
+    assert calls
+    # 사용자가 고른 판정 간격을 그대로 지킨다
+    assert calls[0][0] == "1m"
+    # 그리고 아카이브 전체가 아니라 최근 한 화면 + 워밍업만 읽는다
+    assert calls[0][2] - calls[0][1] < pd.Timedelta(days=30)
+    assert calls[0][2] > pd.Timestamp("2011-08-19") + pd.Timedelta(days=5_000)
+    window.close()
+    app.processEvents()
+
+
+class _FakeHistoryStore:
+    """`_reload_history` 가 읽는 부분만 흉내 낸 이력 저장소."""
+
+    def __init__(self, records):
+        self._records = list(records)
+        self.deleted = []
+
+    def list(self, limit=1000):
+        return list(self._records[:limit])
+
+    def delete(self, record_ids):
+        ids = set(int(value) for value in record_ids)
+        self.deleted.append(ids)
+        before = len(self._records)
+        self._records = [r for r in self._records if int(r["id"]) not in ids]
+        return before - len(self._records)
+
+
+def test_result_history_drops_the_checkbox_column_and_deletes_with_del(monkeypatch):
+    """체크박스 대신 행 선택 + Del 로 지웁니다.
+
+    체크박스를 없애면 컬럼 인덱스가 한 칸씩 당겨집니다. 삭제 대상 id를 읽는
+    컬럼이 어긋나면 Del 이 조용히 아무것도 지우지 않으므로 여기서 고정합니다.
+    """
+    try:
+        from PyQt6 import QtCore, QtGui, QtWidgets
+    except ImportError:
+        try:
+            from PyQt5 import QtCore, QtGui, QtWidgets
+        except ImportError:
+            pytest.skip("PyQt5/PyQt6 unavailable")
+    import copy
+    import config_gui
+    import config_manager
+
+    monkeypatch.setattr(
+        config_manager, "load_config", lambda: copy.deepcopy(config_manager.DEFAULT_CONFIG))
+    monkeypatch.setattr(config_manager, "read_env", lambda *_a, **_k: {})
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    window = config_gui.build_config_window()
+    window._open_backtest()
+    backtest = window._backtest_window
+
+    headers = [backtest.history_table.horizontalHeaderItem(col).text()
+               for col in range(backtest.history_table.columnCount())]
+    assert headers[0] == "실행 구조"
+    assert "선택" not in headers
+    assert not hasattr(backtest, "select_all_results_button")
+
+    store = _FakeHistoryStore([
+        {"id": 41, "group_id": "g7", "segment_index": 0, "segment_count": 1,
+         "start_date": "2023-01-01", "end_date": "2023-12-31",
+         "variant": "현재 설정", "result": {"총수익률%": 12.0, "매매": 30},
+         "meta": {}, "config": {}},
+        {"id": 42, "group_id": "g8", "segment_index": 0, "segment_count": 1,
+         "start_date": "2024-01-01", "end_date": "2024-12-31",
+         "variant": "현재 설정", "result": {"총수익률%": -3.0, "매매": 11},
+         "meta": {}, "config": {}},
+    ])
+    backtest._history_store = store
+    backtest._reload_history()
+    assert backtest.history_table.rowCount() == 2
+    # 첫 컬럼이 삭제 대상 id를 들고 있어야 Del 이 동작합니다.
+    assert backtest.history_table.item(0, 0).data(
+        QtCore.Qt.ItemDataRole.UserRole) == 41
+
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox, "question",
+        staticmethod(lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Yes))
+    backtest.history_table.selectRow(1)
+    event = QtGui.QKeyEvent(QtCore.QEvent.Type.KeyPress,
+                            int(QtCore.Qt.Key.Key_Delete),
+                            QtCore.Qt.KeyboardModifier.NoModifier)
+    backtest.history_table.keyPressEvent(event)
+    app.processEvents()
+    assert store.deleted == [{42}]
+    assert backtest.history_table.rowCount() == 1
+
+    backtest.close()
     window.close()
     app.processEvents()

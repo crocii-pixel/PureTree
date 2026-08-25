@@ -14,6 +14,24 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
+
+def fit_available_width(widget: Any, preferred_height: int | None = None) -> None:
+    """Stretch a top-level window across its current screen's usable width."""
+    try:
+        screen = widget.screen()
+        if screen is None:
+            app = widget.window().windowHandle().screen()
+            screen = app
+        geometry = screen.availableGeometry()
+        height = int(preferred_height or widget.height() or geometry.height())
+        height = min(max(height, widget.minimumHeight()), geometry.height())
+        top = max(geometry.top(), min(widget.y(), geometry.bottom() - height + 1))
+        widget.setGeometry(geometry.left(), top, geometry.width(), height)
+    except Exception:
+        # Geometry differences between Qt5/Qt6 or a not-yet-created native
+        # handle must never prevent a window from opening.
+        return
+
 # ---------------------------------------------------------------------
 # 팔레트
 # ---------------------------------------------------------------------

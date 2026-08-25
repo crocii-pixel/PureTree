@@ -17,7 +17,9 @@ DEFAULT_RATES = {"bithumb": 0.0004, "upbit": 0.0005, "coinone": 0.0002}
 def _rate(value: Any, fallback: float) -> float:
     try:
         parsed = float(value)
-        return parsed if 0.0 <= parsed < 0.1 else fallback
+        # 0 은 정상 수수료가 아니라 조회 실패/미응답 신호로 본다.
+        # 0 을 그대로 받으면 매수 예산이 과대 계산돼 잔고를 초과한다.
+        return parsed if 0.0 < parsed < 0.1 else fallback
     except (TypeError, ValueError):
         return fallback
 
