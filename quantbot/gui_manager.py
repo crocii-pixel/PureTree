@@ -494,12 +494,15 @@ class Dashboard(QWidget):
             # 읽힙니다. 실제로는 청산 대기 중이므로 눈에 띄게 합니다.
             breached = bool(usd_price and sell_usd and usd_price <= sell_usd)
             sell_color = ui_theme.COLORS["danger"] if breached else dim
+            # 반대쪽도 같습니다. 돌파선을 넘었으면 매수 판정이 선 상태입니다.
+            broke_out = bool(usd_price and buy_usd and usd_price >= buy_usd)
+            buy_color = ui_theme.COLORS["info"] if broke_out else dim
 
             cells = [
                 (ticker, ui_theme.COLORS["text"], False),
                 (f"{price:,.0f}" if price else "—", ui_theme.COLORS["text"], True),
                 (self._usd_text(usd_price), ui_theme.COLORS["text"], True),
-                (self._usd_text(buy_usd), dim, True),
+                (self._usd_text(buy_usd), buy_color, True),
                 (self._usd_text(sell_usd), sell_color, True),
                 (f"{self.bot.effective_ks.get(ticker, 0.0):.4f}", dim, False),
                 ("충족" if above_ma else "미달",
@@ -512,6 +515,10 @@ class Dashboard(QWidget):
 
             krw_target = self.bot.target_prices.get(ticker, 0.0)
             unit = "글로벌 USD" if signal_source == "global" else "거래소 KRW"
+            buy_tip = (f"돌파 매수 판정선 · {unit} 기준\n"
+                       f"실제 주문 목표가 {krw_target:,.0f} KRW")
+            if broke_out:
+                buy_tip += "\n현재가가 돌파선 위입니다 · 매수 조건 성립"
             sell_tip = f"청산 판정선 MA{self.bot.exit_ma_window()} · {unit} 기준"
             if breached:
                 # "왜 아직 안 팔았나"에 답이 되는 유일한 정보입니다.
@@ -521,8 +528,7 @@ class Dashboard(QWidget):
                     else "다음 일봉 경계에 청산 판단 (청산 시점: 일봉)")
             tooltips = {
                 2: f"신호 시장 현재가 · {unit} 기준",
-                3: (f"돌파 매수 판정선 · {unit} 기준\n"
-                    f"실제 주문 목표가 {krw_target:,.0f} KRW"),
+                3: buy_tip,
                 4: sell_tip,
                 5: "20일 노이즈 비율로 매일 새로 계산한 돌파 계수",
                 6: (f"전일 종가가 진입 MA{self.bot.ma_window} 위였는지 · "

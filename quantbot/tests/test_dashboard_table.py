@@ -193,3 +193,29 @@ def test_entry_ma_column_says_it_is_not_a_live_value():
     assert "전일 종가" in tip
     assert "실시간" in tip
     dashboard.close()
+
+
+def test_price_above_the_buy_line_is_marked_blue():
+    """돌파 조건이 선 종목은 매수기준을 파랗게 표시합니다."""
+    import ui_theme
+
+    dashboard = _dashboard()
+    table = dashboard.table
+    # DOGE: 현재가 0.2185 < 매수기준 0.2241 -> 아직 돌파 전
+    waiting = table.item(1, 3)
+    assert waiting.foreground().color().name().lower() ==         ui_theme.COLORS["text_dim"].lower()
+    assert "돌파선 위" not in waiting.toolTip()
+    dashboard.close()
+
+
+def test_breakout_colour_follows_the_live_price():
+    import ui_theme
+
+    dashboard = _dashboard()
+    # DOGE 현재가를 매수기준(0.2241) 위로 올리면 파랗게 바뀌어야 합니다.
+    dashboard.set_reference_price("DOGE", 0.2300)
+    dashboard.refresh()
+    broke = dashboard.table.item(1, 3)
+    assert broke.foreground().color().name().lower() ==         ui_theme.COLORS["info"].lower()
+    assert "매수 조건 성립" in broke.toolTip()
+    dashboard.close()
