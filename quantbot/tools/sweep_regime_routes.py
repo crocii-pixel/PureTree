@@ -18,8 +18,10 @@ from tools.backtest_config import _align_asof, prepare_data
 from tools.backtest_period import run_period_backtest
 
 
-BULL_DETECTORS = ("dual_ma", "log_macd", "volatility_breakout")
-BEAR_DETECTORS = ("dual_ma", "log_macd", "volatility_breakout", "lower_channel")
+BULL_DETECTORS = (
+    "dual_ma", "log_macd", "volatility_breakout", "lower_channel")
+BEAR_DETECTORS = (
+    "dual_ma", "log_macd", "volatility_decline", "lower_channel")
 ATR_MULTIPLES = (2.0, 4.0, 6.0, 8.0)
 DEFAULT_INTERVALS = ("1h", "4h", "1d", "1w", "1mo")
 

@@ -515,11 +515,20 @@ def prepare_data(config: Dict[str, Any], refresh: bool = False):
     tickers = [str(t).upper() for t in (static_tickers(config) or ["BTC"])]
     selection_frames: Dict[str, pd.DataFrame] = {}
     selection_schedule: Dict[pd.Timestamp, List[str]] = {}
+    selection_calendar = []
     if automatic_enabled(config):
         selection_frames = load_auto_selection_frames(refresh=refresh)
         btc_calendar = fetch_upbit("BTC", refresh=refresh)
+        selection_calendar = list(
+            btc_calendar.index if btc_calendar is not None else [])
+        opts = selection_config(config)
+        # Load the complete ranked reserve inside the liquidity universe first.
+        # After local/reference validation we rank again with only usable coins,
+        # so a missing winner is replaced by the next valid coin instead of
+        # silently shrinking an automatic six-coin portfolio.
         selection_schedule = build_weekly_schedule(
-            selection_frames, config, btc_calendar.index if btc_calendar is not None else [])
+            selection_frames, config, selection_calendar,
+            count=opts["liquidity_top"])
         selected_union = sorted({
             ticker for chosen in selection_schedule.values() for ticker in chosen})
         tickers = list(dict.fromkeys(tickers + selected_union))
@@ -549,17 +558,24 @@ def prepare_data(config: Dict[str, Any], refresh: bool = False):
                     "대체하지 않고 제외")
                 missing.append(ticker)
                 continue
-        if automatic_enabled(config):
-            opts = selection_config(config)
-            fixed = set(opts["fixed"] if opts["fixed_enabled"] else [])
-            chosen_by_date = {
-                pd.Timestamp(day).normalize(): set(chosen)
-                for day, chosen in selection_schedule.items()}
+        data[ticker] = local
+
+    if automatic_enabled(config):
+        opts = selection_config(config)
+        fixed = set(opts["fixed"] if opts["fixed_enabled"] else [])
+        available = set(data)
+        selection_schedule = build_weekly_schedule(
+            selection_frames, config, selection_calendar,
+            allowed=available, count=opts["count"])
+        chosen_by_date = {
+            pd.Timestamp(day).normalize(): set(chosen)
+            for day, chosen in selection_schedule.items()}
+        for ticker, local in data.items():
             local["auto_selected"] = [
-                ticker in fixed or ticker in chosen_by_date.get(pd.Timestamp(day).normalize(), set())
+                ticker in fixed or ticker in chosen_by_date.get(
+                    pd.Timestamp(day).normalize(), set())
                 for day in local.index
             ]
-        data[ticker] = local
 
     if "BTC" not in data:
         raise RuntimeError("BTC 일봉을 가져오지 못해 시장 상태를 만들 수 없습니다")
@@ -643,7 +659,7 @@ def prepare_data(config: Dict[str, Any], refresh: bool = False):
     if "BTC" not in [str(t).upper() for t in static_tickers(config)]:
         data.pop("BTC", None)
 
-    return data, ctx, missing
+    return data, ctx, list(dict.fromkeys(missing))
 
 
 def run_from_config(config: Dict[str, Any], start=None, end=None,

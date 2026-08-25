@@ -1,7 +1,8 @@
 import numpy as np
 import pandas as pd
 
-from regime_scoring import (_haltu_component, build_regime_frame,
+from regime_scoring import (_haltu_component, _project_lower_channel,
+                            build_regime_frame,
                             composite_bull_regime, current_regime_decision,
                             scoring_config, validate_scoring_config)
 
@@ -23,6 +24,8 @@ def test_defaults_use_independent_detectors_without_weights_or_thresholds():
     assert cfg["bear_detector"] == "lower_channel"
     assert cfg["bull_strategy"] == "period_rebalance"
     assert cfg["bear_strategy"] == "defensive_atr"
+    assert cfg["bull_atr_multiple"] == 1.0
+    assert cfg["bear_atr_multiple"] == 1.0
     assert not any("weight" in key or "threshold" in key for key in cfg)
 
 
@@ -114,7 +117,7 @@ def test_strategy_validation_rejects_invalid_methods_and_periods():
     errors = validate_scoring_config({
         "short_ma": 120, "long_ma": 60,
         "macd_fast": 60, "macd_slow": 30,
-        "bull_detector": "lower_channel",
+        "bull_detector": "unknown_bull",
         "bear_detector": "unknown",
         "decision_interval": "5d",
         "use_for_backtest": True,
@@ -122,6 +125,42 @@ def test_strategy_validation_rejects_invalid_methods_and_periods():
     assert len(errors) >= 5
     assert validate_scoring_config({"use_for_live": True}) == [
         "3국면 전략 라우팅은 현재 백테스트 전용입니다."]
+
+
+def test_atr_up_and_down_thresholds_are_independent_and_effective():
+    prices = frame(periods=90)
+    prices["open"] = prices["close"]
+    prices["high"] = prices["close"] * 1.04
+    prices["low"] = prices["close"] * 0.96
+    upward = build_regime_frame(prices, {"regime_scoring": {
+        "breakout_atr_window": 5,
+        "bull_atr_multiple": 0.1,
+        "bear_atr_multiple": 10.0,
+    }})
+    downward = build_regime_frame(prices, {"regime_scoring": {
+        "breakout_atr_window": 5,
+        "bull_atr_multiple": 10.0,
+        "bear_atr_multiple": 0.1,
+    }})
+    assert upward["breakout_upper_event"].fillna(False).any()
+    assert not upward["breakout_lower_event"].fillna(False).any()
+    assert downward["breakout_lower_event"].fillna(False).any()
+    assert not downward["breakout_upper_event"].fillna(False).any()
+    assert not upward["atr_upper_level"].equals(downward["atr_upper_level"])
+    assert not upward["atr_lower_level"].equals(downward["atr_lower_level"])
+
+
+def test_lower_channel_keeps_last_angle_on_straight_continuation():
+    index = pd.date_range("2024-01-01", periods=5, freq="D")
+    falling = _project_lower_channel(
+        pd.Series([100.0, 90.0, 90.0, 90.0, 90.0], index=index), 1)
+    assert (falling["lower_channel_slope"].iloc[1:] < 0).all()
+    assert falling["lower_channel_line"].iloc[-1] < 90.0
+
+    rising = _project_lower_channel(
+        pd.Series([90.0, 100.0, 100.0, 100.0, 100.0], index=index), 1)
+    assert (rising["lower_channel_slope"].iloc[1:] > 0).all()
+    assert rising["lower_channel_line"].iloc[-1] > 100.0
 
 
 def test_breakout_same_bar_is_conservatively_downside():

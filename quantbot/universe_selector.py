@@ -66,7 +66,8 @@ def automatic_enabled(config: Dict[str, Any]) -> bool:
 
 def rank_frames(frames: Dict[str, pd.DataFrame], config: Dict[str, Any],
                 before: Optional[Any] = None,
-                allowed: Optional[Set[str]] = None) -> List[str]:
+                allowed: Optional[Set[str]] = None,
+                count: Optional[int] = None) -> List[str]:
     """선정 시각 이전의 마감봉만으로 거래대금 TOP N → 7일 수익 TOP K."""
     opts = selection_config(config)
     rows = []
@@ -96,7 +97,8 @@ def rank_frames(frames: Dict[str, pd.DataFrame], config: Dict[str, Any],
     # 7일 수익률이 0 이상인 종목을 모멘텀 순으로 고릅니다.
     liquid = [row for row in liquid if row[2] >= 0]
     return [row[0] for row in sorted(
-        liquid, key=lambda row: (-row[2], -row[1], row[0]))[:opts["count"]]]
+        liquid, key=lambda row: (-row[2], -row[1], row[0]))[
+            :max(1, int(count if count is not None else opts["count"]))]]
 
 
 def binance_usdt_symbols(timeout: float = 8.0) -> Set[str]:
@@ -188,7 +190,9 @@ def select_live(exchange: Any, config: Dict[str, Any],
 
 def build_weekly_schedule(frames: Dict[str, pd.DataFrame],
                           config: Dict[str, Any],
-                          dates: Iterable[Any]) -> Dict[pd.Timestamp, List[str]]:
+                          dates: Iterable[Any],
+                          allowed: Optional[Set[str]] = None,
+                          count: Optional[int] = None) -> Dict[pd.Timestamp, List[str]]:
     """매주 월요일마다 과거 마감봉만 사용해 선정하고 다음 선정일까지 유지."""
     normalized = sorted({pd.Timestamp(d).normalize() for d in dates})
     if not normalized:
@@ -201,6 +205,7 @@ def build_weekly_schedule(frames: Dict[str, pd.DataFrame],
     rebalance_set = set(rebalance)
     for date in normalized:
         if date in rebalance_set or not current:
-            current = rank_frames(frames, config, before=date)
+            current = rank_frames(
+                frames, config, before=date, allowed=allowed, count=count)
         schedule[date] = list(current)
     return schedule

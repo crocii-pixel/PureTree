@@ -134,6 +134,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "macd_slow": 60,
         "macd_signal": 9,
         "breakout_atr_window": 20,
+        "bull_atr_multiple": 1.0,
+        "bear_atr_multiple": 1.0,
         "breakout_lower_window": 10,
         "channel_slope_bars": 3,
         "bull_strategy": "period_rebalance",

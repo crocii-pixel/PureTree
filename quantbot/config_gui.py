@@ -379,6 +379,10 @@ def build_config_window(parent: Any = None) -> Any:
             from regime_scoring import scoring_config
             self._regime_draft = scoring_config(config_provider())
             self._chart_window = None
+            self._chart_period_sync_timer = QtCore.QTimer(self)
+            self._chart_period_sync_timer.setSingleShot(True)
+            self._chart_period_sync_timer.setInterval(350)
+            self._chart_period_sync_timer.timeout.connect(self._sync_chart_period)
             self.setWindowTitle("QuantBot 백테스트")
             self.setMinimumSize(900, 650)
             self.resize(1120, 780)
@@ -463,8 +467,11 @@ def build_config_window(parent: Any = None) -> Any:
             self.segment_days.valueChanged.connect(self._on_segment_basis_changed)
             self.start_date.dateChanged.connect(self._on_segment_basis_changed)
             self.end_date.dateChanged.connect(self._on_segment_basis_changed)
-            self.start_date.dateChanged.connect(self._sync_chart_period)
-            self.end_date.dateChanged.connect(self._sync_chart_period)
+            # A QDateEdit wheel gesture can emit many intermediate years.  Do
+            # not make a chart on another monitor zoom/reload for every notch;
+            # only sync once after the edit settles.
+            self.start_date.dateChanged.connect(self._schedule_chart_period_sync)
+            self.end_date.dateChanged.connect(self._schedule_chart_period_sync)
             outer.addWidget(period_card)
             self._reload_presets("최근 1년")
             self.preset_combo.currentIndexChanged.connect(self._apply_preset)
@@ -683,6 +690,9 @@ def build_config_window(parent: Any = None) -> Any:
             window = self._chart_window
             if window is not None and window.isVisible():
                 window.sync_period()
+
+        def _schedule_chart_period_sync(self, _value: Any = None) -> None:
+            self._chart_period_sync_timer.start()
 
         def _update_split_controls(self, _value: Any = None) -> None:
             enabled = self.split_enabled.isChecked()

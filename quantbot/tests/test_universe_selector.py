@@ -60,6 +60,24 @@ def test_selection_never_uses_cutoff_day_candle():
     assert selected == ["AAA"]  # 당일 급등값 없이도 0% 조건 통과
 
 
+def test_missing_ranked_coin_is_replaced_by_next_available_coin():
+    frames = {
+        "AAA": frame(300, 0.03),
+        "BBB": frame(200, 0.02),
+        "CCC": frame(100, 0.01),
+    }
+    cfg = config(auto_selection_count=2, auto_liquidity_top=3)
+    selected = selector.rank_frames(
+        frames, cfg, before=pd.Timestamp("2024-01-22"),
+        allowed={"BBB", "CCC"})
+    assert selected == ["BBB", "CCC"]
+
+    schedule = selector.build_weekly_schedule(
+        frames, cfg, pd.date_range("2024-01-15", periods=7, freq="D"),
+        allowed={"BBB", "CCC"})
+    assert all(chosen == ["BBB", "CCC"] for chosen in schedule.values())
+
+
 def test_static_legacy_config_keeps_all_tickers():
     assert selector.static_tickers(
         {"tickers": ["BTC", "NOTACOIN", "ETH"]}) == ["BTC", "NOTACOIN", "ETH"]

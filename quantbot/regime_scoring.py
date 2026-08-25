@@ -31,6 +31,8 @@ DEFAULT_REGIME_SCORE_CONFIG: Dict[str, Any] = {
     "macd_slow": 60,
     "macd_signal": 9,
     "breakout_atr_window": 20,
+    "bull_atr_multiple": 1.0,
+    "bear_atr_multiple": 1.0,
     "breakout_lower_window": 10,
     "channel_slope_bars": 3,
     # Backtest-only strategy routing.  Live trading remains a separate opt-in.
@@ -42,8 +44,10 @@ DEFAULT_REGIME_SCORE_CONFIG: Dict[str, Any] = {
 }
 
 
-BULL_DETECTOR_IDS = {"dual_ma", "log_macd", "volatility_breakout"}
-BEAR_DETECTOR_IDS = BULL_DETECTOR_IDS | {"lower_channel"}
+BULL_DETECTOR_IDS = {
+    "dual_ma", "log_macd", "volatility_breakout", "lower_channel"}
+BEAR_DETECTOR_IDS = {
+    "dual_ma", "log_macd", "volatility_decline", "lower_channel"}
 DECISION_INTERVAL_IDS = {
     "1m", "15m", "30m", "1h", "2h", "3h", "4h", "1d", "1w", "1mo"}
 STRATEGY_IDS = {"period_rebalance", "volatility_breakout", "defensive_atr", "cash"}
@@ -99,6 +103,11 @@ def scoring_config(config: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]
                 result["bear_detector"] = selected
     if result.get("bull_detector") not in BULL_DETECTOR_IDS:
         result["bull_detector"] = "dual_ma"
+    # The old shared breakout detector represented both directions.  The two
+    # sides now have explicit meanings, so preserve an old bearish selection
+    # as the downside ATR detector.
+    if result.get("bear_detector") == "volatility_breakout":
+        result["bear_detector"] = "volatility_decline"
     if result.get("bear_detector") not in BEAR_DETECTOR_IDS:
         result["bear_detector"] = "lower_channel"
     if result.get("decision_interval") not in DECISION_INTERVAL_IDS:
@@ -109,6 +118,10 @@ def scoring_config(config: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]
     result["macd_signal"] = max(2, int(result.get("macd_signal", 9)))
     result["breakout_atr_window"] = max(
         2, int(result.get("breakout_atr_window", 20)))
+    result["bull_atr_multiple"] = float(np.clip(
+        float(result.get("bull_atr_multiple", 1.0) or 1.0), 0.1, 20.0))
+    result["bear_atr_multiple"] = float(np.clip(
+        float(result.get("bear_atr_multiple", 1.0) or 1.0), 0.1, 20.0))
     result["breakout_lower_window"] = max(
         2, int(result.get("breakout_lower_window", 10)))
     result["channel_slope_bars"] = max(
@@ -233,7 +246,8 @@ def _log_macd_component(close: pd.Series, fast: int, slow: int,
 
 
 def _breakout_component(frame: pd.DataFrame, atr_window: int,
-                        lower_window: int) -> pd.DataFrame:
+                        lower_window: int, bull_atr_multiple: float,
+                        bear_atr_multiple: float) -> pd.DataFrame:
     candle_range = (frame["high"] - frame["low"]).replace(0, np.nan)
     noise = 1.0 - (frame["close"] - frame["open"]).abs() / candle_range
     dynamic_k = noise.shift(1).rolling(20, min_periods=20).mean().fillna(0.5)
@@ -250,8 +264,12 @@ def _breakout_component(frame: pd.DataFrame, atr_window: int,
     lower_window = max(2, int(lower_window))
     exit_level = frame["low"].shift(1).rolling(
         lower_window, min_periods=lower_window).min()
-    upper_event = frame["high"] >= target
-    lower_event = frame["low"] <= exit_level
+    # Directional ATR levels are separate.  Both are known at the bar open:
+    # the anchor is the previous close and ATR contains completed bars only.
+    atr_upper_level = previous_close + atr * float(bull_atr_multiple)
+    atr_lower_level = previous_close - atr * float(bear_atr_multiple)
+    upper_event = frame["high"] >= atr_upper_level
+    lower_event = frame["low"] <= atr_lower_level
     # A daily bar cannot reveal intrabar ordering; downside wins conservatively.
     event = pd.Series(np.nan, index=frame.index, dtype=float)
     ready = atr.notna() & target.notna() & exit_level.notna()
@@ -270,6 +288,8 @@ def _breakout_component(frame: pd.DataFrame, atr_window: int,
         "dynamic_k": dynamic_k,
         "buy_target": target,
         "exit_level": exit_level,
+        "atr_upper_level": atr_upper_level,
+        "atr_lower_level": atr_lower_level,
         "breakout_upper_event": upper_event.shift(1).where(ready.shift(1)),
         "breakout_lower_event": lower_event.shift(1).where(ready.shift(1)),
         "breakout_ambiguous": (upper_event & lower_event).shift(1).where(ready.shift(1)),
@@ -286,19 +306,55 @@ def _detector_score(parts: pd.DataFrame, detector: str,
         return pd.to_numeric(parts["log_macd_score"], errors="coerce")
     if detector == "volatility_breakout":
         return pd.to_numeric(parts["breakout_score"], errors="coerce")
+    if detector == "volatility_decline":
+        return pd.to_numeric(parts["breakout_score"], errors="coerce")
 
-    # The red line drawn on the chart is the previous N-bar rolling low.
-    # Treat a completed close below the line or a falling line as bearish.
-    # Intrabar low wicks are not used for the regime decision.
-    lower = pd.to_numeric(parts["exit_level"], errors="coerce").where(
-        pd.to_numeric(parts["exit_level"], errors="coerce") > 0)
-    slope = np.log(lower).diff(max(1, int(slope_bars))) / max(1, int(slope_bars))
+    # The lower boundary joins causal rolling-low pivots.  Its last non-zero
+    # angle remains in force along the straight continuation until a new pivot
+    # changes that angle.  This makes a rising/falling channel persist instead
+    # of becoming neutral merely because the rolling low is temporarily flat.
+    lower = pd.to_numeric(parts["lower_channel_line"], errors="coerce").where(
+        pd.to_numeric(parts["lower_channel_line"], errors="coerce") > 0)
+    slope = pd.to_numeric(parts["lower_channel_slope"], errors="coerce")
     score = pd.Series(0.0, index=parts.index, dtype=float)
     completed = pd.to_numeric(parts["decision_close"], errors="coerce")
     ready = lower.notna() & slope.notna() & completed.notna()
     score.loc[ready & (slope > 0) & (completed >= lower)] = 1.0
     score.loc[ready & ((slope < 0) | (completed < lower))] = -1.0
     return score.where(ready)
+
+
+def _project_lower_channel(raw_lower: pd.Series,
+                           slope_bars: int) -> pd.DataFrame:
+    """Join each new lower pivot and extend its last angle causally."""
+    raw = pd.to_numeric(raw_lower, errors="coerce").where(
+        pd.to_numeric(raw_lower, errors="coerce") > 0)
+    bars = max(1, int(slope_bars))
+    measured = np.log(raw).diff(bars) / bars
+    changed = raw.ne(raw.shift(1)) & raw.notna() & raw.shift(1).notna()
+    measured = measured.where(changed & measured.ne(0.0))
+    continuing_slope = measured.ffill()
+    projected = pd.Series(np.nan, index=raw.index, dtype=float)
+    last_value = np.nan
+    last_slope = np.nan
+    previous_raw = np.nan
+    for stamp, value in raw.items():
+        if pd.isna(value):
+            continue
+        slope_value = continuing_slope.loc[stamp]
+        pivot = pd.isna(previous_raw) or not np.isclose(float(value), float(previous_raw))
+        if pivot or not np.isfinite(last_value):
+            last_value = float(value)
+        elif pd.notna(last_slope):
+            last_value = float(last_value) * float(np.exp(last_slope))
+        if pd.notna(slope_value):
+            last_slope = float(slope_value)
+        projected.loc[stamp] = last_value
+        previous_raw = float(value)
+    return pd.DataFrame({
+        "lower_channel_line": projected,
+        "lower_channel_slope": continuing_slope,
+    })
 
 
 def _classify_independent(bull_score: pd.Series,
@@ -339,13 +395,14 @@ def build_regime_frame(frame: pd.DataFrame,
     macd = _log_macd_component(
         prices["close"], cfg["macd_fast"], cfg["macd_slow"], cfg["macd_signal"])
     breakout = _breakout_component(
-        prices, cfg["breakout_atr_window"], cfg["breakout_lower_window"])
+        prices, cfg["breakout_atr_window"], cfg["breakout_lower_window"],
+        cfg["bull_atr_multiple"], cfg["bear_atr_multiple"])
     out = prices.join(haltu).join(macd).join(breakout)
+    channel = _project_lower_channel(
+        out["exit_level"], int(cfg["channel_slope_bars"]))
+    out = out.join(channel)
     out["lower_channel_score"] = _detector_score(
         out, "lower_channel", int(cfg["channel_slope_bars"]))
-    out["lower_channel_slope"] = np.log(
-        out["exit_level"].where(out["exit_level"] > 0)).diff(
-            int(cfg["channel_slope_bars"])) / int(cfg["channel_slope_bars"])
 
     if bool(cfg.get("enabled", True)):
         bull_score = _detector_score(

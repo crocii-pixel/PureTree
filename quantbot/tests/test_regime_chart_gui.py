@@ -90,28 +90,26 @@ def test_native_chart_builds_and_renders_without_webengine(monkeypatch):
     assert not qt_errors
     assert (window.chart._view_start, window.chart._view_end) != before
     assert window.chart._drag_preview_dx == 0.0
-    anchor = window.chart.anchor_state()
-    assert anchor is not None
+    expected_period = (
+        pd.Timestamp("2023-06-01"),
+        pd.Timestamp("2024-02-01 23:59:59.999999"),
+    )
     window._interval_buttons["1h"].click()
     deadline = time.monotonic() + 3.0
     while window._current_interval != "1h" and time.monotonic() < deadline:
         app.processEvents()
         time.sleep(0.01)
     assert window._current_interval == "1h"
-    price_rect, _, _ = window.chart._layout()
-    restored_x = price_rect.left() + anchor["ratio"] * price_rect.width()
-    restored_time = window.chart._time_at(restored_x, price_rect)
-    assert abs((restored_time - anchor["time"]).total_seconds()) < 1.0
+    assert window.chart.backtest_period() == expected_period
+    assert (window.chart._view_start, window.chart._view_end) == expected_period
     window._interval_buttons["1d"].click()
     deadline = time.monotonic() + 3.0
     while window._current_interval != "1d" and time.monotonic() < deadline:
         app.processEvents()
         time.sleep(0.01)
     assert window._current_interval == "1d"
-    restored_daily = window.chart.anchor_state()
-    assert restored_daily is not None
-    assert abs((restored_daily["time"] - anchor["time"]).total_seconds()) < 1.0
-    assert abs((restored_daily["span"] - anchor["span"]).total_seconds()) < 1.0
+    assert window.chart.backtest_period() == expected_period
+    assert (window.chart._view_start, window.chart._view_end) == expected_period
     assert [key for key, _label in __import__("regime_chart").CHART_INTERVALS] == list(
         window._interval_buttons)
     snapshot = os.getenv("QUANTBOT_CHART_SNAPSHOT")
@@ -120,8 +118,18 @@ def test_native_chart_builds_and_renders_without_webengine(monkeypatch):
     assert saved["bull_detector"] == "log_macd"
     assert saved["bear_detector"] == "lower_channel"
     assert saved["decision_interval"] == "1d"
-    assert window.chart.backtest_period() == (
-        pd.Timestamp("2023-06-01"), pd.Timestamp("2024-02-01"))
+    assert window.chart.backtest_period() == expected_period
+    assert "bull_atr_multiple" in window.inputs
+    assert "bear_atr_multiple" in window.inputs
+    analysis = window.chart._analysis_diagnostic()
+    assert not analysis.empty
+    normalized = pd.DatetimeIndex([
+        pd.Timestamp(value).tz_convert("UTC").tz_localize(None)
+        if pd.Timestamp(value).tzinfo is not None else pd.Timestamp(value)
+        for value in analysis.index
+    ])
+    assert normalized.min() >= expected_period[0]
+    assert normalized.max() <= expected_period[1]
     window.close()
     app.processEvents()
 
@@ -198,6 +206,53 @@ def test_backtest_period_area_exposes_chart_button(monkeypatch):
     assert window._backtest_window.chart_button.text() == "BTC 차트 보기"
     assert window._backtest_window._chart_window is None
     window._backtest_window.close()
+    window.close()
+    app.processEvents()
+
+
+def test_date_wheel_like_changes_debounce_chart_period_sync(monkeypatch):
+    try:
+        from PyQt6 import QtCore, QtWidgets
+    except ImportError:
+        try:
+            from PyQt5 import QtCore, QtWidgets
+        except ImportError:
+            pytest.skip("PyQt5/PyQt6 unavailable")
+    import copy
+    import config_manager
+    import config_gui
+
+    monkeypatch.setattr(
+        config_manager, "load_config", lambda: copy.deepcopy(config_manager.DEFAULT_CONFIG))
+    monkeypatch.setattr(config_manager, "read_env", lambda *_a, **_k: {})
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    window = config_gui.build_config_window()
+    window._open_backtest()
+    backtest = window._backtest_window
+    backtest._chart_period_sync_timer.stop()
+
+    class FakeChart:
+        calls = 0
+
+        def isVisible(self):
+            return True
+
+        def sync_period(self):
+            self.calls += 1
+
+    fake = FakeChart()
+    backtest._chart_window = fake
+    for year in (2022, 2021, 2020):
+        date = backtest.start_date.date()
+        backtest.start_date.setDate(QtCore.QDate(year, date.month(), date.day()))
+    app.processEvents()
+    assert fake.calls == 0
+    loop = QtCore.QEventLoop()
+    QtCore.QTimer.singleShot(500, loop.quit)
+    (loop.exec if hasattr(loop, "exec") else loop.exec_)()
+    assert fake.calls == 1
+    backtest._chart_window = None
+    backtest.close()
     window.close()
     app.processEvents()
 
