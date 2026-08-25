@@ -61,6 +61,7 @@ STRATEGY_OPTIONS: Tuple[Tuple[str, str], ...] = (
     ("period_rebalance", "주간 기간리밸런싱"),
     ("volatility_breakout", "동적 K 변동성돌파"),
     ("defensive_atr", "동적 K + ATR 하단 예약매수"),
+    ("cash_with_atr", "현금 대기 + ATR 하단 예약매수"),
     ("cash", "현금 대기"),
 )
 
@@ -1039,6 +1040,27 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
             probe.setDecimals(0)
             self.inputs["defensive_probe_fraction"] = probe
             strategy_form.addRow("예약매수 비중", probe)
+            take_profit = QtWidgets.QDoubleSpinBox()
+            take_profit.setRange(0.1, 100.0)
+            take_profit.setSingleStep(0.5)
+            take_profit.setSuffix(" %")
+            take_profit.setDecimals(1)
+            self.inputs["defensive_take_profit_pct"] = take_profit
+            strategy_form.addRow("예약 체결분 익절", take_profit)
+            stop_atr = QtWidgets.QDoubleSpinBox()
+            stop_atr.setRange(0.1, 20.0)
+            stop_atr.setSingleStep(0.1)
+            stop_atr.setSuffix(" ATR")
+            stop_atr.setDecimals(1)
+            self.inputs["defensive_stop_atr_multiple"] = stop_atr
+            strategy_form.addRow("예약 체결분 손절", stop_atr)
+            cancel_buffer = QtWidgets.QDoubleSpinBox()
+            cancel_buffer.setRange(0.0, 10.0)
+            cancel_buffer.setSingleStep(0.05)
+            cancel_buffer.setSuffix(" ATR")
+            cancel_buffer.setDecimals(2)
+            self.inputs["defensive_cancel_buffer_atr"] = cancel_buffer
+            strategy_form.addRow("돌파 접근 예약취소", cancel_buffer)
             self.panel_layout.addWidget(strategy_group)
 
             self.summary = QtWidgets.QLabel("국면 계산 대기")
@@ -1087,8 +1109,9 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
                 elif isinstance(widget, QtWidgets.QSpinBox):
                     widget.setValue(int(value))
                 else:
-                    shown = (float(value) * 100.0 if key == "defensive_probe_fraction"
-                             else float(value))
+                    shown = (float(value) * 100.0 if key in {
+                        "defensive_probe_fraction", "defensive_take_profit_pct"
+                    } else float(value))
                     widget.setValue(shown)
 
         def _settings(self) -> Dict[str, Any]:
@@ -1103,8 +1126,9 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
                     result[key] = bool(widget.isChecked())
                 else:
                     value = widget.value()
-                    result[key] = (float(value) / 100.0
-                                   if key == "defensive_probe_fraction" else value)
+                    result[key] = (float(value) / 100.0 if key in {
+                        "defensive_probe_fraction", "defensive_take_profit_pct"
+                    } else value)
             return result
 
         def _schedule(self, _value: Any = None) -> None:

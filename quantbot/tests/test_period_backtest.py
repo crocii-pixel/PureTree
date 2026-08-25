@@ -267,3 +267,98 @@ def test_routed_exit_respects_intraday_ma_timing():
     intraday = run_period_backtest({**base, "exit_timing": "intraday"}, data, ctx)
     assert not any(t["reason"].startswith("ma_intraday") for t in daily["_trades"])
     assert any(t["reason"].startswith("ma_intraday") for t in intraday["_trades"])
+
+
+def reservation_frame() -> pd.DataFrame:
+    index = pd.date_range("2024-01-01", periods=90, freq="D")
+    return pd.DataFrame({
+        "open": 100.0, "high": 100.0, "low": 95.0, "close": 100.0,
+        "N": 2.0, "target": 120.0,
+        "above_ma10": True, "above_ma3": True, "auto_selected": True,
+    }, index=index)
+
+
+def reservation_config(**score_overrides):
+    score = {
+        "use_for_backtest": True,
+        "bull_strategy": "cash_with_atr",
+        "stable_strategy": "cash_with_atr",
+        "bear_strategy": "cash_with_atr",
+        "defensive_atr_multiple": 2.0,
+        "defensive_probe_fraction": 0.25,
+        "defensive_take_profit_pct": 0.05,
+        "defensive_stop_atr_multiple": 2.0,
+        "defensive_cancel_buffer_atr": 0.25,
+    }
+    score.update(score_overrides)
+    return {
+        "exchange": "bithumb", "investment_strategy": "period_rebalance",
+        "regime_scoring": score,
+        "ma_window": 10, "bear_exit_ma_window": 3,
+        "risk_per_trade": 0.01, "atr_stop_multiple": 2.0,
+        "_fee_info": {"buy_rate": 0.0, "sell_rate": 0.0},
+        "backtest_slippage_rate": 0.0,
+    }
+
+
+def reservation_context(index):
+    return pd.DataFrame({
+        "explosive": False, "bull": False, "regime_label": "안정",
+    }, index=index)
+
+
+def test_cash_with_atr_places_daily_orders_and_takes_five_percent_profit():
+    frame = reservation_frame()
+    # Fill on day 1, then cross the 5% target without touching the ATR stop.
+    frame.iloc[1::3, frame.columns.get_loc("low")] = 99.0
+    frame.iloc[1::3, frame.columns.get_loc("high")] = 110.0
+    result = run_period_backtest(
+        reservation_config(), {"BTC": frame}, reservation_context(frame.index))
+    assert result["atr_reservations_placed"] > 0
+    assert result["atr_lower_buys"] > 0
+    assert result["atr_probe_take_profit_exits"] > 0
+    assert any(t["reason"] == "atr_probe_take_profit" for t in result["_trades"])
+
+
+def test_atr_probe_stop_rearms_on_a_later_day():
+    frame = reservation_frame()
+    frame.iloc[1, frame.columns.get_loc("low")] = 80.0
+    result = run_period_backtest(
+        reservation_config(), {"BTC": frame}, reservation_context(frame.index))
+    assert result["atr_probe_stop_exits"] > 0
+    # A stop day is blocked from a same-candle re-entry, then a later daily
+    # reservation can fill again.
+    assert result["atr_lower_buys"] >= 2
+
+
+def test_reservation_is_cancelled_when_breakout_is_near():
+    frame = reservation_frame()
+    frame["target"] = 105.0
+    frame["high"] = 104.5
+    frame["low"] = 99.0
+    result = run_period_backtest(
+        reservation_config(defensive_cancel_buffer_atr=0.5),
+        {"BTC": frame}, reservation_context(frame.index))
+    assert result["atr_reservations_cancelled_near_breakout"] > 0
+    assert result["atr_lower_buys"] == 0
+
+
+def test_unfilled_atr_reservation_locks_cash_away_from_breakout():
+    btc = reservation_frame()
+    eth = reservation_frame()
+    btc["target"] = 120.0
+    btc["high"] = 100.0
+    btc["low"] = 99.0
+    eth["target"] = 101.0
+    eth["high"] = 103.0
+    eth["low"] = 99.0
+    data = {"BTC": btc, "ETH": eth}
+    config = reservation_config(
+        stable_strategy="defensive_atr",
+        defensive_cancel_buffer_atr=0.0)
+    config["risk_per_trade"] = 1.0
+    result = run_period_backtest(
+        config, data, reservation_context(btc.index))
+    assert result["atr_locked_cash_max_pct"] > 0
+    assert result["atr_reservations_expired"] > 0
+    assert result["매수주문"] == 0

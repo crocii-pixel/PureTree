@@ -785,6 +785,17 @@ def build_config_window(parent: Any = None) -> Any:
             if segments:
                 html += (f"<br><span style='color:#FFFFFF'>구간 검증 "
                          f"<b>{len(segments)}개</b>를 같은 실행 그룹으로 저장했습니다.</span>")
+            if selected and int(selected.get("atr_reservations_placed", 0) or 0) > 0:
+                html += (
+                    "<br><span style='color:#7DD3FC'>ATR 예약 "
+                    f"<b>{int(selected.get('atr_reservations_placed', 0))}</b>회 · "
+                    f"체결 {int(selected.get('atr_lower_buys', 0))} · "
+                    f"돌파접근 취소 {int(selected.get('atr_reservations_cancelled_near_breakout', 0))} · "
+                    f"익절 {int(selected.get('atr_probe_take_profit_exits', 0))} · "
+                    f"손절 {int(selected.get('atr_probe_stop_exits', 0))} · "
+                    f"평균 잠금 {float(selected.get('atr_locked_cash_average_pct', 0.0)):.2f}%"
+                    "</span>"
+                )
             if payload.get("missing"):
                 html += (f"<br><span style='color:#FFD166'>시세 부족 제외: "
                          f"{', '.join(payload['missing'])}</span>")

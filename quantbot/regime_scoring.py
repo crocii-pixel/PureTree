@@ -41,6 +41,11 @@ DEFAULT_REGIME_SCORE_CONFIG: Dict[str, Any] = {
     "bear_strategy": "defensive_atr",
     "defensive_atr_multiple": 2.0,
     "defensive_probe_fraction": 0.25,
+    # ATR lower orders are rebuilt from the latest completed candle every day.
+    # Filled probe units are managed separately from core/breakout holdings.
+    "defensive_take_profit_pct": 0.05,
+    "defensive_stop_atr_multiple": 2.0,
+    "defensive_cancel_buffer_atr": 0.25,
 }
 
 
@@ -50,7 +55,10 @@ BEAR_DETECTOR_IDS = {
     "dual_ma", "log_macd", "volatility_decline", "lower_channel"}
 DECISION_INTERVAL_IDS = {
     "1m", "15m", "30m", "1h", "2h", "3h", "4h", "1d", "1w", "1mo"}
-STRATEGY_IDS = {"period_rebalance", "volatility_breakout", "defensive_atr", "cash"}
+STRATEGY_IDS = {
+    "period_rebalance", "volatility_breakout", "defensive_atr",
+    "cash_with_atr", "cash",
+}
 
 
 REGIME_COLORS = {
@@ -135,6 +143,13 @@ def scoring_config(config: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]
                                               key=lambda value: abs(value - multiple))
     result["defensive_probe_fraction"] = float(np.clip(
         float(result.get("defensive_probe_fraction", 0.25) or 0.25), 0.01, 1.0))
+    result["defensive_take_profit_pct"] = float(np.clip(
+        float(result.get("defensive_take_profit_pct", 0.05) or 0.05), 0.001, 1.0))
+    result["defensive_stop_atr_multiple"] = float(np.clip(
+        float(result.get("defensive_stop_atr_multiple", 2.0) or 2.0), 0.1, 20.0))
+    cancel_buffer = result.get("defensive_cancel_buffer_atr", 0.25)
+    result["defensive_cancel_buffer_atr"] = float(np.clip(
+        float(0.25 if cancel_buffer is None else cancel_buffer), 0.0, 10.0))
     return result
 
 
@@ -154,6 +169,12 @@ def validate_scoring_config(config: Optional[Mapping[str, Any]] = None,
             errors.append("MACD 느림 기간은 빠름 기간보다 커야 합니다.")
         if int(merged["breakout_lower_window"]) < 2:
             errors.append("하방 채널 기간은 2봉 이상이어야 합니다.")
+        if float(merged["defensive_take_profit_pct"]) <= 0:
+            errors.append("예약 체결분 익절률은 0보다 커야 합니다.")
+        if float(merged["defensive_stop_atr_multiple"]) <= 0:
+            errors.append("예약 체결분 ATR 손절 배수는 0보다 커야 합니다.")
+        if float(merged["defensive_cancel_buffer_atr"]) < 0:
+            errors.append("돌파 접근 예약취소 거리는 0 이상이어야 합니다.")
     except (KeyError, TypeError, ValueError):
         errors.append("국면 판정 숫자 설정을 확인해 주세요.")
 

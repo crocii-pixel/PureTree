@@ -24,9 +24,18 @@ def test_defaults_use_independent_detectors_without_weights_or_thresholds():
     assert cfg["bear_detector"] == "lower_channel"
     assert cfg["bull_strategy"] == "period_rebalance"
     assert cfg["bear_strategy"] == "defensive_atr"
+    assert cfg["defensive_take_profit_pct"] == 0.05
     assert cfg["bull_atr_multiple"] == 1.0
     assert cfg["bear_atr_multiple"] == 1.0
     assert not any("weight" in key or "threshold" in key for key in cfg)
+
+
+def test_cash_with_atr_is_a_valid_phase_strategy():
+    cfg = scoring_config({
+        "regime_scoring": {"stable_strategy": "cash_with_atr"},
+    })
+    assert cfg["stable_strategy"] == "cash_with_atr"
+    assert not validate_scoring_config(cfg)
 
 
 def test_decision_never_uses_current_candle():

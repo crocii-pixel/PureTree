@@ -57,6 +57,12 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
     defensive_multiple = float(scoring.get("defensive_atr_multiple", 2.0))
     probe_fraction = float(np.clip(
         scoring.get("defensive_probe_fraction", 0.25), 0.01, 1.0))
+    probe_take_profit = float(np.clip(
+        scoring.get("defensive_take_profit_pct", 0.05), 0.001, 1.0))
+    probe_stop_multiple = float(np.clip(
+        scoring.get("defensive_stop_atr_multiple", 2.0), 0.1, 20.0))
+    cancel_buffer_atr = float(np.clip(
+        scoring.get("defensive_cancel_buffer_atr", 0.25), 0.0, 10.0))
     use_reference = str(config.get("signal_reference", "binance")) == "binance"
     btc_min_weight = float(np.clip(config.get("btc_min_weight", 0.0), 0.0, 1.0))
     sizing_cap = max(0.0, float(config.get("sizing_equity_cap_krw", 0.0)))
@@ -76,6 +82,9 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
     cash_ratios = []
     exposure = buy_orders = switches = 0
     lower_buy_orders = 0
+    reservation_placed = reservation_cancelled = reservation_expired = 0
+    reservation_ambiguous = probe_take_profits = probe_stops = 0
+    locked_cash_ratios = []
     previous_strategy = None
 
     def active(date):
@@ -131,19 +140,55 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
             units = budget / (entry * (1 + buy_fee))
             positions[ticker] = {"units": units, "cost": budget, "entry": entry,
                                  "core_units": units, "breakout_units": 0.0,
-                                 "probe_units": 0.0}
+                                 "probe_units": 0.0, "core_cost": budget,
+                                 "breakout_cost": 0.0, "probe_cost": 0.0,
+                                 "probe_entry": 0.0}
             cash -= budget
             buy_orders += 1
 
     def add_position(ticker, units, budget, entry, bucket):
         old = positions.get(ticker, {
             "units": 0.0, "cost": 0.0, "entry": entry,
-            "core_units": 0.0, "breakout_units": 0.0, "probe_units": 0.0})
+            "core_units": 0.0, "breakout_units": 0.0, "probe_units": 0.0,
+            "core_cost": 0.0, "breakout_cost": 0.0, "probe_cost": 0.0,
+            "probe_entry": 0.0})
         old["units"] += units
         old["cost"] += budget
         old[bucket] = old.get(bucket, 0.0) + units
+        cost_key = bucket.replace("_units", "_cost")
+        old[cost_key] = old.get(cost_key, 0.0) + budget
+        if bucket == "probe_units" and old["probe_units"] > 0:
+            previous_units = old["probe_units"] - units
+            old["probe_entry"] = (
+                old.get("probe_entry", 0.0) * previous_units + entry * units
+            ) / old["probe_units"]
         old["entry"] = entry
         positions[ticker] = old
+
+    def sell_bucket(ticker, date, bucket, reason, fill_price):
+        """Sell one independently managed position bucket."""
+        nonlocal cash
+        pos = positions[ticker]
+        units = float(pos.get(bucket, 0.0))
+        if units <= 0:
+            return False
+        cost_key = bucket.replace("_units", "_cost")
+        cost = float(pos.get(cost_key, 0.0))
+        price = max(0.0, float(fill_price)) * (1 - slippage)
+        proceeds = units * price * (1 - sell_fee)
+        cash += proceeds
+        trades.append({"date": date, "ticker": ticker, "reason": reason,
+                       "return": proceeds / cost - 1.0 if cost > 0 else 0.0,
+                       "profit": proceeds - cost})
+        pos["units"] = max(0.0, float(pos["units"]) - units)
+        pos["cost"] = max(0.0, float(pos["cost"]) - cost)
+        pos[bucket] = 0.0
+        pos[cost_key] = 0.0
+        if bucket == "probe_units":
+            pos["probe_entry"] = 0.0
+        if pos["units"] <= 1e-12:
+            positions.pop(ticker, None)
+        return True
 
     for date in dates:
         phase = str(regime_labels.get(date, "판정 준비"))
@@ -164,8 +209,9 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
                 for ticker in list(positions):
                     sell(ticker, date, "weekly_rebalance")
                 buy_equal(date, active(date))
-        elif strategy in {"volatility_breakout", "defensive_atr"}:
+        elif strategy in {"volatility_breakout", "defensive_atr", "cash_with_atr"}:
             closed_today = set()
+            probe_rearm_blocked = set()
             for ticker in list(positions):
                 if date not in data[ticker].index:
                     continue
@@ -203,6 +249,36 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
                     sell(ticker, date, "ma_daily")
                     closed_today.add(ticker)
 
+                # ATR reservation fills are a separate bucket.  A take-profit
+                # or ATR stop never liquidates unrelated core/breakout units.
+                if ticker not in positions or ticker in closed_today:
+                    continue
+                pos = positions[ticker]
+                if float(pos.get("probe_units", 0.0)) <= 0:
+                    continue
+                probe_entry = float(pos.get("probe_entry", 0.0))
+                local_atr = float(r.get("N", np.nan))
+                if (not np.isfinite(probe_entry) or probe_entry <= 0
+                        or not np.isfinite(local_atr) or local_atr <= 0):
+                    continue
+                stop_price = max(0.0, probe_entry - probe_stop_multiple * local_atr)
+                take_price = probe_entry * (1.0 + probe_take_profit)
+                open_price = float(r["open"])
+                low_price = float(r["low"])
+                high_price = float(r["high"])
+                # When both boundaries occur in one daily candle, use the
+                # downside-first ordering.  This is deliberately conservative.
+                if open_price <= stop_price or low_price <= stop_price:
+                    fill = open_price if open_price <= stop_price else stop_price
+                    if sell_bucket(ticker, date, "probe_units", "atr_probe_stop", fill):
+                        probe_stops += 1
+                        probe_rearm_blocked.add(ticker)
+                elif open_price >= take_price or high_price >= take_price:
+                    fill = open_price if open_price >= take_price else take_price
+                    if sell_bucket(ticker, date, "probe_units", "atr_probe_take_profit", fill):
+                        probe_take_profits += 1
+                        probe_rearm_blocked.add(ticker)
+
             opening_equity = cash + sum(
                 p["units"] * mark_price(t, date, "open")
                 for t, p in positions.items())
@@ -224,6 +300,8 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
                     if held_btc < btc_target * refill:
                         btc_reserved = min(
                             cash, (btc_target - held_btc) * btc_entry * (1 + buy_fee))
+            plans = {}
+            reservation_mode = strategy in {"defensive_atr", "cash_with_atr"}
             for ticker in active_names:
                 if ticker in closed_today:
                     continue
@@ -240,6 +318,103 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
                     target_units = max(
                         target_units,
                         sizing_equity * btc_min_weight / max(reference_entry, 1e-12))
+                plans[ticker] = {
+                    "row": r, "target_col": target_col, "ma_col": ma_col,
+                    "target_units": target_units,
+                }
+
+            # Build one-day standing ATR orders before any breakout spending.
+            # Unfilled orders lock cash for the session and expire at day end.
+            locked_cash = 0.0
+            open_reservations = {}
+            if reservation_mode:
+                for ticker in active_names:
+                    if ticker not in plans or ticker in probe_rearm_blocked:
+                        continue
+                    plan = plans[ticker]
+                    r = plan["row"]
+                    signal_open = float(r.get("signal_open", r["open"]))
+                    signal_low = float(r.get("signal_low", r["low"]))
+                    signal_atr = float(r.get("signal_N", r["N"]))
+                    if (not np.isfinite(signal_open) or not np.isfinite(signal_low)
+                            or not np.isfinite(signal_atr) or signal_open <= 0
+                            or signal_atr <= 0):
+                        continue
+                    lower_target = signal_open - defensive_multiple * signal_atr
+                    if lower_target <= 0:
+                        continue
+                    lower_ratio = lower_target / signal_open
+                    raw_entry = max(1e-12, float(r["open"]) * lower_ratio)
+                    probe_target = plan["target_units"] * probe_fraction
+                    held_probe = positions.get(ticker, {}).get("probe_units", 0.0)
+                    if held_probe >= probe_target * refill:
+                        continue
+                    desired_budget = max(
+                        0.0, (probe_target - held_probe) * raw_entry *
+                        (1 + slippage) * (1 + buy_fee))
+                    available = (max(0.0, cash - locked_cash) if ticker == "BTC"
+                                 else max(0.0, cash - btc_reserved - locked_cash))
+                    budget = min(desired_budget, available)
+                    if budget <= 0:
+                        continue
+
+                    # The local target is executable in KRW.  Cancel at the
+                    # session open if it is already within the configured ATR
+                    # buffer; otherwise an intraday approach cancels only when
+                    # the lower order was not hit in that same daily candle.
+                    local_atr = max(float(r["N"]), 1e-12)
+                    near_level = float(r[plan["target_col"]]) - (
+                        cancel_buffer_atr * local_atr)
+                    near_at_open = float(r["open"]) >= near_level
+                    near_intraday = float(r["high"]) >= near_level
+                    lower_hit = signal_low <= lower_target
+                    if near_at_open:
+                        continue
+                    reservation_placed += 1
+                    if near_intraday and not lower_hit:
+                        reservation_cancelled += 1
+                        continue
+                    if near_intraday and lower_hit:
+                        reservation_ambiguous += 1
+                    open_reservations[ticker] = {
+                        "budget": budget, "raw_entry": raw_entry,
+                        "lower_hit": lower_hit,
+                    }
+                    locked_cash += budget
+                    if ticker == "BTC":
+                        btc_reserved = max(0.0, btc_reserved - budget)
+
+            if opening_equity > 0:
+                locked_cash_ratios.append(locked_cash / opening_equity)
+
+            # A same-candle lower hit and later rally is modelled downside-first:
+            # the reservation fills before any breakout order can use that cash.
+            filled_reservations = set()
+            for ticker, reservation in open_reservations.items():
+                if not reservation["lower_hit"]:
+                    continue
+                budget = min(float(reservation["budget"]), cash)
+                locked_cash = max(0.0, locked_cash - float(reservation["budget"]))
+                if budget <= 0:
+                    continue
+                entry = float(reservation["raw_entry"]) * (1 + slippage)
+                bought = budget / (entry * (1 + buy_fee))
+                add_position(ticker, bought, budget, entry, "probe_units")
+                cash -= budget
+                buy_orders += 1
+                lower_buy_orders += 1
+                filled_reservations.add(ticker)
+
+            for ticker in active_names:
+                if ticker not in plans or ticker in closed_today:
+                    continue
+                plan = plans[ticker]
+                r = plan["row"]
+                target_col = plan["target_col"]
+                ma_col = plan["ma_col"]
+                target_units = plan["target_units"]
+                if strategy == "cash_with_atr":
+                    continue
                 breakout_share = (1.0 - probe_fraction
                                   if strategy == "defensive_atr" else 1.0)
                 breakout_target_units = target_units * breakout_share
@@ -247,8 +422,8 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
                 if (float(r["high"]) >= float(r[target_col]) and bool(r[ma_col])
                         and held_breakout < breakout_target_units * refill):
                     entry = max(float(r["open"]), float(r[target_col])) * (1 + slippage)
-                    spendable = (cash if ticker == "BTC"
-                                 else max(0.0, cash - btc_reserved))
+                    spendable = (max(0.0, cash - locked_cash) if ticker == "BTC"
+                                 else max(0.0, cash - btc_reserved - locked_cash))
                     budget = min(
                         (breakout_target_units - held_breakout) * entry * (1 + buy_fee),
                         spendable)
@@ -260,37 +435,9 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
                             btc_reserved = max(0.0, btc_reserved - budget)
                         buy_orders += 1
 
-                if strategy != "defensive_atr" or cash <= 0:
-                    continue
-                signal_open = float(r.get("signal_open", r["open"]))
-                signal_low = float(r.get("signal_low", r["low"]))
-                signal_atr = float(r.get("signal_N", r["N"]))
-                if (not np.isfinite(signal_open) or not np.isfinite(signal_low)
-                        or not np.isfinite(signal_atr) or signal_open <= 0
-                        or signal_atr <= 0):
-                    continue
-                lower_target = signal_open - defensive_multiple * signal_atr
-                if lower_target <= 0 or signal_low > lower_target:
-                    continue
-                ratio = lower_target / signal_open
-                entry = max(1e-12, float(r["open"]) * ratio) * (1 + slippage)
-                probe_target_units = target_units * probe_fraction
-                held_probe = positions.get(ticker, {}).get("probe_units", 0.0)
-                if held_probe >= probe_target_units * refill:
-                    continue
-                spendable = (cash if ticker == "BTC"
-                             else max(0.0, cash - btc_reserved))
-                budget = min(
-                    (probe_target_units - held_probe) * entry * (1 + buy_fee), spendable)
-                if budget <= 0:
-                    continue
-                bought = budget / (entry * (1 + buy_fee))
-                add_position(ticker, bought, budget, entry, "probe_units")
-                cash -= budget
-                if ticker == "BTC":
-                    btc_reserved = max(0.0, btc_reserved - budget)
-                buy_orders += 1
-                lower_buy_orders += 1
+            reservation_expired += sum(
+                ticker not in filled_reservations
+                for ticker in open_reservations)
 
         holdings = sum(p["units"] * mark_price(t, date, "close")
                        for t, p in positions.items())
@@ -343,7 +490,20 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
         "phase_strategies": phase_strategies,
         "defensive_atr_multiple": defensive_multiple,
         "defensive_probe_fraction": probe_fraction,
+        "defensive_take_profit_pct": probe_take_profit,
+        "defensive_stop_atr_multiple": probe_stop_multiple,
+        "defensive_cancel_buffer_atr": cancel_buffer_atr,
         "atr_lower_buys": lower_buy_orders,
+        "atr_reservations_placed": reservation_placed,
+        "atr_reservations_cancelled_near_breakout": reservation_cancelled,
+        "atr_reservations_expired": reservation_expired,
+        "atr_same_bar_ambiguous": reservation_ambiguous,
+        "atr_probe_take_profit_exits": probe_take_profits,
+        "atr_probe_stop_exits": probe_stops,
+        "atr_locked_cash_average_pct": round(
+            float(np.mean(locked_cash_ratios)) * 100, 2) if locked_cash_ratios else 0.0,
+        "atr_locked_cash_max_pct": round(
+            float(np.max(locked_cash_ratios)) * 100, 2) if locked_cash_ratios else 0.0,
         "_equity": equity_series, "_monthly": monthly, "_trades": trades,
         "_regime": ctx.loc[dates, [column for column in ctx.columns
                                    if str(column).startswith("regime_")]].copy(),

@@ -143,6 +143,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "bear_strategy": "defensive_atr",
         "defensive_atr_multiple": 2.0,
         "defensive_probe_fraction": 0.25,
+        "defensive_take_profit_pct": 0.05,
+        "defensive_stop_atr_multiple": 2.0,
+        "defensive_cancel_buffer_atr": 0.25,
     },
     "tickers": ["BTC", "ETH", "SOL"],
     # 종목 선정: 고정 종목 + 추가(자동 또는 수동). tickers는 하위 호환용 합집합입니다.
