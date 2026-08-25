@@ -22,9 +22,10 @@ class _Bot:
 
     def __init__(self):
         self.exchange = _Exchange()
-        self.tickers = ["BTC", "DOGE"]
+        self.tickers = ["BTC", "DOGE", "XRP"]
         self.invalid_tickers = ["XPR"]
-        self.ticker_names = {"BTC": "비트코인", "DOGE": "도지코인"}
+        self.ticker_names = {"BTC": "비트코인", "DOGE": "도지코인",
+                             "XRP": "엑스알피(리플)"}
         self.use_dynamic_k = True
         self.k = 0.5
         self.ma_window = 5
@@ -32,19 +33,21 @@ class _Bot:
         self.is_paused = False
         # 같은 종목의 KRW 목표가와 USD 판정선이 서로 다른 값이어야
         # 어느 쪽이 화면에 나갔는지 구분됩니다.
-        self.target_prices = {"BTC": 158_400_000, "DOGE": 312}
-        self.signal_targets = {"BTC": 113_842.55, "DOGE": 0.2241}
-        self.exit_ma_values = {"BTC": 109_204.18, "DOGE": 0.2108}
-        self.effective_ks = {"BTC": 0.4821, "DOGE": 0.6033}
-        self.is_above_ma = {"BTC": True, "DOGE": False}
-        self.signal_sources = {"BTC": "global", "DOGE": "global"}
-        self.bought_today = {"BTC": True, "DOGE": False}
-        self.closed_today = {"BTC": False, "DOGE": False}
-        self.has_position = {"BTC": True, "DOGE": False}
-        self.skipped_today = {"BTC": False, "DOGE": False}
-        self.position_units = {"BTC": 0.01, "DOGE": 0.0}
-        self.pending_buy_units = {"BTC": 0.0, "DOGE": 0.0}
-        self.target_position_units = {"BTC": 0.011, "DOGE": 0.0}
+        self.exit_timing = "daily"
+        self.target_prices = {"BTC": 158_400_000, "DOGE": 312, "XRP": 2_011}
+        self.signal_targets = {"BTC": 113_842.55, "DOGE": 0.2241, "XRP": 1.52}
+        # XRP 는 현재가(1.45)가 매도기준(1.48) 아래인 '이탈' 상태입니다.
+        self.exit_ma_values = {"BTC": 109_204.18, "DOGE": 0.2108, "XRP": 1.48}
+        self.effective_ks = {"BTC": 0.4821, "DOGE": 0.6033, "XRP": 0.5104}
+        self.is_above_ma = {"BTC": True, "DOGE": False, "XRP": True}
+        self.signal_sources = {t: "global" for t in ("BTC", "DOGE", "XRP")}
+        self.bought_today = {"BTC": True, "DOGE": False, "XRP": True}
+        self.closed_today = {"BTC": False, "DOGE": False, "XRP": False}
+        self.has_position = {"BTC": True, "DOGE": False, "XRP": True}
+        self.skipped_today = {"BTC": False, "DOGE": False, "XRP": False}
+        self.position_units = {"BTC": 0.01, "DOGE": 0.0, "XRP": 100.0}
+        self.pending_buy_units = {"BTC": 0.0, "DOGE": 0.0, "XRP": 0.0}
+        self.target_position_units = {"BTC": 0.011, "DOGE": 0.0, "XRP": 110.0}
 
     def exit_ma_window(self):
         return 5
@@ -73,6 +76,8 @@ def _dashboard():
     dashboard.set_price("DOGE", 305)
     dashboard.set_reference_price("BTC", 113_204.11)
     dashboard.set_reference_price("DOGE", 0.2185)
+    dashboard.set_price("XRP", 2_011)
+    dashboard.set_reference_price("XRP", 1.45)
     dashboard.refresh()
     return dashboard
 
@@ -89,8 +94,8 @@ def test_columns_are_ordered_and_labelled_by_currency():
         "매도기준(USD)", "적용 K", "진입 MA", "당일 상태",
     ]
     assert dashboard.table.columnCount() == len(dashboard.COLUMNS)
-    # 감시 2종 + 상장 확인 실패 1종
-    assert dashboard.table.rowCount() == 3
+    # 감시 3종 + 상장 확인 실패 1종
+    assert dashboard.table.rowCount() == 4
     dashboard.close()
 
 
@@ -153,4 +158,38 @@ def test_excluded_ticker_row_matches_the_column_count():
     assert _text(table, row, table.columnCount() - 1) == "관리 제외"
     for col in range(1, table.columnCount() - 1):
         assert _text(table, row, col) == "—", col
+    dashboard.close()
+
+
+def test_price_below_the_sell_line_is_marked_not_left_grey():
+    """현재가가 매도기준 아래인데 회색으로 조용히 있으면 정상으로 읽힙니다.
+
+    실제로 네 종목이 판정선을 뚫고 내려갔는데 화면상 아무 표시가 없어
+    "왜 손절을 안 하냐"는 말을 들었습니다. 최소한 눈에는 보여야 합니다.
+    """
+    import ui_theme
+
+    dashboard = _dashboard()
+    table = dashboard.table
+    # XRP: 현재가 1.45 < 매도기준 1.48
+    breached = table.item(2, 4)
+    assert breached.text() == "1.48"
+    assert breached.foreground().color().name().lower() ==         ui_theme.COLORS["danger"].lower()
+    assert "판정선 아래" in breached.toolTip()
+    # 청산이 언제 일어나는지가 "왜 아직 안 팔았나"의 답입니다.
+    assert "일봉" in breached.toolTip()
+
+    # BTC: 현재가 113,204 > 매도기준 109,204 이므로 평소 색
+    normal = table.item(0, 4)
+    assert normal.foreground().color().name().lower() ==         ui_theme.COLORS["text_dim"].lower()
+    assert "판정선 아래" not in normal.toolTip()
+    dashboard.close()
+
+
+def test_entry_ma_column_says_it_is_not_a_live_value():
+    """'충족'은 전일 종가 기준입니다. 실시간으로 오해하면 상태를 잘못 읽습니다."""
+    dashboard = _dashboard()
+    tip = dashboard.table.item(0, 6).toolTip()
+    assert "전일 종가" in tip
+    assert "실시간" in tip
     dashboard.close()

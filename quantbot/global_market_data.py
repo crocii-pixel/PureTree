@@ -69,9 +69,22 @@ def parse_progress(message: str) -> Dict[str, object]:
     }
 
 
-def bootstrap_needed(root: Optional[Path] = None) -> bool:
-    """정본이 아직 한 번도 수집되지 않았는지."""
-    return not GlobalMarketRepository(root).sealed_files("1m")
+def bootstrap_needed(root: Optional[Path] = None,
+                     interval: str = "1m") -> bool:
+    """
+    정본이 요청한 시간봉을 아직 내줄 수 없는지.
+
+    1분봉만 받아 두고 집계(1h/1d)를 못 끝낸 상태가 실제로 나옵니다.  집계는
+    모든 달을 받은 **뒤에** 한 번에 하므로, 수집이 중간에 끊기면 1분봉 파일은
+    쌓여 있는데 일봉은 하나도 없습니다.  1분봉만 보고 판단하면 "정본은 있는데
+    데이터가 없다"는 상태가 되어 안내만 무한 반복됩니다.
+    """
+    try:
+        backbone = source_interval_for(interval)
+    except ValueError:
+        # 주봉·월봉은 저장소가 직접 갖고 있지 않고 일봉에서 만들어 씁니다.
+        backbone = "1d"
+    return not GlobalMarketRepository(root).sealed_files(backbone)
 
 
 def missing_requirements() -> List[str]:

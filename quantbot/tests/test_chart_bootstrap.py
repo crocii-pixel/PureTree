@@ -57,7 +57,8 @@ def _chart_window(monkeypatch, *, empty=True):
     monkeypatch.setattr(
         global_market_data, "load_global_btc",
         lambda *_a, **_k: pd.DataFrame() if empty else None)
-    monkeypatch.setattr(global_market_data, "bootstrap_needed", lambda *_a: True)
+    monkeypatch.setattr(global_market_data, "bootstrap_needed",
+                        lambda *_a, **_k: True)
 
     _APP = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     window = regime_chart.build_regime_chart_window(
@@ -199,6 +200,35 @@ def test_chart_shows_the_install_command_instead_of_starting(monkeypatch):
     assert window.bootstrap_row.isHidden()
     window.close()
     app.processEvents()
+
+
+def test_minutes_without_rollups_still_counts_as_needing_the_bootstrap(tmp_path):
+    """1분봉만 받고 집계 전에 끊긴 상태가 실제로 나옵니다.
+
+    집계(1h/1d)는 모든 달을 받은 **뒤에** 한 번에 합니다. 중간에 끊기면 1분봉
+    파일은 쌓여 있는데 일봉은 하나도 없습니다. 1분봉만 보고 "정본 있음"이라고
+    답하면 차트는 "데이터가 없습니다"만 무한 반복하게 됩니다.
+    """
+    from global_market_data import PAIR, bootstrap_needed
+
+    minute_dir = tmp_path / "BTC" / "1m" / "2011"
+    minute_dir.mkdir(parents=True)
+    (minute_dir / f"{PAIR}__1m__20110819-20110831__r0001__sealed.parquet").touch()
+
+    # 1분봉은 있으므로 분봉 차트는 더 받을 필요가 없습니다.
+    assert bootstrap_needed(tmp_path, interval="1m") is False
+    assert bootstrap_needed(tmp_path, interval="15m") is False
+    # 하지만 시봉·일봉은 아직 만들어지지 않았습니다.
+    assert bootstrap_needed(tmp_path, interval="1h") is True
+    assert bootstrap_needed(tmp_path, interval="1d") is True
+    assert bootstrap_needed(tmp_path, interval="1w") is True
+
+
+def test_empty_archive_needs_the_bootstrap_for_every_interval(tmp_path):
+    from global_market_data import bootstrap_needed
+
+    for interval in ("1m", "15m", "1h", "1d", "1mo"):
+        assert bootstrap_needed(tmp_path, interval=interval) is True
 
 
 class _NoThread:

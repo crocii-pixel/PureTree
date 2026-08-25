@@ -922,7 +922,7 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
                 data = aggregate_chart_frame(data, self.interval)
                 if data.empty:
                     from global_market_data import bootstrap_needed
-                    if bootstrap_needed():
+                    if bootstrap_needed(interval=source_interval):
                         # 한 번도 받은 적이 없는 상태.  CLI 를 실행하라고 안내만
                         # 하면 아무도 못 알아봅니다.  창이 직접 받아 옵니다.
                         self.finished.emit({
