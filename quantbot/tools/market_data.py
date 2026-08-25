@@ -152,7 +152,11 @@ def fetch_ohlcv(exchange: str, symbol: str, timeframe: str = "1d",
     try:
         import ccxt
     except ImportError:
-        logger.error("ccxt가 필요합니다:  pip install ccxt")
+        # ccxt 는 선택 의존성입니다. 공용 BTC 정본이 있으면 이 경로는 아예
+        # 타지 않으므로, 배포본 로그에 ⛔ 로 남길 일이 아닙니다.
+        logger.info(
+            "ccxt가 없어 %s %s 수집을 건너뜁니다 (필요하면 pip install ccxt)",
+            exchange, symbol)
         return None
 
     try:

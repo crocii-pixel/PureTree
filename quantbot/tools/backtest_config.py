@@ -581,7 +581,11 @@ def prepare_data(config: Dict[str, Any], refresh: bool = False):
         raise RuntimeError("BTC 일봉을 가져오지 못해 시장 상태를 만들 수 없습니다")
 
     btc_raw = fetch_upbit("BTC", refresh=refresh)
-    era_source = fetch_ohlcv("bitstamp", "BTC/USD")     # 폭등기 판정용 15년치
+    # 폭등기 판정에는 15년치 Bitstamp BTC/USD 가 필요합니다.  예전에는 ccxt 로
+    # 매번 새로 받았는데, 그건 아래에서 읽는 **공용 정본과 같은 데이터**입니다.
+    # 같은 값을 두 번 받을 이유가 없고, ccxt 가 없는 배포본에서는 경고만 남긴 채
+    # 폭등기 판정이 조용히 꺼졌습니다.  정본을 먼저 읽고 그것으로 판정합니다.
+    era_source = None
     # 국면은 설정의 현지/글로벌 K 선택과 무관하게 항상 글로벌 BTC를 사용합니다.
     global_btc = None
     regime_btc = None
@@ -602,6 +606,7 @@ def prepare_data(config: Dict[str, Any], refresh: bool = False):
             global_btc = global_btc[["open", "high", "low", "close", "volume"]]
             regime_dataset_id = DATASET_ID
             regime_btc = global_btc
+            era_source = global_btc
             if composite_requested and regime_interval != "1d":
                 from regime_chart import (CHART_INTERVAL_SECONDS,
                                           aggregate_chart_frame)
@@ -639,6 +644,10 @@ def prepare_data(config: Dict[str, Any], refresh: bool = False):
         raise RuntimeError(
             "복합 국면 백테스트에는 공용 Bitstamp BTC 정본이 필요합니다. "
             "[BTC 차트 보기]를 한 번 열면 자동으로 내려받습니다.")
+    if era_source is None:
+        # 정본이 아직 없는 설치본. ccxt 가 있으면 받아 오고, 없으면 폭등기
+        # 판정만 업비트 일봉으로 대체합니다(market_context 의 기본 동작).
+        era_source = fetch_ohlcv("bitstamp", "BTC/USD")
     if global_btc is None or len(global_btc) < 200:
         global_btc = references.get("BTC")
         if global_btc is None or len(global_btc) < 200:
