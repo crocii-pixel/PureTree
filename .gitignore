@@ -33,3 +33,8 @@ quantbot/tools/_cache/
 
 # 시간봉 캐시 (용량 큼)
 quantbot/tools/_cache/*_1h.csv
+
+# 런타임 수수료 스냅샷 - 거래소 API로 주기적으로 다시 씁니다.
+# 인스턴스마다 갱신 시각이 달라 추적하면 매번 충돌합니다.
+# 파일이 없으면 fee_manager.DEFAULT_RATES로 안전하게 대체됩니다.
+quantbot/fee_rates.json
