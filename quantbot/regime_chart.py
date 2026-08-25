@@ -917,7 +917,7 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
             self.setWindowTitle("QuantBot · BTC 국면 차트")
             self.setMinimumSize(920, 620)
             self.resize(1280, 780)
-            ui_theme.fit_available_width(self, 780)
+            ui_theme.fit_available_height(self, 1280)
             self._data = pd.DataFrame()
             self._load_generation = 0
             self._interval_buttons: Dict[str, Any] = {}

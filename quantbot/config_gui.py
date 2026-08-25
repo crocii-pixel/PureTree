@@ -396,7 +396,7 @@ def build_config_window(parent: Any = None) -> Any:
             self.setWindowTitle("QuantBot 백테스트")
             self.setMinimumSize(900, 650)
             self.resize(1120, 780)
-            ui_theme.fit_available_width(self, 780)
+            ui_theme.fit_available_height(self, 1120)
 
             outer = QtWidgets.QVBoxLayout(self)
             outer.setContentsMargins(22, 20, 22, 20)
@@ -947,7 +947,7 @@ def build_config_window(parent: Any = None) -> Any:
             dialog.setWindowTitle("백테스트 설정보기 · 읽기 전용")
             dialog.setWindowModality(QtCore.Qt.WindowModality.NonModal)
             dialog.resize(720, 680)
-            ui_theme.fit_available_width(dialog, 680)
+            ui_theme.fit_available_height(dialog, 720)
             layout = QtWidgets.QVBoxLayout(dialog)
             self._config_view_title = QtWidgets.QLabel("")
             self._config_view_title.setObjectName("Title")
@@ -1029,7 +1029,7 @@ def build_config_window(parent: Any = None) -> Any:
             self.setWindowTitle("QuantBot 설정")
             self.setMinimumWidth(560)
             self.resize(600, 780)
-            ui_theme.fit_available_width(self, 780)
+            ui_theme.fit_available_height(self, 600)
 
             ensure_icon()
             if ICO_PATH.exists():

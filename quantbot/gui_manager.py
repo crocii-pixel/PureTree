@@ -273,8 +273,8 @@ class Dashboard(QWidget):
             self.setWindowIcon(QIcon(str(ICO_PATH)))
 
         self._build_ui()
-        # 컬럼이 8개로 늘어 좁은 창에서는 숫자가 잘립니다. 화면 가용 폭을 씁니다.
-        ui_theme.fit_available_width(self, 660)
+        # 종목 목록과 로그가 세로로 쌓이므로 화면 높이를 끝까지 씁니다.
+        ui_theme.fit_available_height(self, 930)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)

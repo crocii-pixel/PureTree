@@ -15,18 +15,24 @@ from __future__ import annotations
 from typing import Any, Dict
 
 
-def fit_available_width(widget: Any, preferred_height: int | None = None) -> None:
-    """Stretch a top-level window across its current screen's usable width."""
+def fit_available_height(widget: Any, preferred_width: int | None = None) -> None:
+    """
+    창을 현재 화면의 사용 가능한 **높이** 전체로 늘립니다.
+
+    폭은 설계값 그대로 둡니다.  세로로만 키우는 이유는 세로로 쌓이는 것들
+    (종목 목록, 로그, 결과 이력, 설정 항목)이 잘리는 게 문제였기 때문입니다.
+    가로까지 화면 끝으로 늘리면 표 칸만 넓어지고 읽기가 나빠집니다.
+    """
     try:
         screen = widget.screen()
         if screen is None:
             app = widget.window().windowHandle().screen()
             screen = app
         geometry = screen.availableGeometry()
-        height = int(preferred_height or widget.height() or geometry.height())
-        height = min(max(height, widget.minimumHeight()), geometry.height())
-        top = max(geometry.top(), min(widget.y(), geometry.bottom() - height + 1))
-        widget.setGeometry(geometry.left(), top, geometry.width(), height)
+        width = int(preferred_width or widget.width() or geometry.width())
+        width = min(max(width, widget.minimumWidth()), geometry.width())
+        left = max(geometry.left(), min(widget.x(), geometry.right() - width + 1))
+        widget.setGeometry(left, geometry.top(), width, geometry.height())
     except Exception:
         # Geometry differences between Qt5/Qt6 or a not-yet-created native
         # handle must never prevent a window from opening.
