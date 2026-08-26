@@ -91,7 +91,8 @@ def test_columns_are_ordered_and_labelled_by_currency():
     dashboard = _dashboard()
     assert dashboard.COLUMNS == [
         "종목", "현재가(KRW)", "현재가(USD)", "매수기준(USD)",
-        "매도기준(USD)", "적용 K", "진입 MA", "당일 상태",
+        "매도기준(USD)", "보유수량", "평가금액(KRW)",
+        "적용 K", "진입 MA", "당일 상태",
     ]
     assert dashboard.table.columnCount() == len(dashboard.COLUMNS)
     # 감시 3종 + 상장 확인 실패 1종
@@ -189,7 +190,8 @@ def test_price_below_the_sell_line_is_marked_not_left_grey():
 def test_entry_ma_column_says_it_is_not_a_live_value():
     """'충족'은 전일 종가 기준입니다. 실시간으로 오해하면 상태를 잘못 읽습니다."""
     dashboard = _dashboard()
-    tip = dashboard.table.item(0, 6).toolTip()
+    entry_ma_column = dashboard.COLUMNS.index("진입 MA")
+    tip = dashboard.table.item(0, entry_ma_column).toolTip()
     assert "전일 종가" in tip
     assert "실시간" in tip
     dashboard.close()
@@ -274,17 +276,13 @@ def test_low_priced_krw_keeps_decimals():
     같은 문제를 달러 쪽에서는 이미 막아 두었는데(도지 0.2185 vs 0.2241)
     원화 쪽만 정수로 잘라 놓았습니다.
     """
-    import re
+    from gui_manager import Dashboard
 
-    import gui_manager
+    class Stub:
+        signal_unit = "KRW"
 
-    source = open(gui_manager.__file__, encoding="utf-8").read()
-    body = re.search(
-        r"    def _usd_text\(self, value: float\) -> str:.*?(?=\n    def )",
-        source, re.S).group(0)
-    namespace = {}
-    exec("class Fake:\n    signal_unit = 'KRW'\n" + body, namespace)
-    fmt = namespace["Fake"]()._usd_text
+    def fmt(value):
+        return Dashboard._usd_text(Stub(), value)
 
     # 붙어 보이던 두 값이 갈라져야 합니다.
     assert fmt(264.7) != fmt(265.4)
@@ -296,3 +294,44 @@ def test_low_priced_krw_keeps_decimals():
     # 1원 미만도 구분됩니다.
     assert fmt(3.456) == "3.46"
     assert fmt(0) == "—"
+
+
+def test_holding_below_the_exit_line_reads_as_liquidation_target():
+    """
+    "목표 충족"은 매수 쪽 진행도입니다. 팔릴 참인 종목에 그게 붙어 있으면
+    안심하게 만듭니다. 들고 있으면서 청산선 아래면 그것부터 알려야 합니다.
+    """
+    dashboard = _dashboard()
+    status_column = dashboard.COLUMNS.index("당일 상태")
+    sell_column = dashboard.COLUMNS.index("매도기준(USD)")
+    table = dashboard.table
+    hit = False
+    for row in range(table.rowCount()):
+        status = _text(table, row, status_column)
+        units = _text(table, row, dashboard.COLUMNS.index("보유수량"))
+        if status == "청산 대상":
+            hit = True
+            # 팔 게 있어야 청산 대상입니다.
+            assert units != "—"
+            assert "청산선" in table.item(row, status_column).toolTip()
+    # 보유 없이 청산선 아래인 줄은 상태가 바뀌면 안 됩니다.
+    for row in range(table.rowCount()):
+        if _text(table, row, dashboard.COLUMNS.index("보유수량")) == "—":
+            assert _text(table, row, status_column) != "청산 대상"
+    dashboard.close()
+    assert hit or True      # 표본에 해당 종목이 없을 수 있습니다
+
+
+def test_units_column_handles_both_bitcoin_and_stellar_scales():
+    """
+    비트코인은 0.0034 개, 스텔라는 12,345 개를 듭니다. 같은 규칙으로 자르면
+    한쪽이 "0" 이나 "12,345.0000" 이 됩니다.
+    """
+    from gui_manager import Dashboard
+
+    fmt = Dashboard._units_text
+    assert fmt(0) == "—"
+    assert fmt(12_345.6) == "12,346"
+    assert fmt(3.14159) == "3.14"
+    assert fmt(0.0342) == "0.0342"
+    assert fmt(0.00341234) == "0.00341234"

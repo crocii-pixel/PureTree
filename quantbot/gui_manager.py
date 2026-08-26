@@ -255,10 +255,11 @@ class Dashboard(QWidget):
     #: 컬럼 제목이 실제 값의 통화와 어긋나면 숫자를 잘못 읽게 되므로 제목을
     #: 신호 기준에서 만들어 붙입니다.
     COLUMN_TEMPLATE = ("종목", "현재가(KRW)", "현재가({unit})", "매수기준({unit})",
-                       "매도기준({unit})", "적용 K", "진입 MA", "당일 상태")
+                       "매도기준({unit})", "보유수량", "평가금액(KRW)",
+                       "적용 K", "진입 MA", "당일 상태")
     #: 값을 가운데로 정렬할 컬럼 (숫자는 오른쪽, 나머지는 왼쪽)
-    CENTERED_COLUMNS = (5, 6, 7)
-    NUMERIC_COLUMNS = (1, 2, 3, 4)
+    CENTERED_COLUMNS = (7, 8, 9)
+    NUMERIC_COLUMNS = (1, 2, 3, 4, 5, 6)
 
     @property
     def COLUMNS(self):
@@ -447,6 +448,25 @@ class Dashboard(QWidget):
             return f"{value:,.4f}"
         return f"{value:,.6f}"
 
+    @staticmethod
+    def _units_text(units: float) -> str:
+        """
+        보유 수량. 종목마다 자릿수가 크게 달라 고정 소수점은 못 씁니다.
+
+        비트코인은 0.0034 개를 들고 있고 스텔라는 12,345 개를 들고 있습니다.
+        같은 규칙으로 자르면 한쪽이 "0" 이나 "12,345.0000" 이 됩니다.
+        """
+        if not units:
+            return "—"
+        units = float(units)
+        if units >= 1000:
+            return f"{units:,.0f}"
+        if units >= 1:
+            return f"{units:,.2f}"
+        if units >= 0.01:
+            return f"{units:,.4f}"
+        return f"{units:,.8f}".rstrip("0")
+
     def refresh(self) -> None:
         """봇 상태를 읽어 화면 갱신 (네트워크 호출 없음 - 메모리 상태만 사용)"""
         exchange = self.bot.exchange
@@ -504,6 +524,7 @@ class Dashboard(QWidget):
             usd_price = self._usd_cache.get(ticker, 0.0)
             buy_usd = getattr(self.bot, "signal_targets", {}).get(ticker, 0.0)
             sell_usd = getattr(self.bot, "exit_ma_values", {}).get(ticker, 0.0)
+            units = float(self.bot.position_units.get(ticker, 0.0))
             above_ma = self.bot.is_above_ma.get(ticker)
             signal_source = self.bot.signal_sources.get(ticker, "global_pending")
             dim = ui_theme.COLORS["text_dim"]
@@ -511,6 +532,16 @@ class Dashboard(QWidget):
             # 읽힙니다. 실제로는 청산 대기 중이므로 눈에 띄게 합니다.
             breached = bool(usd_price and sell_usd and usd_price <= sell_usd)
             sell_color = ui_theme.COLORS["danger"] if breached else dim
+            # 들고 있으면서 청산선 아래면 그것부터 알려야 합니다. "목표 충족"
+            # 은 매수 쪽 진행도라, 팔릴 참인 종목에 붙으면 안심하게 만듭니다.
+            # 안 들고 있으면 팔 게 없으므로 상태를 바꾸지 않습니다.
+            if breached and units > 0 and not self.bot.closed_today.get(ticker):
+                status = "청산 대상"
+                tone = ui_theme.COLORS["danger"]
+                tip = (f"현재가가 청산선 MA{self.bot.exit_ma_window()} 아래입니다.\n"
+                       + ("실시간 청산 감시 중"
+                          if getattr(self.bot, "exit_timing", "daily") == "intraday"
+                          else "일봉 종가가 이대로면 다음 판정에서 정리됩니다."))
             # 반대쪽도 같습니다. 돌파선을 넘었으면 매수 판정이 선 상태입니다.
             broke_out = bool(usd_price and buy_usd and usd_price >= buy_usd)
             buy_color = ui_theme.COLORS["info"] if broke_out else dim
@@ -521,6 +552,10 @@ class Dashboard(QWidget):
                 (self._usd_text(usd_price), ui_theme.COLORS["text"], True),
                 (self._usd_text(buy_usd), buy_color, True),
                 (self._usd_text(sell_usd), sell_color, True),
+                (self._units_text(units), ui_theme.COLORS["text"] if units else dim,
+                 True),
+                (f"{units * price:,.0f}" if units and price else "—",
+                 ui_theme.COLORS["text"] if units else dim, True),
                 (f"{self.bot.effective_ks.get(ticker, 0.0):.4f}", dim, False),
                 ("충족" if above_ma else "미달",
                  ui_theme.COLORS["accent"] if above_ma else ui_theme.COLORS["text_muted"], False),
@@ -548,8 +583,10 @@ class Dashboard(QWidget):
                 2: f"신호 시장 현재가 · {unit} 기준",
                 3: buy_tip,
                 4: sell_tip,
-                5: "20일 노이즈 비율로 매일 새로 계산한 돌파 계수",
-                6: (f"전일 종가가 진입 MA{self.bot.ma_window} 위였는지 · "
+                5: "봇이 들고 있는 수량 · 사람이 직접 산 물량은 빠집니다",
+                6: "보유 수량 x 거래소 현재가",
+                7: "20일 노이즈 비율로 매일 새로 계산한 돌파 계수",
+                8: (f"전일 종가가 진입 MA{self.bot.ma_window} 위였는지 · "
                     "실시간 값이 아닙니다"),
                 len(cells) - 1: tip,
             }
