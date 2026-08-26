@@ -424,16 +424,23 @@ class Dashboard(QWidget):
         """
         신호 통화 표기. 단위는 컬럼 제목이 말해 주므로 숫자만 씁니다.
 
-        원화는 소수점이 의미 없어 정수로 씁니다. 달러는 소수점 2자리가 기본인데,
         1달러 미만 종목까지 2자리로 자르면 도지(0.2185)와 그 매수기준(0.2241)이
         **둘 다 "0.22"** 로 찍혀 돌파 여부를 눈으로 확인할 수 없습니다.
         그래서 1달러 미만은 유효숫자를 남깁니다.
+
+        원화도 같습니다. 스텔라(254원)의 매수기준 264.7 과 매도기준 265.4 가
+        **둘 다 "265"** 로 찍히면 두 선이 붙은 것처럼 보입니다. 실제로는
+        0.7원 떨어져 있습니다. 1,000원 미만은 소수점을 남깁니다.
         """
         if not value:
             return "—"
         value = float(value)
         if self.signal_unit == "KRW":
-            return f"{value:,.0f}"
+            if abs(value) >= 1000:
+                return f"{value:,.0f}"
+            if abs(value) >= 10:
+                return f"{value:,.1f}"
+            return f"{value:,.2f}"
         if abs(value) >= 1:
             return f"{value:,.2f}"
         if abs(value) >= 0.01:

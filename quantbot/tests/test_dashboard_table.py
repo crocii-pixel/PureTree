@@ -263,3 +263,36 @@ def test_usd_source_keeps_the_usd_labels():
                for c in range(dashboard.table.columnCount())]
     assert headers[3] == "매수기준(USD)"
     dashboard.close()
+
+
+def test_low_priced_krw_keeps_decimals():
+    """
+    스텔라(254원)의 매수기준 264.7 과 매도기준 265.4 가 **둘 다 "265"** 로
+    찍히면 두 선이 붙은 것처럼 보입니다. 실제로는 0.7원 떨어져 있고, 그
+    차이가 오늘 살지 팔지를 가릅니다.
+
+    같은 문제를 달러 쪽에서는 이미 막아 두었는데(도지 0.2185 vs 0.2241)
+    원화 쪽만 정수로 잘라 놓았습니다.
+    """
+    import re
+
+    import gui_manager
+
+    source = open(gui_manager.__file__, encoding="utf-8").read()
+    body = re.search(
+        r"    def _usd_text\(self, value: float\) -> str:.*?(?=\n    def )",
+        source, re.S).group(0)
+    namespace = {}
+    exec("class Fake:\n    signal_unit = 'KRW'\n" + body, namespace)
+    fmt = namespace["Fake"]()._usd_text
+
+    # 붙어 보이던 두 값이 갈라져야 합니다.
+    assert fmt(264.7) != fmt(265.4)
+    assert fmt(264.7) == "264.7"
+    assert fmt(265.4) == "265.4"
+    # 큰 값은 그대로 정수입니다. 비트코인에 소수점은 무의미합니다.
+    assert fmt(108_184_667.0) == "108,184,667"
+    assert fmt(15_827.4) == "15,827"
+    # 1원 미만도 구분됩니다.
+    assert fmt(3.456) == "3.46"
+    assert fmt(0) == "—"
