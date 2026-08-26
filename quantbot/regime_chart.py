@@ -54,6 +54,23 @@ OVERLAY_SERIES: Tuple[Tuple[str, str, str, str], ...] = (
 PARAM_INPUT_WIDTH = 50
 
 
+def _span_text(seconds: int) -> str:
+    """초를 사람이 읽는 기간으로. 판정이 실제로 보는 창의 길이입니다."""
+    def trim(value: float, unit: str) -> str:
+        # 2.0 개월이 아니라 2개월로 읽히게 소수점 한 자리에서 다듬습니다.
+        text = f"{value:.1f}".rstrip("0").rstrip(".")
+        return f"{text}{unit}"
+
+    if seconds < 3_600:
+        return trim(seconds / 60, "분")
+    if seconds < 86_400:
+        return trim(seconds / 3_600, "시간")
+    days = seconds / 86_400
+    if days < 60:
+        return trim(days, "일")
+    return trim(days / 30.44, "개월")
+
+
 def compact_spin(widget: Any, target: int = PARAM_INPUT_WIDTH) -> Any:
     """
     숫자 입력란을 ``target`` 폭으로 좁힙니다.
@@ -1232,17 +1249,27 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
             parameter_layout.setSpacing(4)
             ma_row = QtWidgets.QHBoxLayout()
             ma_row.setSpacing(4)
+            # MA 는 **봉 개수**로 받는데, 판정이 보는 것은 시간입니다.
+            # 4시간봉 180봉과 1시간봉 720봉은 둘 다 30일이고 결과가 자릿수까지
+            # 같습니다. 반대로 30을 그대로 둔 채 시간대만 4시간으로 바꾸면
+            # 30일선이 조용히 5일선이 됩니다(실측 287,271% -> 4,330%).
+            # 그래서 옆에 실제 기간을 띄웁니다.
             self.inputs["short_ma"] = QtWidgets.QSpinBox()
-            self.inputs["short_ma"].setRange(5, 200)
+            self.inputs["short_ma"].setRange(5, 2000)
             compact_spin(self.inputs["short_ma"])
             self.inputs["long_ma"] = QtWidgets.QSpinBox()
-            self.inputs["long_ma"].setRange(20, 400)
+            self.inputs["long_ma"].setRange(20, 4000)
             compact_spin(self.inputs["long_ma"])
+            self.ma_span_label = QtWidgets.QLabel()
+            self.ma_span_label.setProperty("hint", "true")
             ma_row.addWidget(QtWidgets.QLabel("단기"))
             ma_row.addWidget(self.inputs["short_ma"])
             ma_row.addWidget(QtWidgets.QLabel("장기"))
             ma_row.addWidget(self.inputs["long_ma"])
+            ma_row.addWidget(self.ma_span_label)
             ma_row.addStretch(1)
+            for key in ("short_ma", "long_ma"):
+                self.inputs[key].valueChanged.connect(self._update_ma_span)
             parameter_layout.addWidget(QtWidgets.QLabel("이중 이동평균 추세"))
             parameter_layout.addLayout(ma_row)
 
@@ -1432,6 +1459,29 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
                         "defensive_probe_fraction", "defensive_take_profit_pct"
                     } else float(value))
                     widget.setValue(shown)
+
+        def _update_ma_span(self, _value: Any = None) -> None:
+            """단기·장기 MA 가 실제로 몇 일인지 옆에 적습니다."""
+            label = getattr(self, "ma_span_label", None)
+            if label is None:
+                return
+            seconds = CHART_INTERVAL_SECONDS.get(self._current_interval, 86_400)
+            spans = []
+            for key in ("short_ma", "long_ma"):
+                widget = self.inputs.get(key)
+                if widget is None:
+                    return
+                spans.append(_span_text(widget.value() * seconds))
+            label.setText(f"= {spans[0]} / {spans[1]}")
+            # 한 달 부근이 시장의 주기와 맞습니다(시간대를 바꿔도 같은 자리).
+            # 단기가 거기서 멀면 눈에 띄게 해 둡니다.
+            days = self.inputs["short_ma"].value() * seconds / 86_400
+            label.setToolTip(
+                "판정은 봉 개수가 아니라 **기간**을 봅니다. 4시간봉 180봉과 "
+                "1시간봉 720봉은 둘 다 30일이고 결과가 같습니다.\n"
+                "시간대를 바꾸면 봉 개수를 다시 잡아야 같은 기간이 됩니다."
+                + ("" if 20 <= days <= 45 else
+                   f"\n\n지금 단기 MA 는 {_span_text(int(days * 86_400))} 입니다."))
 
         def _settings(self) -> Dict[str, Any]:
             result = dict(self._score)
@@ -1628,6 +1678,7 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
                 f"{last.strftime(time_format)} · 모두 확정봉")
 
         def _recalculate(self) -> None:
+            self._update_ma_span()
             raw = self._settings()
             raw["decision_interval"] = self._current_interval
             errors = validate_scoring_config(raw, raw.get("use_for_backtest", False))
