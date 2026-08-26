@@ -48,10 +48,59 @@ OVERLAY_SERIES: Tuple[Tuple[str, str, str, str], ...] = (
     ("atr_upper_level", "ATR 상단", "#60A5FA", "dash"),
     ("atr_lower_level", "ATR 하단", "#FB7185", "dash"),
     ("lower_channel_line", "하방채널", "#EF4444", "solid"),
+    # 아래 셋은 가격이 아니라 MACD 값이라 메인 차트 하단에 겹쳐 그립니다.
+    # 축이 다르므로 별도 영역을 쓰던 것을, 세로 공간을 아끼려고 옮겼습니다.
+    ("log_macd_histogram", "MACD 히스토", "#4ADE80", "solid"),
+    ("log_macd", "MACD", "#38BDF8", "solid"),
+    ("log_macd_signal", "시그널", "#F97316", "solid"),
 )
+
+#: 메인 차트 하단에 겹쳐 그리는 계열. 가격 축과 무관합니다.
+MACD_SERIES = ("log_macd_histogram", "log_macd", "log_macd_signal")
+
+#: 겹쳐 그릴 때 차트 높이의 몇 할을 쓸지.
+MACD_OVERLAY_FRACTION = 0.24
+
+#: 범례 배경 불투명도(0~255). 낮을수록 뒤 차트가 비칩니다. 범례가 좌상단
+#: 가격 구간을 가려서, 살짝 비치게 두면 가려진 봉도 읽을 수 있습니다.
+LEGEND_ALPHA_DEFAULT = 120
 
 #: 판정값 입력란 공통 폭. 기존 76px 의 2/3.
 PARAM_INPUT_WIDTH = 50
+
+
+def _view_state_path():
+    import config_manager
+
+    return config_manager.DATA_DIR / "chart_view.json"
+
+
+def load_view_state() -> Dict[str, Any]:
+    """
+    범례 토글과 투명도.
+
+    판정값(chart_settings.json)과 **따로** 둡니다. 이건 전략이 아니라 화면
+    취향이라, 이력에서 설정을 불러올 때 같이 끌려오면 안 됩니다.
+    """
+    try:
+        import json
+
+        loaded = json.loads(_view_state_path().read_text(encoding="utf-8"))
+        return loaded if isinstance(loaded, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_view_state(state: Dict[str, Any]) -> None:
+    try:
+        import json
+
+        path = _view_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(dict(state), ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+    except Exception:
+        return
 
 
 def _span_text(seconds: int) -> str:
@@ -223,6 +272,8 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
     class PriceChart(QtWidgets.QWidget):
         viewChanged = QtCore.pyqtSignal(object, object)
         windowRequested = QtCore.pyqtSignal(object, object)
+        #: 범례 토글·투명도가 바뀌면 알립니다. 창이 받아 파일로 남깁니다.
+        viewStateChanged = QtCore.pyqtSignal()
 
         def __init__(self):
             super().__init__()
@@ -233,6 +284,8 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
             self._regions: List[Dict[str, Any]] = []
             self._log_scale = True
             #: 보조선별 표시 여부. 차트 좌상단 범례를 눌러 바꿉니다.
+            #: 범례 배경 불투명도. 사용자가 조절하고 저장됩니다.
+            self._legend_alpha: int = LEGEND_ALPHA_DEFAULT
             self._series_visible: Dict[str, bool] = {
                 column: True for column, _l, _c, _s in OVERLAY_SERIES}
             self._legend_hit: Dict[str, Any] = {}
@@ -417,25 +470,34 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
             self.update()
 
         def _layout(self) -> Tuple[Any, Any, Any]:
+            """
+            가격 · 조건 띠 · MACD 영역.
+
+            MACD 는 이제 가격 차트 **안쪽 아래에 겹쳐** 그립니다. 예전에는
+            아래에 따로 칸을 두어 세로를 나눠 썼는데, 그만큼 가격 차트가
+            납작해졌습니다. 겹치면 가격을 크게 보면서 MACD 도 같이 봅니다.
+            """
             outer = self.rect().adjusted(62, 18, -18, -36)
             ribbon_height = 28 if self._show_conditions else 0
-            macd_height = int(outer.height() * self._macd_fraction) if self._show_macd else 0
-            gap = 10 if macd_height else 0
             price = QtCore.QRectF(
                 outer.left(), outer.top(), outer.width(),
-                max(100, outer.height() - ribbon_height - macd_height - gap))
+                max(100, outer.height() - ribbon_height))
             ribbon = QtCore.QRectF(
                 outer.left(), price.bottom(), outer.width(), ribbon_height)
-            macd = QtCore.QRectF(
-                outer.left(), ribbon.bottom() + gap, outer.width(), macd_height)
+            macd = self._macd_overlay_rect(price)
             return price, ribbon, macd
 
-        def _macd_splitter_rect(self) -> Any:
-            _price, ribbon, macd = self._layout()
-            if not self._show_macd or macd.height() <= 0:
+        def _macd_overlay_rect(self, price: Any) -> Any:
+            """가격 차트 하단에 겹칠 MACD 자리."""
+            if not self._show_macd:
                 return QtCore.QRectF()
-            return QtCore.QRectF(macd.left(), macd.top() - 6,
-                                 macd.width(), 10)
+            height = max(60.0, price.height() * MACD_OVERLAY_FRACTION)
+            return QtCore.QRectF(price.left(), price.bottom() - height,
+                                 price.width(), height)
+
+        def _macd_splitter_rect(self) -> Any:
+            """겹쳐 그리므로 끌어서 나눌 경계가 없습니다."""
+            return QtCore.QRectF()
 
         def _visible(self) -> pd.DataFrame:
             if self._data.empty or self._view_start is None or self._view_end is None:
@@ -594,6 +656,11 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
                 "dot": QtCore.Qt.PenStyle.DotLine,
             }
             for column, _label, color, style_key in OVERLAY_SERIES:
+                # MACD 계열은 가격 축이 아니라 하단 겹침 영역에 그립니다.
+                # 여기서 걸러 내지 않으면 가격 스케일에 찍혀 선이 화면 밖으로
+                # 날아갑니다(로그가격 MACD 값은 0 근처입니다).
+                if column in MACD_SERIES:
+                    continue
                 style = pen_styles[style_key]
                 if column not in diagnostic or not self._series_visible.get(column, True):
                     continue
@@ -633,10 +700,13 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
             box_h = row_h * len(rows) + pad * 2
             left, top = rect.left() + 8, rect.top() + 26
             box = QtCore.QRectF(left, top, box_w, box_h)
+            alpha = int(getattr(self, "_legend_alpha", LEGEND_ALPHA_DEFAULT))
             backdrop = QtGui.QColor("#0F1724")
-            backdrop.setAlpha(196)
+            backdrop.setAlpha(max(0, min(255, alpha)))
             painter.fillRect(box, backdrop)
-            painter.setPen(QtGui.QPen(QtGui.QColor("#273246"), 1))
+            border = QtGui.QColor("#273246")
+            border.setAlpha(max(0, min(255, alpha + 40)))
+            painter.setPen(QtGui.QPen(border, 1))
             painter.drawRect(box)
 
             pen_styles = {
@@ -663,6 +733,30 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
                     int(QtCore.Qt.AlignmentFlag.AlignLeft
                         | QtCore.Qt.AlignmentFlag.AlignVCenter), label)
             painter.restore()
+
+        def view_state(self) -> Dict[str, Any]:
+            """범례 토글과 투명도. 창을 닫았다 열어도 그대로 오게 저장합니다."""
+            return {"series_visible": dict(self._series_visible),
+                    "legend_alpha": int(self._legend_alpha)}
+
+        def apply_view_state(self, state: Dict[str, Any]) -> None:
+            visible = (state or {}).get("series_visible") or {}
+            for column, on in visible.items():
+                if column in self._series_visible:
+                    self._series_visible[column] = bool(on)
+            alpha = (state or {}).get("legend_alpha")
+            if alpha is not None:
+                try:
+                    self._legend_alpha = max(0, min(255, int(alpha)))
+                except (TypeError, ValueError):
+                    pass
+            self._static_pixmap = None
+            self.update()
+
+        def set_legend_alpha(self, alpha: int) -> None:
+            self._legend_alpha = max(0, min(255, int(alpha)))
+            self._static_pixmap = None
+            self.update()
 
         def _legend_column_at(self, point: Any) -> Optional[str]:
             for column, rect in self._legend_hit.items():
@@ -706,25 +800,36 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
             ]).replace([np.inf, -np.inf], np.nan).dropna()
             if values.empty:
                 return
+            if not any(self._series_visible.get(c, True) for c in MACD_SERIES):
+                return
             limit = max(abs(float(values.min())), abs(float(values.max())), 1e-9)
             zero = rect.center().y()
-            painter.setPen(QtGui.QPen(QtGui.QColor("#3A465A"), 1))
-            painter.drawRect(rect)
-            painter.drawLine(QtCore.QPointF(rect.left(), zero), QtCore.QPointF(rect.right(), zero))
+            # 겹쳐 그리므로 가격 차트를 가리지 않게 0선만 옅게 둡니다.
+            baseline = QtGui.QColor("#3A465A")
+            baseline.setAlpha(150)
+            painter.setPen(QtGui.QPen(baseline, 1, QtCore.Qt.PenStyle.DashLine))
+            painter.drawLine(QtCore.QPointF(rect.left(), zero),
+                             QtCore.QPointF(rect.right(), zero))
 
             def my(value: float) -> float:
                 return zero - float(value) / limit * rect.height() * 0.46
 
             stride = max(1, int(np.ceil(len(diagnostic) / max(rect.width(), 1))))
-            for stamp, value in diagnostic["log_macd_histogram"].iloc[::stride].items():
-                if not _finite(value):
-                    continue
-                x = self._x(stamp, rect)
-                color = QtGui.QColor("#4ADE80" if float(value) >= 0 else "#FB7185")
-                painter.setPen(QtGui.QPen(color, 2))
-                painter.drawLine(QtCore.QPointF(x, zero), QtCore.QPointF(x, my(float(value))))
+            if self._series_visible.get("log_macd_histogram", True):
+                for stamp, value in diagnostic[
+                        "log_macd_histogram"].iloc[::stride].items():
+                    if not _finite(value):
+                        continue
+                    x = self._x(stamp, rect)
+                    color = QtGui.QColor("#4ADE80" if float(value) >= 0 else "#FB7185")
+                    color.setAlpha(190)
+                    painter.setPen(QtGui.QPen(color, 2))
+                    painter.drawLine(QtCore.QPointF(x, zero),
+                                     QtCore.QPointF(x, my(float(value))))
             for column, color in (("log_macd", "#38BDF8"),
                                   ("log_macd_signal", "#F97316")):
+                if not self._series_visible.get(column, True):
+                    continue
                 series = diagnostic[column].iloc[::max(
                     1, int(np.ceil(len(diagnostic) / max(rect.width() * 2, 1))))]
                 path = QtGui.QPainterPath()
@@ -737,10 +842,12 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
                     first = False
                 painter.setPen(QtGui.QPen(QtGui.QColor(color), 1.2))
                 painter.drawPath(path)
-            painter.setPen(QtGui.QColor("#AAB6C6"))
+            label = QtGui.QColor("#AAB6C6")
+            label.setAlpha(170)
+            painter.setPen(label)
             painter.drawText(rect.adjusted(6, 2, -6, -2),
-                             int(QtCore.Qt.AlignmentFlag.AlignTop |
-                                 QtCore.Qt.AlignmentFlag.AlignLeft),
+                             int(QtCore.Qt.AlignmentFlag.AlignBottom |
+                                 QtCore.Qt.AlignmentFlag.AlignRight),
                              "로그가격 MACD")
 
         def _draw_crosshair(self, painter: Any, price_rect: Any,
@@ -790,6 +897,7 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
             cache_key = (
                 self.width(), self.height(), self._view_start, self._view_end,
                 self._log_scale, self._show_regime, self._show_macd,
+                self._legend_alpha,
                 self._show_conditions, id(self._data), id(self._diagnostic),
                 tuple(sorted(self._series_visible.items())),
             )
@@ -863,6 +971,7 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
                 column = self._legend_column_at(point)
                 if column is not None:
                     # 범례 클릭은 화면 이동으로 넘기지 않습니다.
+                    self.viewStateChanged.emit()
                     self._series_visible[column] = not self._series_visible.get(
                         column, True)
                     self._static_pixmap = None
@@ -1189,6 +1298,10 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
             splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
             self.chart = PriceChart()
             self.chart.windowRequested.connect(self._request_visible_window)
+            self.chart.viewStateChanged.connect(
+                lambda: save_view_state(self.chart.view_state()))
+            # 지난번에 쓰던 범례 상태로 되돌립니다.
+            self.chart.apply_view_state(load_view_state())
             splitter.addWidget(self.chart)
             panel = QtWidgets.QScrollArea()
             panel.setWidgetResizable(True)
@@ -1207,6 +1320,24 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
             splitter.setStretchFactor(0, 4)
             splitter.setStretchFactor(1, 1)
             outer.addWidget(splitter, 1)
+
+            legend_row = QtWidgets.QHBoxLayout()
+            legend_row.setSpacing(6)
+            self.legend_alpha_slider = QtWidgets.QSlider(
+                QtCore.Qt.Orientation.Horizontal)
+            self.legend_alpha_slider.setRange(0, 255)
+            self.legend_alpha_slider.setValue(
+                int(self.chart.view_state().get("legend_alpha",
+                                                LEGEND_ALPHA_DEFAULT)))
+            self.legend_alpha_slider.setFixedWidth(110)
+            self.legend_alpha_slider.setToolTip(
+                "범례 배경 투명도. 범례가 좌상단 봉을 가리므로 살짝 비치게 두면 "
+                "가려진 구간도 읽을 수 있습니다.\n창을 닫았다 열어도 유지됩니다.")
+            self.legend_alpha_slider.valueChanged.connect(self._legend_alpha_changed)
+            legend_row.addWidget(QtWidgets.QLabel("범례 투명도"))
+            legend_row.addWidget(self.legend_alpha_slider)
+            legend_row.addStretch(1)
+            outer.addLayout(legend_row)
 
             self.regime_check = QtWidgets.QCheckBox("국면 판정")
             self.regime_check.setChecked(True)
@@ -1525,6 +1656,10 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
             finally:
                 self._building = False
             self._recalculate()
+
+        def _legend_alpha_changed(self, value: int) -> None:
+            self.chart.set_legend_alpha(value)
+            save_view_state(self.chart.view_state())
 
         def _settings(self) -> Dict[str, Any]:
             result = dict(self._score)

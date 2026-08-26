@@ -210,10 +210,19 @@ def test_marketcap_failure_is_loud_not_silent():
     오염된 채 그럴듯한 숫자가 나옵니다. 같은 종류의 조용한 대체가
     signal_reference 에서 이미 한 번 있었고 아무도 몰랐습니다.
     """
+    import tools.market_cap as market_cap
     from universe_selector import marketcap_universe
 
-    with pytest.raises(RuntimeError, match="시총 순위"):
-        marketcap_universe("1900-01-01", 20)   # 기록보다 앞선 날짜
+    def boom(*args, **kwargs):
+        raise OSError("연결 끊김")
+
+    original = market_cap.top_at
+    market_cap.top_at = boom
+    try:
+        with pytest.raises(RuntimeError, match="시총 순위"):
+            marketcap_universe("2020-01-05", 20)
+    finally:
+        market_cap.top_at = original
 
 
 def test_turnover_mode_unchanged():
@@ -238,3 +247,39 @@ def test_ticker_text_keeps_repeated_cash():
     assert parse_tickers("BTC, CASH, ETH, CASH") == ["BTC", "CASH", "ETH", "CASH"]
     assert parse_tickers("BTC, BTC, ETH") == ["BTC", "ETH"]      # 종목은 접습니다
     assert parse_tickers("KRW-SOL, cash") == ["SOL", "CASH"]
+
+
+def test_fixed_tickers_are_not_picked_again_by_auto(monkeypatch):
+    """
+    "고정 2 + 자동 6" 이 7 종이 되면 안 됩니다.
+
+    고정 종목을 후보에서 빼면 자동은 다음 순위로 채웁니다. 거래대금 모드는
+    EXCLUDED 에 BTC·ETH 가 있어 원래 문제가 없었는데, 시총 모드에서 그
+    목록을 풀면서 구멍이 생겼습니다.
+    """
+    import universe_selector
+
+    universe = ["AAA", "BBB", "CCC", "DDD", "EEE"]
+    monkeypatch.setattr(universe_selector, "marketcap_universe",
+                        lambda cutoff, limit: universe[:limit])
+    frames = _frames(universe, days=60)
+    cutoff = frames["AAA"].index[-1]
+    config = _config(auto_universe_source="marketcap", auto_selection_count=3,
+                     fixed_selection_enabled=True, fixed_tickers=["AAA", "BBB"])
+    picked = rank_frames(frames, config, before=cutoff)
+    assert "AAA" not in picked and "BBB" not in picked
+    # 빠진 두 자리는 다음 순위가 메웁니다.
+    assert set(picked) == {"CCC", "DDD", "EEE"}
+
+
+def test_dates_before_records_select_nothing_instead_of_raising():
+    """
+    기록 시작(2013-04-28) 이전은 **알 수 없는 것**이지 고장이 아닙니다.
+
+    달러 모드에서 BTC 달력이 글로벌 정본(2011년~)으로 바뀌자 여기서 멈췄습니다.
+    연결 실패는 계속 멈춰야 하지만, 기록 이전은 빈 목록이 정답입니다.
+    """
+    from universe_selector import marketcap_universe
+
+    assert marketcap_universe("2011-08-19", 20) == []
+    assert marketcap_universe("2013-01-01", 20) == []

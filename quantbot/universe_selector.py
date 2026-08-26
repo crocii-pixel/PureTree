@@ -176,8 +176,15 @@ def rank_frames(frames: Dict[str, pd.DataFrame], config: Dict[str, Any],
     cutoff = pd.Timestamp(before) if before is not None else pd.Timestamp.now()
     # 시총 밴드 모드에서는 BTC·ETH 를 빼지 않습니다. 순위가 곧 크기이므로
     # 1·2 위를 지우면 밴드 전체가 두 칸씩 밀립니다.
-    blocked = (STABLE_ONLY_EXCLUDED
-               if opts["universe_source"] == "marketcap" else EXCLUDED)
+    blocked = (set(STABLE_ONLY_EXCLUDED)
+               if opts["universe_source"] == "marketcap" else set(EXCLUDED))
+    if opts["fixed_enabled"]:
+        # 고정으로 이미 들고 가는 종목은 자동 후보에서 뺍니다. 그러면 자동은
+        # **다음 순위로 채웁니다.** 안 빼면 "고정 2 + 자동 6" 이 실제로는
+        # 7 종이 됩니다.
+        # (거래대금 모드는 EXCLUDED 에 BTC·ETH 가 있어 원래 이 문제가
+        #  없었습니다. 시총 모드에서 그 목록을 풀면서 생긴 구멍입니다.)
+        blocked |= {str(t).upper() for t in opts["fixed"]}
     for symbol, raw in frames.items():
         symbol = str(symbol).upper()
         if symbol in blocked or (allowed is not None and symbol not in allowed):
@@ -241,9 +248,14 @@ def marketcap_universe(cutoff: Any, limit: int) -> List[str]:
     실측: 2017-09 상위 20 중 지금 목록과 겹치는 건 3개뿐이고, 종목만 그때
     기준으로 바꾸면 9년 수익이 20배 안팎으로 줄었습니다.
     """
-    try:
-        from tools.market_cap import top_at
+    from tools.market_cap import FIRST_SNAPSHOT, top_at
 
+    # 기록이 시작되기 전이면 "고를 수 없음"이 정답입니다. 연결 실패와 달리
+    # 이건 알 수 없는 것이라, 멈추지 않고 빈 목록을 돌려줍니다. 그 날짜에는
+    # 아무것도 선정되지 않습니다.
+    if pd.Timestamp(cutoff).date() < FIRST_SNAPSHOT:
+        return []
+    try:
         universe = [row["symbol"] for row in top_at(cutoff, int(limit))]
     except Exception as exc:
         # 조용히 거래대금으로 물러서면 안 됩니다. 크기별로 나눠 재려고 시총을
@@ -257,6 +269,12 @@ def marketcap_universe(cutoff: Any, limit: int) -> List[str]:
         raise RuntimeError(
             f"{pd.Timestamp(cutoff).date()} 시총 순위가 비어 있습니다.")
     return universe
+
+
+def _band_pool_note() -> None:      # pragma: no cover - 문서용 자리
+    """
+    밴드가 모집단 밖이면 아무것도 고르지 않습니다(위 rank_frames 참고).
+    """
 
 
 def binance_usdt_symbols(timeout: float = 8.0,

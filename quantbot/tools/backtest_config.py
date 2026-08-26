@@ -539,6 +539,22 @@ def prepare_data(config: Dict[str, Any], refresh: bool = False):
     atr_w = int(config.get("atr_window", 20))
     windows = [ma, bear_ma]
 
+    # 체결 시장을 고를 수 있게 합니다.
+    #
+    #   upbit_krw    - 업비트 원화 일봉 (기본, 실전과 같은 시장)
+    #   binance_usdt - 바이낸스 USDT 일봉
+    #
+    # 자동 선정은 바이낸스 데이터로 순위를 매기는데 체결은 업비트에서 합니다.
+    # 그래서 "그날 업비트에 아직 상장 안 된 종목"이 뽑혀 자리만 차지하는 일이
+    # 생깁니다(후보를 넓힐수록 심해집니다). 달러로 돌리면 그 불일치가 없어져
+    # **전략 자체의 실력**을 잽니다. 다만 실전은 업비트/빗썸이므로, 달러
+    # 결과를 실전 기대치로 그대로 옮기면 안 됩니다.
+    market = str(config.get("backtest_market", "upbit_krw")).lower()
+    if market not in {"upbit_krw", "binance_usdt"}:
+        market = "upbit_krw"
+    fetch_market = (fetch_binance_reference if market == "binance_usdt"
+                    else fetch_upbit)
+
     requested = [str(t).upper() for t in (static_tickers(config) or ["BTC"])]
     # CASH 는 종목이 아니라 자리입니다. 시세를 받으러 가면 안 되고, 대신 몇
     # 자리를 차지했는지만 세어 사이징에 넘깁니다.
@@ -554,7 +570,7 @@ def prepare_data(config: Dict[str, Any], refresh: bool = False):
 
         selection_frames = load_auto_selection_frames(
             refresh=refresh, include_majors=band_mode(config))
-        btc_calendar = fetch_upbit("BTC", refresh=refresh)
+        btc_calendar = fetch_market("BTC", refresh=refresh)
         selection_calendar = list(
             btc_calendar.index if btc_calendar is not None else [])
         opts = selection_config(config)
@@ -579,7 +595,7 @@ def prepare_data(config: Dict[str, Any], refresh: bool = False):
     from reference_data import normalize_source
     use_reference = normalize_source(config.get("signal_reference")) == "binance"
     for ticker in tickers:
-        raw = fetch_upbit(ticker, refresh=refresh)
+        raw = fetch_market(ticker, refresh=refresh)
         if raw is None or len(raw) < 200:
             missing.append(ticker)
             continue
@@ -623,7 +639,7 @@ def prepare_data(config: Dict[str, Any], refresh: bool = False):
         for frame in data.values():
             frame.attrs["cash_slots"] = cash_reserved_slots
 
-    btc_raw = fetch_upbit("BTC", refresh=refresh)
+    btc_raw = fetch_market("BTC", refresh=refresh)
     # 폭등기 판정에는 15년치 Bitstamp BTC/USD 가 필요합니다.  예전에는 ccxt 로
     # 매번 새로 받았는데, 그건 아래에서 읽는 **공용 정본과 같은 데이터**입니다.
     # 같은 값을 두 번 받을 이유가 없고, ccxt 가 없는 배포본에서는 경고만 남긴 채
