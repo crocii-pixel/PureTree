@@ -14,8 +14,9 @@ from fee_manager import refresh_from_exchange, resolve_fee_info
 from exchange_base import ExchangeBase, create_exchange
 from live_price_stream import LivePriceStream
 from notifier import TelegramNotifier
-from reference_data import (KRW_SOURCES, fetch_reference_daily,
-                            fetch_reference_price, normalize_source)
+from reference_data import (KRW_SOURCES, SIGNAL_BOUNDARY_KST,
+                            fetch_reference_daily, fetch_reference_price,
+                            normalize_source)
 from regime_strategy import current_regime_from_config, is_period_rebalance
 from strategy_engine import StrategyEngine
 from trade_store import TradeStore, session_date
@@ -670,7 +671,18 @@ class QuantBot:
         :return: (청산 시각, 세팅 시각, 자동 유도 여부)
         """
         schedule_cfg = self.config.get("schedule") or {}
-        derived = derive_schedule(self.exchange.DAILY_CANDLE_OPEN_KST)
+        # 세팅 갱신은 **신호 일봉이 바뀌는 순간**에 맞춰야 합니다. 예전에는
+        # 체결 거래소 경계를 따랐는데, 빗썸(00:00)에서 09:00 경계 신호를 쓰면
+        # 매일 15시간 묵은 신호로 판정하게 됩니다.
+        boundary = SIGNAL_BOUNDARY_KST
+        derived = derive_schedule(boundary)
+        if boundary != self.exchange.DAILY_CANDLE_OPEN_KST:
+            logger.info(
+                "[스케줄] 신호 경계 %s (%s) 기준으로 세팅 시각을 잡습니다. "
+                "체결 거래소 %s 경계는 %s 입니다.",
+                boundary, self.signal_reference,
+                self.exchange.DISPLAY_NAME,
+                self.exchange.DAILY_CANDLE_OPEN_KST)
 
         liquidate_time = schedule_cfg.get("liquidate_time") or derived["liquidate_time"]
         settings_time = schedule_cfg.get("settings_time") or derived["settings_time"]

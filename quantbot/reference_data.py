@@ -183,6 +183,11 @@ KRW_SOURCES = frozenset({"upbit"})
 
 DEFAULT_SOURCE = "upbit"
 
+#: 선택 가능한 신호 기준은 모두 이 시각에 일봉이 바뀝니다(=UTC 00:00).
+#: 판정 스케줄은 **체결 거래소가 아니라 이 경계**를 따라야 합니다. 신호가
+#: 갱신되는 순간에 목표가·MA·청산선이 새로 정해지기 때문입니다.
+SIGNAL_BOUNDARY_KST = "09:00"
+
 
 def normalize_source(value: Any) -> str:
     """

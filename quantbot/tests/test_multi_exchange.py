@@ -1070,14 +1070,23 @@ class TestQuantBotIntegration:
         # 잘못된 값은 09:00 기준으로 안전하게 폴백
         assert derive_schedule("bad")["settings_time"] == "09:00:05"
 
-    def test_schedule_auto_follows_exchange(self, bot):
-        """schedule을 비우면 거래소의 일봉 갱신 시각을 따라간다"""
+    def test_schedule_auto_follows_the_signal_boundary(self, bot):
+        """schedule을 비우면 **신호 일봉** 경계를 따라간다.
+
+        예전에는 체결 거래소 경계를 따랐습니다. 그러면 빗썸(00:00)에서 09:00
+        경계 신호를 쓸 때 매일 15시간 묵은 신호로 판정하게 됩니다. 판정에
+        쓰는 값(K·MA·목표가·청산선)이 새로 정해지는 순간에 맞춰야 합니다.
+        """
+        from reference_data import SIGNAL_BOUNDARY_KST
+
         bot.config["schedule"] = {}
+        assert SIGNAL_BOUNDARY_KST == "09:00"
 
-        bot.exchange.DAILY_CANDLE_OPEN_KST = "00:00"      # 빗썸 기준
-        assert bot.resolve_schedule() == ("23:59:50", "00:00:05", True)
+        # 체결 거래소 경계가 무엇이든 세팅 시각은 신호 경계를 따릅니다.
+        bot.exchange.DAILY_CANDLE_OPEN_KST = "00:00"      # 빗썸
+        assert bot.resolve_schedule() == ("08:59:50", "09:00:05", True)
 
-        bot.exchange.DAILY_CANDLE_OPEN_KST = "09:00"      # 업비트/코인원 기준
+        bot.exchange.DAILY_CANDLE_OPEN_KST = "09:00"      # 업비트/코인원
         assert bot.resolve_schedule() == ("08:59:50", "09:00:05", True)
 
     def test_explicit_schedule_overrides_auto(self, bot):
