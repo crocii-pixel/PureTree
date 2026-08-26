@@ -1594,13 +1594,31 @@ class QuantBot:
         self.refresh_auto_selection()
         # 재선정 직후에 정리해야 이번 주 대상이 확정된 상태로 판단할 수 있습니다.
         self.prune_inactive_tickers()
+        previous_fee = float(self.fee_info.get("buy_rate", 0.0) or 0.0)
         self.fee_info = refresh_from_exchange(self.exchange, self.tickers)
+        current_fee = float(self.fee_info.get("buy_rate", 0.0) or 0.0)
         logger.info(
             "[수수료] 매수 %.4f%% / 매도 %.4f%% (%s)",
-            self.fee_info["buy_rate"] * 100,
-            self.fee_info["sell_rate"] * 100,
+            current_fee * 100, self.fee_info["sell_rate"] * 100,
             self.fee_info["source"],
         )
+        # 빗썸 수수료 쿠폰은 기간제라 조용히 만료됩니다. 만료되면 왕복 비용이
+        # 0.08% 에서 0.5% 로 여섯 배가 되므로 반드시 눈에 띄어야 합니다.
+        if previous_fee > 0 and current_fee > previous_fee * 1.5:
+            self.notifier.send_message(
+                "⚠️ <b>[수수료 인상 감지]</b>\n"
+                f"• 이전: {previous_fee * 100:.4f}%\n"
+                f"• 현재: {current_fee * 100:.4f}%  "
+                f"(왕복 {current_fee * 200:.2f}%)\n"
+                f"• 출처: {self.fee_info.get('source')}\n"
+                "수수료 쿠폰이 만료됐을 수 있습니다. 거래소에서 확인해 주세요.")
+            logger.error("[수수료] %.4f%% -> %.4f%% 로 올랐습니다. 쿠폰 만료 의심",
+                         previous_fee * 100, current_fee * 100)
+        elif previous_fee > 0 and current_fee < previous_fee * 0.7:
+            self.notifier.send_message(
+                "✅ <b>[수수료 인하 확인]</b>\n"
+                f"• 이전: {previous_fee * 100:.4f}%\n"
+                f"• 현재: {current_fee * 100:.4f}%")
 
         # 국면 판정은 종목과 무관하므로 루프 밖에서 1회만 (API 호출 절약)
         self.market_regime = self.detect_market_regime()

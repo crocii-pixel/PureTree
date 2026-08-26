@@ -67,17 +67,78 @@ class BithumbAdapter(ExchangeBase):
             logger.error(f"[빗썸][{symbol}] 현재가 조회 실패: {e}")
             return None
 
+    #: 실효 요율을 뽑을 때 훑어볼 최근 체결 건수.
+    #: 거래가 뜸한 종목도 최근 값 하나는 찾을 수 있게 넉넉히 봅니다.
+    FEE_SAMPLE_COUNT = 20
+
+    def _effective_fee_from_fills(self, symbol: str) -> Optional[float]:
+        """
+        최근 체결 내역에서 **실제로 떼인** 수수료율을 계산합니다.
+
+        `/info/account` 의 ``trade_fee`` 는 쿠폰을 반영하지 않는 기본 요율이라
+        쿠폰을 넣어도 늘 0.25% 로 답합니다. 실제로 얼마를 냈는지는 체결 내역의
+        ``fee / amount`` 로만 알 수 있습니다.
+
+        **가장 최근의 0 이 아닌** 요율을 씁니다. 최댓값을 쓰면 쿠폰을 넣기
+        전의 옛 체결까지 끌어와 계속 0.25% 로 보입니다. 수수료 0 인 체결
+        (이벤트·정액쿠폰 소진분)은 건너뜁니다 — 그걸 현재 요율로 삼으면
+        주문 예산이 잔고를 넘습니다.
+        """
+        try:
+            response = self.client.api.http.post(
+                "/info/user_transactions", order_currency=symbol,
+                payment_currency="KRW", offset=0,
+                count=self.FEE_SAMPLE_COUNT, searchGb=0)
+        except Exception as exc:
+            logger.debug("[%s] 체결 내역 조회 실패: %s", symbol, exc)
+            return None
+        if not isinstance(response, dict) or response.get("status") != "0000":
+            return None
+        rows = response.get("data") or []
+        # 응답은 최신순입니다. 그래도 확실히 하려고 체결 시각으로 다시 정렬합니다.
+        def stamp(row):
+            try:
+                return int(row.get("transfer_date") or 0)
+            except (TypeError, ValueError):
+                return 0
+        for row in sorted(rows, key=stamp, reverse=True):
+            try:
+                amount, fee = float(row["amount"]), float(row["fee"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if amount > 0 and fee > 0:
+                return fee / amount
+        return None
+
     def get_trading_fees(self, tickers=None) -> Dict[str, Any]:
-        by_symbol: Dict[str, Any] = {}
-        for ticker in (tickers or ["BTC"]):
-            symbol = self.to_symbol(ticker)
-            fee = float(self.client.get_trading_fee(symbol, "KRW"))
+        symbols = [self.to_symbol(t) for t in (tickers or ["BTC"])]
+        observed = {}
+        for symbol in symbols:
+            fee = self._effective_fee_from_fills(symbol)
+            if fee is not None:
+                observed[symbol] = fee
+
+        # 수수료 쿠폰은 **계정 단위**입니다(실측: 쿠폰 적용 시각 이후 모든 종목이
+        # 동시에 0.25% -> 0.04%). 그래서 한 종목에서 관측한 요율을 아직 체결이
+        # 없는 종목에도 씁니다. 여기서 trade_fee 로 되돌리면 쿠폰을 못 본
+        # 종목들이 대표값을 0.25% 로 끌어올립니다.
+        if observed:
+            account_rate = max(observed.values())
+            source = "bithumb_filled_orders"
+        else:
+            account_rate = float(self.client.get_trading_fee(symbols[0], "KRW"))
+            source = "bithumb_private_api"
+
+        by_symbol = {}
+        for symbol in symbols:
+            fee = observed.get(symbol, account_rate)
             by_symbol[symbol] = {"buy_rate": fee, "sell_rate": fee,
                                  "maker_rate": fee, "taker_rate": fee}
-        rate = max(v["taker_rate"] for v in by_symbol.values())
-        return {"exchange": self.NAME, "buy_rate": rate, "sell_rate": rate,
-                "maker_rate": rate, "taker_rate": rate,
-                "by_symbol": by_symbol, "source": "bithumb_private_api"}
+        return {"exchange": self.NAME,
+                "buy_rate": account_rate, "sell_rate": account_rate,
+                "maker_rate": account_rate, "taker_rate": account_rate,
+                "by_symbol": by_symbol, "source": source,
+                "fee_samples": len(observed)}
 
     # 공통 봉 이름 -> pybithumb 표기.
     # pybithumb만 1시간봉을 'hour'로 부르기 때문에 공통 이름을 그대로 넘기면 KeyError가 납니다.
