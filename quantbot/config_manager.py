@@ -169,6 +169,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "auto_rank_band": "",
     # 재선정 주기(일). 예전에는 월요일에 박혀 있었습니다. 7 이면 같은 자리.
     "auto_rebalance_days": 7,
+    # 7일 수익률 0 이상만 고를지. 원 전략의 규칙이라 기본은 켜짐.
+    "auto_require_positive_return": True,
     # 자동 TOP6에서 탈락하면 기존 MA 청산을 기다리지 않고 전량 시장가 청산.
     "exit_on_selection_drop": True,
     # 워크포워드 검증에서 MA5보다 OOS 성과가 나았던 값 (31개 구간 중 19개 우위)

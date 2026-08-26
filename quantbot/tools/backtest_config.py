@@ -550,7 +550,10 @@ def prepare_data(config: Dict[str, Any], refresh: bool = False):
     selection_schedule: Dict[pd.Timestamp, List[str]] = {}
     selection_calendar = []
     if automatic_enabled(config):
-        selection_frames = load_auto_selection_frames(refresh=refresh)
+        from universe_selector import band_mode
+
+        selection_frames = load_auto_selection_frames(
+            refresh=refresh, include_majors=band_mode(config))
         btc_calendar = fetch_upbit("BTC", refresh=refresh)
         selection_calendar = list(
             btc_calendar.index if btc_calendar is not None else [])
@@ -704,9 +707,18 @@ def prepare_data(config: Dict[str, Any], refresh: bool = False):
     ctx.attrs["regime_last_completed"] = str(regime_btc.index[-1])
     ctx.attrs["regime_decision_interval"] = regime_interval
 
-    # 매매 대상에서 BTC를 뺐다면 지표만 쓰고 매매에서는 제외
-    if "BTC" not in [str(t).upper() for t in static_tickers(config)
-                     if str(t).upper() != "CASH"]:
+    # 매매 대상에서 BTC를 뺐다면 지표만 쓰고 매매에서는 제외.
+    #
+    # 다만 자동 선정이 BTC 를 고를 수 있으면 매매 대상입니다. 예전에는 BTC 가
+    # 늘 고정 종목이었고 자동 선정 후보에서도 빠져 있어 이 구분이 필요 없었지만,
+    # 시총 순위대로 자를 때는 1위가 곧 BTC 입니다. 그때 BTC 를 빼 버리면 대형
+    # 밴드에서 가장 큰 종목이 통째로 사라집니다.
+    btc_auto_selected = bool(
+        "BTC" in data and "auto_selected" in data["BTC"].columns
+        and data["BTC"]["auto_selected"].any())
+    if not btc_auto_selected and "BTC" not in [
+            str(t).upper() for t in static_tickers(config)
+            if str(t).upper() != "CASH"]:
         data.pop("BTC", None)
 
     return data, ctx, list(dict.fromkeys(missing))

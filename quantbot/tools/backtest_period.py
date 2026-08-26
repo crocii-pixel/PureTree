@@ -21,8 +21,15 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
         dates = [d for d in dates if d >= pd.Timestamp(start)]
     if end is not None:
         dates = [d for d in dates if d <= pd.Timestamp(end)]
-    if len(dates) < 30 or "BTC" not in data:
+    if len(dates) < 30:
         return {}
+    # BTC 가 매매 대상이 아닐 수 있습니다. 시총 하위 밴드만 담는 구성이 그렇고,
+    # 그때도 백테스트는 돌아야 합니다. 국면은 ctx(글로벌 BTC)에서 오므로
+    # data["BTC"] 없이도 판정에는 지장이 없습니다. 옛 국면 엔진만 예외입니다.
+    if "BTC" not in data and "regime_close" not in ctx:
+        raise RuntimeError(
+            "옛 국면 엔진은 매매 대상 BTC 일봉이 필요합니다. "
+            "종목에 BTC 를 넣거나 장세 판정을 켜 주세요.")
 
     scoring = config.get("regime_scoring") or {}
     use_composite = bool(scoring.get("use_for_backtest", False))
@@ -224,14 +231,20 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
         return [ticker for ticker, frame in data.items()
                 if date in frame.index and bool(frame.loc[date].get("auto_selected", True))]
 
+    # 종목마다 날짜 색인을 한 번만 만들어 둡니다. 아래 조회가 하루에 종목 수
+    # 만큼 일어나므로, 매번 프레임을 잘라 보면 종목이 늘수록 제곱으로 느려집니다.
+    # 손으로 고른 8종목은 전 기간 데이터가 있어 이 경로를 거의 안 탔지만,
+    # 자동 선정은 종목이 계속 드나들어 빠진 날짜가 많습니다.
+    _index_cache = {ticker: frame.index for ticker, frame in data.items()}
+
     def row_at_or_before(ticker, date):
         frame = data[ticker]
-        if date in frame.index:
-            return frame.loc[date], True
-        history = frame.loc[:date]
-        if history.empty:
+        index = _index_cache[ticker]
+        position = int(index.searchsorted(date, side="right")) - 1
+        if position < 0:
             raise KeyError(f"{ticker} has no price at or before {date}")
-        return history.iloc[-1], False
+        return frame.iloc[position], bool(
+            position < len(index) and index[position] == date)
 
     def mark_price(ticker, date, preferred="close"):
         row, exact = row_at_or_before(ticker, date)
@@ -502,8 +515,8 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
             sizing_equity *= (1.0 - cash_slot_share)
             active_names = active(date)
             btc_reserved = 0.0
-            if btc_min_weight > 0 and "BTC" in active_names:
-                br = data["BTC"].loc[date]
+            if btc_min_weight > 0 and "BTC" in active_names and "BTC" in data:
+                br = data["BTC"].loc[date]      # btc_min_weight > 0 인 경우만
                 btc_target_col = ("signal_target" if use_reference
                                   and "signal_target" in br.index else "target")
                 if (not pd.isna(br[btc_target_col]) and not pd.isna(br["N"])

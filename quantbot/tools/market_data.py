@@ -296,13 +296,21 @@ def load_upbit_many(tickers: List[str], refresh: bool = False,
     return out
 
 
-def load_auto_selection_frames(refresh: bool = False) -> dict:
-    """현재 업비트 KRW 상장 ∩ Binance USDT 현물의 장기 일봉을 병렬 캐시 로딩."""
+def load_auto_selection_frames(refresh: bool = False,
+                               include_majors: bool = False) -> dict:
+    """
+    현재 업비트 KRW 상장 ∩ Binance USDT 현물의 장기 일봉을 병렬 캐시 로딩.
+
+    ``include_majors`` 는 BTC·ETH 를 후보에 남깁니다. 시총 순위대로 자를 때는
+    1·2 위가 곧 BTC·ETH 라서, 빼 두면 밴드가 두 칸씩 밀립니다.
+    """
     from concurrent.futures import ThreadPoolExecutor, as_completed
     import pyupbit
-    from universe_selector import binance_usdt_symbols
+    from universe_selector import STABLE_ONLY_EXCLUDED, binance_usdt_symbols
 
-    universe_cache = CACHE_DIR / "auto_selection_candidates.json"
+    universe_cache = CACHE_DIR / (
+        "auto_selection_candidates_majors.json" if include_majors
+        else "auto_selection_candidates.json")
     candidates = []
     if universe_cache.exists() and not refresh:
         try:
@@ -315,7 +323,8 @@ def load_auto_selection_frames(refresh: bool = False) -> dict:
     if not candidates:
         upbit = {str(m).split("-")[-1].upper()
                  for m in (pyupbit.get_tickers(fiat="KRW") or [])}
-        candidates = sorted(upbit & binance_usdt_symbols())
+        candidates = sorted(upbit & binance_usdt_symbols(
+            exclude=set(STABLE_ONLY_EXCLUDED) if include_majors else None))
         try:
             universe_cache.parent.mkdir(parents=True, exist_ok=True)
             universe_cache.write_text(json.dumps({

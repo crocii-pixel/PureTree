@@ -144,6 +144,10 @@ def selection_config(config: Dict[str, Any]) -> Dict[str, Any]:
         # 없었습니다. 주기를 값으로 빼면 한 달 주기를 확인했던 것처럼
         # 주간 주기도 스윕할 수 있습니다.
         "rebalance_days": max(1, int(config.get("auto_rebalance_days", 7))),
+        # 7일 수익률 0 이상만 고를지. 원 전략의 규칙이라 기본은 켜짐입니다.
+        # 밴드끼리 비교할 때만 꺼서 칸을 꽉 채웁니다.
+        "require_positive_return": bool(
+            config.get("auto_require_positive_return", True)),
     }
 
 
@@ -170,9 +174,13 @@ def rank_frames(frames: Dict[str, pd.DataFrame], config: Dict[str, Any],
     opts = selection_config(config)
     rows = []
     cutoff = pd.Timestamp(before) if before is not None else pd.Timestamp.now()
+    # 시총 밴드 모드에서는 BTC·ETH 를 빼지 않습니다. 순위가 곧 크기이므로
+    # 1·2 위를 지우면 밴드 전체가 두 칸씩 밀립니다.
+    blocked = (STABLE_ONLY_EXCLUDED
+               if opts["universe_source"] == "marketcap" else EXCLUDED)
     for symbol, raw in frames.items():
         symbol = str(symbol).upper()
-        if symbol in EXCLUDED or (allowed is not None and symbol not in allowed):
+        if symbol in blocked or (allowed is not None and symbol not in allowed):
             continue
         df = raw.sort_index()
         index = pd.DatetimeIndex(df.index).tz_localize(None)
@@ -201,13 +209,23 @@ def rank_frames(frames: Dict[str, pd.DataFrame], config: Dict[str, Any],
     # 순위 밴드가 지정되면 **모집단 순위로 먼저 자릅니다.** 1~6위(대형)와
     # 15~20위(소형)를 갈라 돌리면 수익 배수가 크기에서 오는지 전략에서
     # 오는지가 드러납니다.
-    band = expand_band(opts["rank_band"], len(pool)) if opts["rank_band"] else []
-    if band:
+    band: List[int] = []
+    if opts["rank_band"]:
+        band = expand_band(opts["rank_band"], len(pool))
+        # 밴드가 모집단 밖으로 통째로 벗어나면 **아무것도 고르지 않습니다.**
+        # 예전에는 빈 밴드를 "밴드 없음"으로 보고 풀 전체를 썼습니다. 그러면
+        # 2017년처럼 시세 이력이 있는 종목이 두 개뿐일 때 소형 밴드가 조용히
+        # 대형과 같은 종목을 담아, 크기 비교가 통째로 무의미해집니다.
         pool = [pool[rank - 1] for rank in band if 1 <= rank <= len(pool)]
 
     # 원 전략 순서: 모집단을 확정한 다음, 그 안에서만 7일 수익률이 0 이상인
     # 종목을 모멘텀 순으로 고릅니다.
-    pool = [row for row in pool if row[2] >= 0]
+    #
+    # 이 문턱을 끄면 밴드가 늘 꽉 찹니다. 크기별로 나눠 비교할 때는 그래야
+    # 합니다 - 문턱이 밴드마다 다르게 걸려서, 담긴 종목이 2.4개인 밴드와
+    # 4.0개인 밴드를 비교하면 크기가 아니라 **집중도**를 재게 됩니다.
+    if opts["require_positive_return"]:
+        pool = [row for row in pool if row[2] >= 0]
     limit = count if count is not None else opts["count"]
     if band and count is None:
         # 밴드를 지정했으면 그 칸 수가 곧 목표 종목 수입니다.
@@ -241,17 +259,40 @@ def marketcap_universe(cutoff: Any, limit: int) -> List[str]:
     return universe
 
 
-def binance_usdt_symbols(timeout: float = 8.0) -> Set[str]:
+def binance_usdt_symbols(timeout: float = 8.0,
+                         exclude: Optional[Set[str]] = None) -> Set[str]:
+    """
+    Binance USDT 현물 심볼.
+
+    기본 제외 목록에는 BTC·ETH 가 들어 있습니다. 원래 자동 선정이 "BTC·ETH 는
+    고정으로 들고 그 밖에서 여섯 개를 고른다"는 전략이었기 때문입니다.
+    시총 순위대로 자를 때는 1·2 위가 곧 BTC·ETH 이므로, 그대로 두면 밴드
+    "1-6" 이 실제로는 3~8 위가 됩니다. 그때는 ``exclude`` 를 좁혀 부릅니다.
+    """
+    blocked = EXCLUDED if exclude is None else exclude
     response = requests.get(BINANCE_INFO_URL, timeout=timeout)
     response.raise_for_status()
     return {
         str(row["baseAsset"]).upper()
         for row in response.json().get("symbols", [])
         if row.get("quoteAsset") == "USDT" and row.get("status") == "TRADING"
-        and str(row.get("baseAsset", "")).upper() not in EXCLUDED
+        and str(row.get("baseAsset", "")).upper() not in blocked
         and not any(str(row.get("baseAsset", "")).upper().endswith(suffix)
                     for suffix in ("UP", "DOWN", "BULL", "BEAR"))
     }
+
+
+#: 스테이블·법정통화만 뺀 제외 목록. 시총 밴드 모드에서 씁니다.
+STABLE_ONLY_EXCLUDED = frozenset({
+    "USDT", "USDC", "FDUSD", "TUSD", "DAI", "BUSD",
+    "EUR", "TRY", "BRL", "KRW", "JPY",
+})
+
+
+def band_mode(config: Dict[str, Any]) -> bool:
+    """시총 순위대로 자르는 모드인가. BTC·ETH 를 후보에 남겨야 합니다."""
+    opts = selection_config(config)
+    return opts["universe_source"] == "marketcap"
 
 
 def save_state(exchange: str, selected: List[str],
