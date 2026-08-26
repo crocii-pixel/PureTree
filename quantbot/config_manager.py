@@ -143,7 +143,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "bear_strategy": "defensive_atr",
         "defensive_atr_multiple": 2.0,
         "defensive_entry_method": "atr",
-        "defensive_carry_mode": "merge",
+        "defensive_carry_mode": "ma",
         "defensive_probe_fraction": 0.25,
         "defensive_take_profit_pct": 0.05,
         "defensive_stop_atr_multiple": 2.0,
@@ -301,6 +301,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # 청산선이 매수선 위면 사지 않습니다. 사자마자 파는 장면은 수익보다
     # 신뢰를 깎습니다(9년 실측 39일, 0.2%).
     "skip_immediate_exit_buys": True,
+    # 주간 리밸런싱을 어떻게 할지. "delta" 는 목표 비중과의 차액만 거래하고
+    # "full" 은 전량 매도 후 재매수합니다. 세 구간 검증 모두에서 delta 가
+    # 이겼습니다(+185,850%p · MDD -0.7p · 매매 -856).
+    "rebalance_mode": "delta",
+    # 목표 대비 이 안쪽이면 손대지 않습니다. 0%(잔돈까지 맞춤)와 10%(너무
+    # 벌어짐) 사이에서 5% 가 가장 좋았습니다.
+    "rebalance_band": 0.05,
     # 복리 사이징 기준자산 상한. 0이면 제한 없이 실제 총자산을 전부 반영합니다.
     # 예: 30_000_000이면 계좌가 5천만원이어도 목표수량은 3천만원 기준으로 계산합니다.
     "sizing_equity_cap_krw": 0.0,

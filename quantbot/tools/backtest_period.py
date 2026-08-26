@@ -119,6 +119,15 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
     # 청산선이 매수선 위에 있으면 사자마자 팔 자리입니다. 실전이 그 매수를
     # 막으므로 백테스트도 같이 막아야 검증이 실전과 어긋나지 않습니다.
     skip_immediate_exit = bool(config.get("skip_immediate_exit_buys", True))
+    # 리밸런싱 방식. "delta" 는 목표 비중과의 차액만 거래합니다.
+    # "full" 은 전량 매도 후 재매수(기존 동작).
+    rebalance_mode = str(config.get("rebalance_mode", "full")).lower()
+    if rebalance_mode not in {"full", "delta"}:
+        rebalance_mode = "full"
+    # 목표 대비 이만큼 안쪽이면 손대지 않습니다. 잔돈 거래로 수수료만 내는
+    # 것을 막습니다.
+    rebalance_band = float(np.clip(
+        config.get("rebalance_band", 0.05) or 0.0, 0.0, 0.5))
     # 현금 슬롯. 목록에 CASH 를 넣은 수만큼 기준자산에서 떼어 놓습니다.
     # 슬롯 하나가 1/N 이고, 그 몫은 어떤 포지션도 건드리지 못합니다.
     # 노출을 낮추는 손잡이가 아니라 **노출 자체를 선택지로** 만드는 장치입니다.
@@ -148,6 +157,10 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
 
     cash = INITIAL_CAPITAL
     immediate_exit_skips = 0        # 사자마자 팔 자리라 건너뛴 횟수
+    # 국면별 매수 횟수. "하락장에도 돌파를 켜 두는 이유는 어차피 잘 안 걸리기
+    # 때문"이라는 설명이 맞는지 보려면, 실제로 몇 번 걸렸는지 세야 합니다.
+    buys_by_phase: Dict[str, int] = {}
+    days_by_phase: Dict[str, int] = {}
     positions: Dict[str, Dict[str, float]] = {}
     trades = []
     curve = [INITIAL_CAPITAL]
@@ -296,6 +309,101 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
                        "return": proceeds / cost - 1.0 if cost > 0 else 0.0,
                        "profit": proceeds - cost})
 
+    def rebalance_delta(date, names):
+        """
+        목표 비중과의 **차액만** 거래합니다.
+
+        전량 매도 후 재매수는 매주 장부 100%를 왕복시킵니다. 실제 조정
+        필요분은 보통 10~20% 인데, 왕복 비용(수수료 + 슬리피지)은 100% 에
+        붙습니다. 차액만 옮기면 그 대부분이 남습니다.
+
+        비중이 이미 맞는 종목은 손대지 않습니다. 넘치는 쪽만 팔고 모자란
+        쪽만 삽니다.
+        """
+        nonlocal cash, buy_orders
+        names = list(names)
+        # 목표에서 빠진 종목은 전량 정리합니다.
+        for ticker in list(positions):
+            if ticker not in names:
+                sell(ticker, date, "rebalance_drop")
+        if not names:
+            return
+
+        equity = cash + sum(
+            float(p["units"]) * mark_price(t, date, "open")
+            for t, p in positions.items())
+        deployable = min(equity, sizing_cap) if sizing_cap > 0 else equity
+        deployable *= (1.0 - cash_slot_share)
+        equal_budget = deployable / len(names)
+        budgets = {ticker: equal_budget for ticker in names}
+        if "BTC" in budgets and btc_min_weight > 0:
+            btc_budget = max(equal_budget, deployable * btc_min_weight)
+            budgets["BTC"] = btc_budget
+            others = [ticker for ticker in names if ticker != "BTC"]
+            if others:
+                alt_budget = max(0.0, deployable - btc_budget) / len(others)
+                budgets.update({ticker: alt_budget for ticker in others})
+
+        # 넘치는 쪽을 먼저 팔아야 모자란 쪽을 살 현금이 생깁니다.
+        for ticker in names:
+            pos = positions.get(ticker)
+            if not pos:
+                continue
+            price = mark_price(ticker, date, "open")
+            if price <= 0:
+                continue
+            held_value = float(pos["units"]) * price
+            excess = held_value - budgets[ticker]
+            if excess <= rebalance_band * max(budgets[ticker], 1e-9):
+                continue
+            units = min(float(pos["units"]), excess / price)
+            if units <= 0:
+                continue
+            sell_units(ticker, date, "rebalance_trim", units)
+
+        for ticker in names:
+            pos = positions.get(ticker)
+            price = mark_price(ticker, date, "open")
+            if price <= 0:
+                continue
+            held_value = (float(pos["units"]) * price) if pos else 0.0
+            need = budgets[ticker] - held_value
+            if need <= rebalance_band * max(budgets[ticker], 1e-9):
+                continue
+            budget = min(cash, need)
+            if budget <= 0:
+                continue
+            entry = float(data[ticker].at[date, "open"]) * (1 + slippage)
+            units = budget / (entry * (1 + buy_fee))
+            add_position(ticker, units, budget, entry, "core_units")
+            cash -= budget
+            buy_orders += 1
+            buys_by_phase[phase] = buys_by_phase.get(phase, 0) + 1
+
+    def sell_units(ticker, date, reason, units):
+        """보유분 중 일부만 팝니다. 리밸런싱 차액 정리에 씁니다."""
+        nonlocal cash
+        pos = positions.get(ticker)
+        if not pos or units <= 0:
+            return
+        total = float(pos["units"])
+        units = min(units, total)
+        share = units / total if total > 0 else 0.0
+        cost = float(pos["cost"]) * share
+        r, exact = row_at_or_before(ticker, date)
+        price = float(r["open" if exact else "close"]) * (1 - slippage)
+        proceeds = units * price * (1 - sell_fee)
+        cash += proceeds
+        for key in ("units", "cost", "core_units", "breakout_units",
+                    "probe_units", "core_cost", "breakout_cost", "probe_cost"):
+            pos[key] = float(pos.get(key, 0.0)) * (1 - share)
+        if pos["units"] <= 1e-12:
+            positions.pop(ticker, None)
+            filled_rungs.pop(ticker, None)
+        trades.append({"date": date, "ticker": ticker, "reason": reason,
+                       "return": proceeds / cost - 1.0 if cost > 0 else 0.0,
+                       "profit": proceeds - cost})
+
     def buy_equal(date, names):
         nonlocal cash, buy_orders
         if not names:
@@ -422,6 +530,7 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
 
     for date in dates:
         phase = str(regime_labels.get(date, "판정 준비"))
+        days_by_phase[phase] = days_by_phase.get(phase, 0) + 1
         strategy = phase_strategies.get(phase, "cash")
         changed = previous_strategy is not None and strategy != previous_strategy
         if changed:
@@ -431,24 +540,6 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
                 # 넘겨받아 이어 갑니다. 돌파분만 전환에 따라 정리합니다.
                 sell(ticker, date, "strategy_switch",
                      keep_probe=not probe_follows_ma)
-            if carry_mode == "merge" and strategy in {
-                    "volatility_breakout", "defensive_atr"}:
-                # 상승 전환처럼 **새 전략도 포지션을 드는** 경우에는, 지뢰를
-                # 돌파분으로 넘겨 MA 청산 규칙에 맡깁니다. +10% 에서 끊지 않고
-                # 추세를 끝까지 탈 수 있습니다.
-                for ticker, pos in positions.items():
-                    probe = float(pos.get("probe_units", 0.0))
-                    if probe <= 0:
-                        continue
-                    pos["breakout_units"] = pos.get("breakout_units", 0.0) + probe
-                    pos["breakout_cost"] = (pos.get("breakout_cost", 0.0)
-                                            + float(pos.get("probe_cost", 0.0)))
-                    pos["probe_units"] = 0.0
-                    pos["probe_cost"] = 0.0
-                    pos["probe_entry"] = 0.0
-                    pos["probe_atr"] = 0.0
-                    filled_rungs.pop(ticker, None)
-                    probe_merged_into_breakout += 1
 
         # 전략이 무엇이든 이미 깔린 지뢰는 매일 자기 규칙으로 정산합니다.
         settled_today: set = set()
@@ -462,9 +553,12 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
             pass
         elif strategy == "period_rebalance":
             if date.weekday() == 0 or previous_strategy is None:
-                for ticker in list(positions):
-                    sell(ticker, date, "weekly_rebalance")
-                buy_equal(date, active(date))
+                if rebalance_mode == "delta":
+                    rebalance_delta(date, active(date))
+                else:
+                    for ticker in list(positions):
+                        sell(ticker, date, "weekly_rebalance")
+                    buy_equal(date, active(date))
         elif strategy in {"volatility_breakout", "defensive_atr", "cash_with_atr"}:
             closed_today = set()
             probe_rearm_blocked = set(rearm_blocked_today)
@@ -664,6 +758,7 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
                 positions[ticker]["probe_atr"] = float(reservation["local_atr"])
                 cash -= budget
                 buy_orders += 1
+                buys_by_phase[phase] = buys_by_phase.get(phase, 0) + 1
                 lower_buy_orders += 1
                 rung_fills[rung] += 1
                 filled_rungs.setdefault(ticker, set()).add(rung)
@@ -715,6 +810,7 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
                         if ticker == "BTC":
                             btc_reserved = max(0.0, btc_reserved - budget)
                         buy_orders += 1
+                        buys_by_phase[phase] = buys_by_phase.get(phase, 0) + 1
 
             reservation_expired += sum(
                 ticker not in filled_reservations
@@ -762,6 +858,10 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
         "cash_slot_share": round(cash_slot_share, 4),
         "skip_immediate_exit_buys": skip_immediate_exit,
         "immediate_exit_skips": immediate_exit_skips,
+        "rebalance_mode": rebalance_mode,
+        "rebalance_band": rebalance_band,
+        "buys_by_phase": dict(buys_by_phase),
+        "days_by_phase": dict(days_by_phase),
         "signal_reference": signal_reference,
         "signal_basis": "signal_columns" if use_reference else "execution_candles",
         "exit_timing": exit_timing,

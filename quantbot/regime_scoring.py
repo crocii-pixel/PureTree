@@ -54,7 +54,7 @@ DEFAULT_REGIME_SCORE_CONFIG: Dict[str, Any] = {
     #   own   자기 익절·손절로만
     #   merge 포지션을 드는 전략으로 바뀌면 돌파분에 편입 (기본)
     #   ma    처음부터 MA 청산 규칙만
-    "defensive_carry_mode": "merge",
+    "defensive_carry_mode": "ma",
     "defensive_probe_fraction": 0.25,
     # ATR lower orders are rebuilt from the latest completed candle every day.
     # Filled probe units are managed separately from core/breakout holdings.
@@ -169,8 +169,15 @@ def scoring_config(config: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]
     result["wick_ratio_min"] = float(np.clip(
         float(result.get("wick_ratio_min", 0.5) or 0.5), 0.05, 0.95))
     result["wick_slope_bars"] = max(0, int(result.get("wick_slope_bars", 0)))
-    if result.get("defensive_carry_mode") not in {"own", "merge", "ma"}:
-        result["defensive_carry_mode"] = "merge"
+    # "merge"(전환 시 보유분 넘김)는 뺐습니다. 세 구간 검증에서 전환 시
+    # 정리하는 쪽에 -62,121%p 로 졌습니다. 상승 전환의 절반 이상이 가짜라
+    # 넘기면 되돌림을 그대로 맞습니다. 옛 설정값은 "own" 으로 보냅니다 -
+    # 상승 전략이 period_rebalance 인 조합에서는 merge 가 애초에 발동하지
+    # 않았으므로 동작이 바뀌지 않습니다.
+    if result.get("defensive_carry_mode") == "merge":
+        result["defensive_carry_mode"] = "own"
+    if result.get("defensive_carry_mode") not in {"own", "ma"}:
+        result["defensive_carry_mode"] = "own"
     result["defensive_probe_fraction"] = float(np.clip(
         float(result.get("defensive_probe_fraction", 0.25) or 0.25), 0.01, 1.0))
     result["defensive_take_profit_pct"] = float(np.clip(
@@ -223,7 +230,7 @@ def validate_scoring_config(config: Optional[Mapping[str, Any]] = None,
     if str(merged.get("defensive_entry_method", "atr")) not in {
             "atr", "lower_channel", "wick"}:
         errors.append("예약매수 방식을 선택해 주세요.")
-    if str(merged.get("defensive_carry_mode", "merge")) not in {
+    if str(merged.get("defensive_carry_mode", "ma")) not in {
             "own", "merge", "ma"}:
         errors.append("예약분 회수 방식을 선택해 주세요.")
     for phase, label in (("bull", "상승기"), ("stable", "안정기"),

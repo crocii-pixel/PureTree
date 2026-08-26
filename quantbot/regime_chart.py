@@ -1362,9 +1362,15 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
             self.inputs["defensive_entry_method"] = entry_method
             strategy_form.addRow("예약매수 방식", entry_method)
             carry = QtWidgets.QComboBox()
-            carry.addItem("상승전환 시 돌파분 편입", "merge")
-            carry.addItem("자기 익절·손절로만", "own")
-            carry.addItem("처음부터 MA 청산", "ma")
+            carry.addItem("지뢰도 MA 청산", "ma")
+            carry.addItem("전환 시 돌파분만 정리", "own")
+            carry.setToolTip(
+                "장세가 바뀔 때 들고 있던 물량을 어떻게 할지.\n\n"
+                "  넘김   - 돌파분·지뢰분을 각자 규칙 그대로 새 전략에 넘깁니다.\n"
+                "           조정에서 잡아 둔 물량이 상승장으로 이어집니다.\n"
+                "  정리   - 돌파분은 팔고 지뢰분만 남깁니다(기존 동작).\n"
+                "  MA청산 - 지뢰도 짧은 익절 대신 MA 청산을 따릅니다.\n\n"
+                "주간 리밸런싱 시점에는 어느 쪽이든 지뢰까지 전부 풉니다.")
             carry.setToolTip(
                 "이미 채워진 지뢰를 어떻게 회수할지 고릅니다.\n"
                 "\n"

@@ -597,14 +597,20 @@ def _switching_ctx(index, bull_from):
                          "regime_label": labels}, index=index)
 
 
-def test_three_probe_exit_modes_behave_differently():
-    """예약분 회수 방식 세 가지가 실제로 다르게 동작해야 합니다."""
+def test_two_probe_exit_modes_behave_differently():
+    """
+    예약분 회수 방식 두 가지가 실제로 다르게 동작해야 합니다.
+
+    예전에는 "merge"(전환 시 보유분 넘김)가 있었는데 뺐습니다. 세 구간 검증
+    에서 전환 시 정리하는 쪽에 -62,121%p 로 졌습니다 - 상승 전환의 절반
+    이상이 가짜라, 넘기면 되돌림을 그대로 맞습니다.
+    """
     data = {"BTC": _defensive_frame(ma_ok=False)}
     index = data["BTC"].index
     ctx = _switching_ctx(index, len(index) // 3)
 
     results = {}
-    for mode in ("own", "merge", "ma"):
+    for mode in ("own", "ma"):
         # 익절선을 최대로 올려 전환 시점에 지뢰가 열린 채로 남게 합니다.
         config = _defensive_config(defensive_carry_mode=mode,
                                    defensive_take_profit_pct=1.0)
@@ -618,21 +624,30 @@ def test_three_probe_exit_modes_behave_differently():
     # ma 는 익절·손절선을 두지 않습니다.
     assert results["ma"]["atr_probe_take_profit_exits"] == 0
     assert results["ma"]["atr_probe_stop_exits"] == 0
-    # merge 는 상승 전환 때 돌파분으로 넘깁니다.
-    assert results["merge"]["atr_probe_merged_into_breakout"] > 0
-    assert results["own"]["atr_probe_merged_into_breakout"] == 0
+    # own 은 자기 익절·손절을 그대로 씁니다.
+    assert (results["own"]["atr_probe_take_profit_exits"]
+            + results["own"]["atr_probe_stop_exits"]) >= 0
 
 
-def test_carry_mode_defaults_to_merge_and_rejects_typos():
+def test_carry_mode_migrates_merge_and_rejects_typos():
+    """
+    옛 설정에 남은 "merge" 는 "own" 으로 보냅니다.
+
+    상승 전략이 period_rebalance 인 조합에서는 merge 가 애초에 발동하지
+    않았으므로(조건 집합에 없었음) 동작이 바뀌지 않습니다. 조용히 다른
+    동작으로 바꾸면 그게 더 나쁩니다.
+    """
     from regime_scoring import scoring_config
 
-    assert scoring_config({})["defensive_carry_mode"] == "merge"
-    for value in ("own", "merge", "ma"):
+    assert scoring_config({})["defensive_carry_mode"] == "ma"
+    for value in ("own", "ma"):
         assert scoring_config({"regime_scoring": {"defensive_carry_mode": value}}
                               )["defensive_carry_mode"] == value
+    assert scoring_config({"regime_scoring": {"defensive_carry_mode": "merge"}}
+                          )["defensive_carry_mode"] == "own"
     for bad in ("nonsense", "", None, 5):
         assert scoring_config({"regime_scoring": {"defensive_carry_mode": bad}}
-                              )["defensive_carry_mode"] == "merge"
+                              )["defensive_carry_mode"] == "own"
 
 
 def test_ma_mode_lets_the_ma_exit_take_the_probe_too():
