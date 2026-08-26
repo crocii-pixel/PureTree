@@ -558,3 +558,69 @@ def test_result_history_drops_the_checkbox_column_and_deletes_with_del(monkeypat
     backtest.close()
     window.close()
     app.processEvents()
+
+
+def test_legend_toggles_each_overlay_without_panning_the_chart(monkeypatch):
+    """차트 좌상단 범례를 눌러 보조선을 하나씩 껐다 켤 수 있어야 합니다.
+
+    범례 클릭이 드래그 이동으로 새어 나가면 선을 끄려다 화면이 밀립니다.
+    """
+    try:
+        from PyQt6 import QtCore, QtGui, QtWidgets
+    except ImportError:
+        try:
+            from PyQt5 import QtCore, QtGui, QtWidgets
+        except ImportError:
+            pytest.skip("PyQt5/PyQt6 unavailable")
+
+    import global_market_data
+    from regime_chart import OVERLAY_SERIES, build_regime_chart_window
+
+    monkeypatch.setattr(global_market_data, "ensure_global_btc_current", lambda **_: True)
+    monkeypatch.setattr(global_market_data, "load_global_btc", lambda *_a, **_k: _frame())
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    window = build_regime_chart_window(
+        QtCore, QtGui, QtWidgets,
+        lambda: {"regime_short_ma": 60, "regime_long_ma": 120},
+        lambda _value: None,
+        lambda: ("2023-06-01", "2024-02-01", False),
+        lambda _start, _end: None,
+    )
+    deadline = time.monotonic() + 5.0
+    while window._data.empty and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.01)
+    window.resize(1280, 800)
+    window.show()
+    app.processEvents()
+    chart = window.chart
+
+    # 기본은 전부 켜짐, 그리고 범례를 그린 뒤에 히트영역이 생깁니다.
+    assert all(chart._series_visible.values())
+    assert set(chart._legend_hit) == {c for c, _l, _c, _s in OVERLAY_SERIES}
+
+    before = (chart._view_start, chart._view_end)
+    for column, _label, _colour, _style in OVERLAY_SERIES:
+        rect = chart._legend_hit[column]
+        event = QtGui.QMouseEvent(
+            QtCore.QEvent.Type.MouseButtonPress, QtCore.QPointF(rect.center()),
+            QtCore.Qt.MouseButton.LeftButton, QtCore.Qt.MouseButton.LeftButton,
+            QtCore.Qt.KeyboardModifier.NoModifier)
+        chart.mousePressEvent(event)
+        app.processEvents()
+        assert chart._series_visible[column] is False, column
+        # 클릭이 이동으로 새지 않아야 합니다.
+        assert chart._drag_origin is None, column
+        assert (chart._view_start, chart._view_end) == before, column
+        chart.mousePressEvent(event)
+        app.processEvents()
+        assert chart._series_visible[column] is True, column
+
+    # 표시 상태가 캐시 키에 들어가야 껐을 때 다시 그려집니다.
+    chart._series_visible["ma_long"] = False
+    first = chart._static_key
+    assert not chart.grab().isNull()
+    assert chart._static_key != first
+
+    window.close()
+    app.processEvents()

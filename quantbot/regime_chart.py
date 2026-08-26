@@ -39,6 +39,17 @@ MIN_VISIBLE_BARS: Dict[str, int] = {
     "1d": 30, "1w": 12, "1mo": 6,
 }
 
+#: 차트 위에 겹쳐 그리는 보조선. (열 이름, 라벨, 색, 선 모양키)
+#: 순서가 곧 범례 순서이고, 범례를 클릭하면 그 선만 껐다 켤 수 있습니다.
+OVERLAY_SERIES: Tuple[Tuple[str, str, str, str], ...] = (
+    ("ma_short", "단기 MA", "#22D3EE", "solid"),
+    ("ma_long", "장기 MA", "#F59E0B", "dash"),
+    ("buy_target", "매수기준", "#3B82F6", "dot"),
+    ("atr_upper_level", "ATR 상단", "#60A5FA", "dash"),
+    ("atr_lower_level", "ATR 하단", "#FB7185", "dash"),
+    ("lower_channel_line", "하방채널", "#EF4444", "solid"),
+)
+
 #: 판정값 입력란 공통 폭. 기존 76px 의 2/3.
 PARAM_INPUT_WIDTH = 50
 
@@ -204,6 +215,10 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
             self._diagnostic = pd.DataFrame()
             self._regions: List[Dict[str, Any]] = []
             self._log_scale = True
+            #: 보조선별 표시 여부. 차트 좌상단 범례를 눌러 바꿉니다.
+            self._series_visible: Dict[str, bool] = {
+                column: True for column, _l, _c, _s in OVERLAY_SERIES}
+            self._legend_hit: Dict[str, Any] = {}
             self._show_regime = True
             self._show_macd = True
             self._show_conditions = True
@@ -556,15 +571,14 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
                 painter.setPen(QtGui.QPen(QtGui.QColor("#DCE7F5"), 1.4))
                 painter.drawPath(path)
 
-            for column, color, style in (
-                ("ma_short", "#22D3EE", QtCore.Qt.PenStyle.SolidLine),
-                ("ma_long", "#F59E0B", QtCore.Qt.PenStyle.DashLine),
-                ("buy_target", "#3B82F6", QtCore.Qt.PenStyle.DotLine),
-                ("atr_upper_level", "#60A5FA", QtCore.Qt.PenStyle.DashLine),
-                ("atr_lower_level", "#FB7185", QtCore.Qt.PenStyle.DashLine),
-                ("lower_channel_line", "#EF4444", QtCore.Qt.PenStyle.SolidLine),
-            ):
-                if column not in diagnostic:
+            pen_styles = {
+                "solid": QtCore.Qt.PenStyle.SolidLine,
+                "dash": QtCore.Qt.PenStyle.DashLine,
+                "dot": QtCore.Qt.PenStyle.DotLine,
+            }
+            for column, _label, color, style_key in OVERLAY_SERIES:
+                style = pen_styles[style_key]
+                if column not in diagnostic or not self._series_visible.get(column, True):
                     continue
                 stride = max(1, int(np.ceil(len(diagnostic) / max(rect.width() * 2, 1))))
                 series = diagnostic[column].iloc[::stride]
@@ -580,6 +594,64 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
                 painter.setPen(QtGui.QPen(QtGui.QColor(color), 1.25, style))
                 painter.drawPath(path)
             painter.restore()
+
+        def _draw_legend(self, painter: Any, rect: Any) -> None:
+            """
+            좌상단 보조선 스위치.
+
+            범례와 토글을 겸합니다. 꺼진 선은 흐리게 보여 "그 선이 없는 것"과
+            "끈 것"을 구분할 수 있게 합니다.
+            """
+            painter.save()
+            metrics = painter.fontMetrics()
+            pad, gap, swatch = 7, 4, 15
+            rows = []
+            width = 0
+            for column, label, color, style_key in OVERLAY_SERIES:
+                text_w = metrics.horizontalAdvance(label)
+                rows.append((column, label, color, style_key, text_w))
+                width = max(width, swatch + 6 + text_w)
+            row_h = max(16, metrics.height() + 2)
+            box_w = width + pad * 2
+            box_h = row_h * len(rows) + pad * 2
+            left, top = rect.left() + 8, rect.top() + 26
+            box = QtCore.QRectF(left, top, box_w, box_h)
+            backdrop = QtGui.QColor("#0F1724")
+            backdrop.setAlpha(196)
+            painter.fillRect(box, backdrop)
+            painter.setPen(QtGui.QPen(QtGui.QColor("#273246"), 1))
+            painter.drawRect(box)
+
+            pen_styles = {
+                "solid": QtCore.Qt.PenStyle.SolidLine,
+                "dash": QtCore.Qt.PenStyle.DashLine,
+                "dot": QtCore.Qt.PenStyle.DotLine,
+            }
+            self._legend_hit = {}
+            for index, (column, label, color, style_key, _tw) in enumerate(rows):
+                y = top + pad + index * row_h
+                hit = QtCore.QRectF(left, y, box_w, row_h)
+                self._legend_hit[column] = hit
+                on = self._series_visible.get(column, True)
+                line = QtGui.QColor(color)
+                if not on:
+                    line.setAlpha(70)
+                painter.setPen(QtGui.QPen(line, 2, pen_styles[style_key]))
+                mid = y + row_h / 2
+                painter.drawLine(QtCore.QPointF(left + pad, mid),
+                                 QtCore.QPointF(left + pad + swatch, mid))
+                painter.setPen(QtGui.QColor("#DDE7F4" if on else "#5A6472"))
+                painter.drawText(
+                    QtCore.QRectF(left + pad + swatch + 6, y, box_w, row_h),
+                    int(QtCore.Qt.AlignmentFlag.AlignLeft
+                        | QtCore.Qt.AlignmentFlag.AlignVCenter), label)
+            painter.restore()
+
+        def _legend_column_at(self, point: Any) -> Optional[str]:
+            for column, rect in self._legend_hit.items():
+                if rect.contains(point):
+                    return column
+            return None
 
         def _draw_ribbons(self, painter: Any, rect: Any, diagnostic: pd.DataFrame) -> None:
             if not self._show_conditions or rect.height() <= 0 or diagnostic.empty:
@@ -702,6 +774,7 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
                 self.width(), self.height(), self._view_start, self._view_end,
                 self._log_scale, self._show_regime, self._show_macd,
                 self._show_conditions, id(self._data), id(self._diagnostic),
+                tuple(sorted(self._series_visible.items())),
             )
             if self._static_pixmap is None or cache_key != self._static_key:
                 pixmap = QtGui.QPixmap(self.size())
@@ -712,6 +785,7 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
                 self._draw_grid(base, price_rect, domain)
                 self._draw_price(base, price_rect, visible, diagnostic, domain)
                 self._draw_ribbons(base, ribbon_rect, analysis_diagnostic)
+                self._draw_legend(base, price_rect)
                 self._draw_macd(base, macd_rect, diagnostic)
                 if self._show_macd:
                     handle = self._macd_splitter_rect()
@@ -768,6 +842,17 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
         def mousePressEvent(self, event: Any) -> None:
             point = _event_pos(event)
             price_rect, _, _ = self._layout()
+            if event.button() == QtCore.Qt.MouseButton.LeftButton:
+                column = self._legend_column_at(point)
+                if column is not None:
+                    # 범례 클릭은 화면 이동으로 넘기지 않습니다.
+                    self._series_visible[column] = not self._series_visible.get(
+                        column, True)
+                    self._static_pixmap = None
+                    self._static_key = None
+                    self.update()
+                    event.accept()
+                    return
             if (event.button() == QtCore.Qt.MouseButton.LeftButton
                     and self._macd_splitter_rect().contains(point)):
                 self._splitter_dragging = True
