@@ -1961,8 +1961,16 @@ class TestPositionSizing:
         assert bot.target_position_values["BTC"] == pytest.approx(200_000.0)
         assert bot.btc_reserved_cash == pytest.approx(200_000.0)
         planned, explicit = bot.plan_order_budget("ETH")
-        assert planned == pytest.approx(800_000.0)
-        assert explicit == pytest.approx(800_000.0 / bot.exchange.ORDER_SAFETY_RATIO)
+        ratio = bot.exchange.ORDER_SAFETY_RATIO
+        # 넘기는 예산은 가용액을 넘지 않아야 합니다. 예전에는 여기서 ratio 로
+        # **나누고** buy_market 에서 다시 곱해, 마진이 상쇄되어 가용 원화
+        # 전액이 주문으로 나갔습니다. 빗썸은 수량으로 주문하므로 체결가에
+        # 수수료가 더 붙는데 남은 돈이 없어 "잔액이 부족합니다"(5600)로
+        # 거절됐고, 감시 루프가 그 주문을 1,600번 반복했습니다.
+        assert explicit == pytest.approx(800_000.0)
+        # 예상 투입액은 마진을 뺀 값 - 실제로 나갈 주문 금액과 같아야 합니다.
+        assert planned == pytest.approx(800_000.0 * ratio)
+        assert planned < explicit
 
     def test_btc_floor_never_reduces_larger_atr_target(self, tmp_path):
         bot = self._make_bot(tmp_path, position_sizing="atr", btc_min_weight=0.20)

@@ -2,7 +2,7 @@ import os
 import time
 import logging
 import threading
-from typing import Optional, Dict, Callable
+from typing import Any, Optional, Dict, Callable
 import requests
 from dotenv import load_dotenv
 
@@ -38,6 +38,8 @@ class TelegramNotifier:
         self.is_polling = False
         self.polling_thread: Optional[threading.Thread] = None
         self.command_handlers: Dict[str, Callable[[], str]] = {}
+        #: 최근 보낸 메시지 {문구: {"at": monotonic, "count": n}}. 도배 방지용.
+        self._recent: Dict[str, Dict[str, Any]] = {}
 
         # 토큰 유효성 기본 검증
         is_invalid_token = not self.bot_token or "your_telegram_bot_token" in self.bot_token
@@ -49,9 +51,23 @@ class TelegramNotifier:
         else:
             logger.info("텔레그램 알림 모듈 정상 등록 완료")
 
+    #: 같은 메시지를 이 시간 안에 다시 보내지 않습니다(초).
+    DEDUPE_WINDOW_SECONDS = 300
+    #: 이 횟수마다 "N번 반복" 요약을 한 번 보냅니다.
+    DEDUPE_SUMMARY_EVERY = 20
+
     def send_message(self, message: str) -> bool:
         """
-        텔레그램으로 메시지 발송
+        텔레그램으로 메시지 발송.
+
+        **같은 메시지가 쏟아지는 것을 막습니다.** 주문이 거절될 때마다 알림을
+        보내던 코드가 초당 한 번씩 도는 감시 루프에 걸려, 같은 문구를 1,600번
+        보낸 적이 있습니다. 화면이 그것으로만 채워지면 정작 중요한 알림을
+        놓칩니다.
+
+        같은 문구는 5분에 한 번만 나가고, 그 사이 몇 번 더 일어났는지는
+        20번마다 한 줄로 알려 줍니다. 아예 삼키면 문제가 계속되는 줄
+        모르게 되므로 완전히 막지는 않습니다.
 
         :param message: 발송할 텍스트 메시지
         :return: 성공 여부 (bool)
@@ -59,6 +75,23 @@ class TelegramNotifier:
         if not self.is_enabled:
             logger.debug(f"[알림 스킵 - 비활성화] 메시지: {message}")
             return False
+
+        import time as _time
+
+        now = _time.monotonic()
+        state = self._recent.get(message)
+        if state is not None and now - state["at"] < self.DEDUPE_WINDOW_SECONDS:
+            state["count"] += 1
+            if state["count"] % self.DEDUPE_SUMMARY_EVERY:
+                logger.debug("[알림 억제] 같은 메시지 %d회: %s",
+                             state["count"], message[:60])
+                return False
+            message = (f"{message}\n\n"
+                       f"⚠️ 같은 알림이 {state['count']}번 반복되었습니다.")
+        else:
+            self._recent = {k: v for k, v in self._recent.items()
+                            if now - v["at"] < self.DEDUPE_WINDOW_SECONDS}
+            self._recent[message] = {"at": now, "count": 1}
 
         url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
         payload = {

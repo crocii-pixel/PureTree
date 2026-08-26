@@ -289,6 +289,8 @@ class QuantBot:
         self.btc_broke_out: bool = False    # 당일 BTC 돌파 여부 (한 번 켜지면 유지)
         # 차단 사유를 종목당 하루 한 번만 남기기 위한 기록 (매초 로그 폭주 방지)
         self.blocked_logged: Dict[str, str] = {}
+        #: 종목별 주문 거절 기록 {ticker: {"count": n, "until": monotonic}}
+        self._buy_failures: Dict[str, Dict[str, Any]] = {}
         # 잔고 기준 대사로 발견한 외부 매수 (봇이 내지 않은 주문)
         self.external_positions: Dict[str, float] = {}
         # None = 미판정(필터 꺼짐 또는 데이터 부족), True = 상승 국면, False = 하락 국면
@@ -643,6 +645,48 @@ class QuantBot:
         self.btc_reserved_cash = max(0.0, min(room_value, available))
         return self.btc_reserved_cash
 
+    #: 주문이 거절될 때 다음 시도까지 기다리는 시간(초). 뒤로 갈수록 늘립니다.
+    BUY_BACKOFF_SECONDS = (30, 60, 180, 600)
+    #: 이 횟수를 넘기면 그 종목은 당일 매수를 접습니다.
+    BUY_FAILURE_LIMIT = 5
+
+    def note_buy_failure(self, ticker: str) -> None:
+        """
+        주문 거절을 기록하고 다음 시도를 미룹니다.
+
+        거절 사유가 잔액 부족이면 1초 뒤에 다시 내도 똑같이 거절됩니다.
+        그런데 예전에는 아무 표시도 안 남겨서, 감시 루프가 초당 한 번씩
+        같은 주문을 계속 냈습니다.
+        """
+        import time as _time
+
+        state = self._buy_failures.setdefault(
+            ticker, {"count": 0, "until": 0.0})
+        state["count"] += 1
+        index = min(state["count"] - 1, len(self.BUY_BACKOFF_SECONDS) - 1)
+        wait = self.BUY_BACKOFF_SECONDS[index]
+        state["until"] = _time.monotonic() + wait
+        if state["count"] >= self.BUY_FAILURE_LIMIT:
+            self.skipped_today[ticker] = True
+            logger.error(
+                f"[{ticker}] 주문 거절 {state['count']}회 - 당일 매수를 접습니다")
+            self.notifier.send_message(
+                f"⛔ <b>[{ticker} 당일 매수 중단]</b>\n"
+                f"주문이 {state['count']}회 거절되어 오늘은 더 시도하지 않습니다.\n"
+                "잔고와 최소 주문금액을 확인해 주세요.")
+        else:
+            logger.warning(
+                f"[{ticker}] 주문 거절 {state['count']}회 - {wait}초 뒤 재시도")
+
+    def clear_buy_failure(self, ticker: str) -> None:
+        self._buy_failures.pop(ticker, None)
+
+    def buy_backoff_active(self, ticker: str) -> bool:
+        import time as _time
+
+        state = self._buy_failures.get(ticker)
+        return bool(state and _time.monotonic() < state.get("until", 0.0))
+
     def plan_order_budget(self, ticker: str) -> Tuple[float, Optional[float]]:
         """
         설정된 사이징 방식으로 이번 주문의 예산을 계산합니다.
@@ -657,8 +701,14 @@ class QuantBot:
         available = self.exchange.get_balance("KRW", use_available=True)
         if ticker != "BTC":
             available = max(0.0, available - self.refresh_btc_reservation())
+        # 여기서 나누고 buy_market 에서 다시 곱하면 안전 마진이 상쇄되어
+        # **가용 원화 전액**이 주문으로 나갑니다. 빗썸은 수량으로 주문하므로
+        # (units = 예산 / 현재가) 체결가에 수수료가 더 붙는데, 남은 돈이 없어
+        # "잔액이 부족합니다"(5600)로 거절됩니다.
+        #
+        # 마진은 buy_market 한 곳에서만 겁니다.
         ratio = self.exchange.ORDER_SAFETY_RATIO
-        raw = min(room_value, available / ratio if ratio > 0 else 0.0)
+        raw = min(room_value, available)
         return raw * ratio, raw
 
     def resolve_schedule(self) -> Tuple[str, str, bool]:
@@ -2393,6 +2443,8 @@ class QuantBot:
 
                 # 당일 체결 횟수가 아니라 목표수량까지 남은 룸으로 판단합니다.
                 if current_price >= target_price and is_above_ma:
+                    if self.buy_backoff_active(ticker):
+                        continue
                     # 4) 알트는 BTC도 같은 세션에 돌파했어야 함 (폭등기에는 해제)
                     if self.needs_btc_confirm(ticker) and not self.btc_confirmed():
                         self.log_blocked(
@@ -2426,6 +2478,13 @@ class QuantBot:
                         buy_result = self.exchange.buy_market(
                             ticker, budget_krw=explicit_budget, order_code=order_code)
 
+                        if not buy_result:
+                            # 실패를 표시하지 않으면 1초 뒤 같은 주문을 그대로
+                            # 다시 냅니다. 실제로 잔액 부족 주문이 1,600번
+                            # 반복되며 알림을 도배했습니다.
+                            self.note_buy_failure(ticker)
+                            continue
+                        self.clear_buy_failure(ticker)
                         if buy_result:
                             units = float(buy_result.get("units", 0.0) or 0.0)
                             self.pending_buy_units[ticker] += units
