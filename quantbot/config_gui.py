@@ -232,6 +232,45 @@ def _card(QtWidgets, title: str):
     return frame, layout
 
 
+def _chart_settings_path():
+    import config_manager
+
+    return config_manager.DATA_DIR / "chart_settings.json"
+
+
+def _load_chart_settings() -> Dict[str, Any]:
+    """
+    마지막으로 쓰던 판정값.
+
+    실전 config.json 과는 별도입니다. 이건 연구용 초안이라, 차트에서 값을
+    만질 때마다 실전 설정이 흔들리면 안 됩니다.
+    """
+    try:
+        import json
+
+        loaded = json.loads(_chart_settings_path().read_text(encoding="utf-8"))
+        return loaded if isinstance(loaded, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_chart_settings(score: Dict[str, Any]) -> None:
+    try:
+        import json
+
+        path = _chart_settings_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # 봉 간격은 화면 선택이지 판정값이 아닙니다. 저장해 두면 다음에
+        # 1분봉을 열어 달라고 해도 지난번 일봉으로 뜹니다.
+        payload = {k: v for k, v in dict(score).items()
+                   if k != "decision_interval"}
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+    except Exception:
+        # 저장 실패가 백테스트를 막으면 안 됩니다. 다음 변경 때 다시 씁니다.
+        return
+
+
 def build_config_window(parent: Any = None) -> Any:
     """설정 창 위젯을 생성해 반환 (QApplication은 호출자가 준비)"""
     QtCore, QtGui, QtWidgets = _qt()
@@ -392,7 +431,16 @@ def build_config_window(parent: Any = None) -> Any:
             self._history_store = BacktestHistoryStore()
             self._config_view_dialog = None
             from regime_scoring import scoring_config
-            self._regime_draft = scoring_config(config_provider())
+            # 앱을 껐다 켜도 마지막에 쓰던 판정값으로 돌아오게 합니다.
+            # 차트가 아니라 여기서 들고 있는 이유는, 차트가 "받은 설정을 그대로
+            # 그린다"는 한 가지 일만 하게 두기 위해서입니다. 차트가 저장본을
+            # 스스로 덮으면, 이력에서 "차트 설정 적용"을 눌러도 옛 값이 뜹니다.
+            self._regime_draft = scoring_config({
+                "regime_scoring": {
+                    **(scoring_config(config_provider())),
+                    **_load_chart_settings(),
+                }
+            })
             self._chart_window = None
             self._chart_period_sync_timer = QtCore.QTimer(self)
             self._chart_period_sync_timer.setSingleShot(True)
@@ -523,6 +571,14 @@ def build_config_window(parent: Any = None) -> Any:
             history_label.setObjectName("Title")
             history_title.addWidget(history_label)
             history_title.addStretch(1)
+            # 줄마다 버튼을 두면 표가 산만하고, 결국 한 번에 하나만 씁니다.
+            # 선택한 줄의 판정 설정을 차트로 보내는 버튼 하나로 충분합니다.
+            self.apply_chart_button = QtWidgets.QPushButton("차트 설정 적용")
+            self.apply_chart_button.setToolTip(
+                "선택한 줄을 만든 판정 설정을 차트 패널에 넣습니다.\n"
+                "차트가 닫혀 있으면 열면서 넣습니다.")
+            self.apply_chart_button.clicked.connect(self._apply_selected_scoring)
+            history_title.addWidget(self.apply_chart_button)
             self.view_config_button = QtWidgets.QPushButton("백테스트 설정보기")
             self.view_config_button.clicked.connect(self._view_selected_config)
             history_title.addWidget(self.view_config_button)
@@ -532,14 +588,14 @@ def build_config_window(parent: Any = None) -> Any:
             history_title.addWidget(self.delete_results_button)
             outer.addLayout(history_title)
 
-            self.history_table = _HistoryTable(0, 9)
+            self.history_table = _HistoryTable(0, 8)
             self.history_table.setObjectName("BacktestTable")
             self.history_table.setHorizontalHeaderLabels([
-                "실행 구조", "테스트 기간", "설정 적용", "누적수익",
+                "실행 구조", "테스트 기간", "누적수익",
                 "CAGR", "MDD", "MAR", "승률", "매매",
             ])
             header_color_keys = (
-                "structure", "period", "variant", "total_return",
+                "structure", "period", "total_return",
                 "cagr", "mdd", "mar", "win_rate", "trades",
             )
             for column, color_key in enumerate(header_color_keys):
@@ -689,6 +745,7 @@ def build_config_window(parent: Any = None) -> Any:
 
         def _update_regime_draft(self, value: Dict[str, Any]) -> None:
             self._regime_draft = dict(value)
+            _save_chart_settings(value)
             if self._regime_changed:
                 self._regime_changed(dict(value))
             self.refresh_summary()
@@ -907,7 +964,6 @@ def build_config_window(parent: Any = None) -> Any:
                 values = [
                     (tree_label, colors["structure"]),
                     (f"{entry['start_date']} ~ {entry['end_date']}", colors["period"]),
-                    (entry["variant"], colors["variant"]),
                     (self._metric_text(result, "총수익률%"), colors["total_return"]),
                     (self._metric_text(result, "CAGR%"), colors["cagr"]),
                     (self._metric_text(result, "MDD%"), colors["mdd"]),
@@ -919,30 +975,29 @@ def build_config_window(parent: Any = None) -> Any:
                     item = QtWidgets.QTableWidgetItem(value)
                     item.setForeground(QtGui.QBrush(QtGui.QColor(color)))
                     item.setData(QtCore.Qt.ItemDataRole.UserRole, entry["id"])
-                    if col >= 3:
+                    if col >= 2:
                         item.setTextAlignment(int(QtCore.Qt.AlignmentFlag.AlignRight |
                                                   QtCore.Qt.AlignmentFlag.AlignVCenter))
                     self.history_table.setItem(row, col, item)
-                # "설정" 칸은 어느 줄이나 "현재 설정"이라 읽을 게 없었습니다.
-                # 그 자리에 그 줄의 설정을 차트로 불러오는 버튼을 둡니다.
-                self._install_apply_button(row, entry)
             if scroll_bottom and records:
                 self.history_table.scrollToBottom()
 
-        def _install_apply_button(self, row: int, entry: Dict[str, Any]) -> None:
-            """이력 한 줄의 판정 설정을 차트로 보내는 버튼."""
-            scoring = dict((entry.get("config") or {}).get("regime_scoring") or {})
-            if not scoring:
+        def _apply_selected_scoring(self) -> None:
+            """선택한 이력 줄의 판정 설정을 차트로 보냅니다."""
+            record_id = self._current_record_id()
+            if record_id is None:
+                self.backtest_result.setText(
+                    "<span style='color:#FFCC80'>이력에서 줄을 먼저 고르세요.</span>")
                 return
-            button = QtWidgets.QPushButton("설정 적용")
-            button.setObjectName("HistoryApply")
-            button.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-            button.setToolTip(
-                "이 줄을 만든 판정 설정을 차트 패널에 넣습니다.\n"
-                "차트가 닫혀 있으면 열면서 넣습니다.")
-            button.clicked.connect(
-                lambda _checked=False, values=scoring: self._apply_history_scoring(values))
-            self.history_table.setCellWidget(row, 2, button)
+            entry = self._history_store.get(record_id)
+            scoring = dict(((entry or {}).get("config") or {}).get(
+                "regime_scoring") or {})
+            if not scoring:
+                self.backtest_result.setText(
+                    "<span style='color:#FFCC80'>그 줄에는 저장된 판정 설정이 "
+                    "없습니다.</span>")
+                return
+            self._apply_history_scoring(scoring)
 
         def _apply_history_scoring(self, scoring: Dict[str, Any]) -> None:
             from regime_scoring import scoring_config
@@ -1317,7 +1372,7 @@ def build_config_window(parent: Any = None) -> Any:
             self.additional_selection = QtWidgets.QCheckBox("추가")
             self.additional_selection.setChecked(
                 bool(self.config.get("additional_selection_enabled", True)))
-            self.additional_auto = QtWidgets.QRadioButton("자동 6종")
+            self.additional_auto = QtWidgets.QRadioButton("자동")
             self.additional_manual = QtWidgets.QRadioButton("수동")
             mode = str(self.config.get("additional_selection_mode", "manual"))
             self.additional_auto.setChecked(mode == "auto")
@@ -1328,46 +1383,39 @@ def build_config_window(parent: Any = None) -> Any:
             additional_row.addStretch(1)
             form.addRow(QtWidgets.QLabel("추가 방식"), additional_row)
 
+            # 검증 결과 이긴 규칙은 하나입니다: 시총 상위 N 안에서 최근 수익률
+            # 높은 순으로 K 종. 그래서 화면도 두 칸이면 됩니다.
+            #   겹치지 않는 3구간 중 2구간 1위 · 전체 MAR 3.17 (대조군 2.95)
+            # 순위 밴드나 거래대금 모집단은 크기 효과를 재려고 만든 연구용
+            # 손잡이였고, 결론이 "크기는 도움이 안 된다"로 나서 화면에서 뺐습니다.
+            # 설정 키는 그대로라 연구 스크립트에서는 계속 쓸 수 있습니다.
             auto_row = QtWidgets.QHBoxLayout()
             auto_row.setSpacing(4)
+            self.auto_top_spin = QtWidgets.QSpinBox()
+            self.auto_top_spin.setRange(3, 200)
+            self.auto_top_spin.setValue(
+                int(self.config.get("auto_liquidity_top", 20)))
+            self.auto_top_spin.setToolTip(
+                "후보를 시총 몇 위까지 볼지. 넓힐수록 작은 종목이 들어옵니다.")
+            self.auto_count_spin = QtWidgets.QSpinBox()
+            self.auto_count_spin.setRange(1, 30)
+            self.auto_count_spin.setValue(
+                int(self.config.get("auto_selection_count", 8)))
+            self.auto_count_spin.setToolTip(
+                "그 안에서 최근 수익률 높은 순으로 몇 종을 담을지.")
             self.auto_rebalance_spin = QtWidgets.QSpinBox()
             self.auto_rebalance_spin.setRange(1, 90)
             self.auto_rebalance_spin.setSuffix("일")
             self.auto_rebalance_spin.setValue(
                 int(self.config.get("auto_rebalance_days", 7)))
-            self.auto_rebalance_spin.setToolTip(
-                "재선정 주기. 예전에는 월요일에 박혀 있어 7일 말고는 시험할 수 "
-                "없었습니다. 7 로 두면 예전과 같은 자리에 섭니다.")
-            self.auto_universe_combo = QtWidgets.QComboBox()
-            self.auto_universe_combo.addItem("거래대금 상위", "turnover")
-            self.auto_universe_combo.addItem("시총 상위", "marketcap")
-            universe = str(self.config.get("auto_universe_source", "turnover"))
-            self.auto_universe_combo.setCurrentIndex(
-                max(0, self.auto_universe_combo.findData(universe)))
-            self.auto_universe_combo.setToolTip(
-                "거래대금은 그날 터진 종목이 올라오고, 시총은 크기 자체를 "
-                "잽니다. 시총이어야 순위대를 나눠 볼 수 있습니다.")
-            self.auto_top_spin = QtWidgets.QSpinBox()
-            self.auto_top_spin.setRange(3, 200)
-            self.auto_top_spin.setValue(
-                int(self.config.get("auto_liquidity_top", 20)))
-            self.auto_band_edit = QtWidgets.QLineEdit(
-                str(self.config.get("auto_rank_band", "") or ""))
-            self.auto_band_edit.setPlaceholderText("1-6 · 8,10,12,14 · 15-")
-            self.auto_band_edit.setToolTip(
-                "모집단 순위 중 어느 구간을 쓸지.\n"
-                "  1-6           1~6위 6종\n"
-                "  8,10,12,14    그 네 자리만\n"
-                "  15-           15위부터 끝까지\n\n"
-                "비워 두면 상위 N종을 씁니다. 밴드를 쓰면 칸 수가 곧 종목 "
-                "수입니다.\n밴드마다 종목 수가 다르면 분산 효과가 섞이므로, "
-                "크기를 비교할 때는 1-6 / 7-12 / 13-18 처럼 개수를 맞추십시오.")
-            auto_row.addWidget(QtWidgets.QLabel("주기"))
-            auto_row.addWidget(self.auto_rebalance_spin)
-            auto_row.addWidget(self.auto_universe_combo)
+            self.auto_rebalance_spin.setToolTip("몇 일마다 다시 고를지.")
+            auto_row.addWidget(QtWidgets.QLabel("시총 상위"))
             auto_row.addWidget(self.auto_top_spin)
-            auto_row.addWidget(QtWidgets.QLabel("순위"))
-            auto_row.addWidget(self.auto_band_edit, 1)
+            auto_row.addWidget(QtWidgets.QLabel("중 수익순위"))
+            auto_row.addWidget(self.auto_count_spin)
+            auto_row.addWidget(QtWidgets.QLabel("종 · 주기"))
+            auto_row.addWidget(self.auto_rebalance_spin)
+            auto_row.addStretch(1)
             form.addRow(QtWidgets.QLabel("자동 선정"), auto_row)
 
             self.additional_tickers_edit = QtWidgets.QLineEdit(format_tickers(
@@ -1422,21 +1470,15 @@ def build_config_window(parent: Any = None) -> Any:
                 self.additional_tickers_edit.setEnabled(
                     enabled and self.additional_manual.isChecked())
                 auto_on = enabled and self.additional_auto.isChecked()
-                for widget in (self.auto_rebalance_spin, self.auto_universe_combo,
-                               self.auto_top_spin, self.auto_band_edit):
+                for widget in (self.auto_rebalance_spin, self.auto_top_spin,
+                               self.auto_count_spin):
                     widget.setEnabled(auto_on)
-                band = self.auto_band_edit.text().strip()
-                pool = ("시총" if self.auto_universe_combo.currentData() == "marketcap"
-                        else "최근 10일 평균 거래대금")
-                where = f"{int(self.auto_top_spin.value())}위 중 "
-                where += f"{band} 자리" if band else "상위"
                 selection_hint.setText(
-                    f"자동은 {pool} {where}에서 "
-                    f"{int(self.auto_return_days_value())}일 수익률이 0% 이상인 "
-                    f"종목을 많이 오른 순으로 "
-                    f"{int(self.auto_rebalance_spin.value())}일마다 재선정합니다."
-                    + ("" if self.auto_universe_combo.currentData() == "marketcap"
-                       else "  BTC·ETH 는 제외됩니다."))
+                    f"자동은 그 시점 시총 {int(self.auto_top_spin.value())}위 안에서 "
+                    f"최근 {int(self.auto_return_days_value())}일 수익률이 높은 순으로 "
+                    f"{int(self.auto_count_spin.value())}종을 "
+                    f"{int(self.auto_rebalance_spin.value())}일마다 다시 고릅니다.  "
+                    "고정 종목이 있으면 그만큼 자리를 차지합니다.")
                 period = self.investment_strategy_combo.currentData() == "period_rebalance"
                 for widget in (self.regime_short_ma_spin, self.regime_long_ma_spin,
                                self.regime_entry_days_spin, self.regime_exit_days_spin):
@@ -1449,8 +1491,7 @@ def build_config_window(parent: Any = None) -> Any:
 
             self.auto_rebalance_spin.valueChanged.connect(sync_selection)
             self.auto_top_spin.valueChanged.connect(sync_selection)
-            self.auto_universe_combo.currentIndexChanged.connect(sync_selection)
-            self.auto_band_edit.textChanged.connect(sync_selection)
+            self.auto_count_spin.valueChanged.connect(sync_selection)
             self.fixed_selection.toggled.connect(sync_selection)
             self.additional_selection.toggled.connect(sync_selection)
             self.additional_auto.toggled.connect(sync_selection)
@@ -1875,9 +1916,14 @@ def build_config_window(parent: Any = None) -> Any:
                 "additional_selection_mode": additional_mode,
                 "additional_tickers": manual,
                 "auto_rebalance_days": int(self.auto_rebalance_spin.value()),
-                "auto_universe_source": self.auto_universe_combo.currentData(),
                 "auto_liquidity_top": int(self.auto_top_spin.value()),
-                "auto_rank_band": self.auto_band_edit.text().strip(),
+                "auto_selection_count": int(self.auto_count_spin.value()),
+                # 화면에서 고르는 자동 선정은 시총 모집단만 씁니다.
+                "auto_universe_source": "marketcap",
+                # 문턱을 켜면 하락장에 칸이 비어 몇 종에 몰립니다. 3구간 검증
+                # 에서 두 구간을 뒤집었습니다(18,614% -> 10,683%).
+                "auto_require_positive_return": False,
+                "auto_rank_band": "",
                 "ma_window": int(self.ma_spin.value()),
                 "fixed_k": float(self.k_spin.value()),
                 "use_dynamic_k": bool(self.dynamic_k.isChecked()),
