@@ -1329,6 +1329,7 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
             entry_method = QtWidgets.QComboBox()
             entry_method.addItem("ATR 하단", "atr")
             entry_method.addItem("하방 채널선 돌파", "lower_channel")
+            entry_method.addItem("이전 아래꼬리 자리", "wick")
             self.inputs["defensive_entry_method"] = entry_method
             strategy_form.addRow("예약매수 방식", entry_method)
             carry = QtWidgets.QComboBox()

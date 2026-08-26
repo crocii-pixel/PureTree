@@ -651,3 +651,70 @@ def test_ma_mode_lets_the_ma_exit_take_the_probe_too():
     # 어느 모드든 구간이 끝나면 남은 예약분이 없어야 합니다.
     assert own["atr_probe_open_at_end"] == 0
     assert ma["atr_probe_open_at_end"] == 0
+
+
+def _wick_frame():
+    """되돌아온 아래꼬리가 섞인 프레임."""
+    frame = market_frame()
+    # 20봉마다 깊게 찔렀다가 되돌아오는 날을 만듭니다.
+    positions = list(range(20, len(frame), 20))
+    frame.iloc[positions, frame.columns.get_loc("low")] = (
+        frame["open"].iloc[positions] * 0.90)
+    frame["target"] = frame["open"] + frame["N"] * 20.0   # K 돌파 차단
+    frame["above_ma10"] = False
+    frame["above_ma3"] = False
+    frame["auto_selected"] = True
+    return frame
+
+
+def test_mine_is_never_placed_above_the_session_open():
+    """지뢰는 시가 아래에만 묻습니다.
+
+    과거 저점이 오늘 시가보다 위에 있으면 그건 급락 매수가 아니라 그냥 시장가
+    매수입니다. 선 기반 방식(하방 채널선·아래꼬리)에서 실제로 그렇게 돌아
+    9년 수익이 -94% 까지 내려갔습니다.
+    """
+    frame = _wick_frame()
+    # 뒤로 갈수록 값이 오르는 프레임이라, 과거 저점이 오늘 시가보다 낮습니다.
+    # 반대로 뒤집어 과거 저점이 위에 오게 만듭니다.
+    falling = frame.iloc[::-1].copy()
+    falling.index = frame.index
+    data = {"BTC": falling}
+    ctx = pd.DataFrame({"explosive": False, "bull": False,
+                        "regime_label": "하락"}, index=falling.index)
+
+    result = run_period_backtest(
+        _defensive_config(defensive_entry_method="lower_channel"), data, ctx)
+
+    for trade in result["_trades"]:
+        assert trade["reason"] != "atr_probe_immediate", trade
+    # 과거 저점이 계속 위에 있으므로 예약이 거의 걸리지 않아야 합니다.
+    assert result["atr_lower_buys"] < len(falling) / 4
+
+
+def test_wick_entry_method_is_selectable_and_differs_from_the_channel():
+    """아래꼬리 자리는 롤링 최저가와 다른 지점을 잡아야 합니다."""
+    data = {"BTC": _wick_frame()}
+    ctx = pd.DataFrame({"explosive": False, "bull": False,
+                        "regime_label": "하락"}, index=data["BTC"].index)
+
+    wick = run_period_backtest(
+        _defensive_config(defensive_entry_method="wick"), data, ctx)
+    channel = run_period_backtest(
+        _defensive_config(defensive_entry_method="lower_channel"), data, ctx)
+
+    assert wick["defensive_entry_method"] == "wick"
+    assert channel["defensive_entry_method"] == "lower_channel"
+    # 꼬리 자리만 고르므로 채널선보다 예약이 적습니다.
+    assert wick["atr_reservations_placed"] <= channel["atr_reservations_placed"]
+
+
+def test_wick_settings_are_clamped():
+    from regime_scoring import scoring_config
+
+    cfg = scoring_config({"regime_scoring": {
+        "defensive_entry_method": "wick", "wick_lookback": 1,
+        "wick_ratio_min": 5.0}})
+    assert cfg["defensive_entry_method"] == "wick"
+    assert cfg["wick_lookback"] == 2
+    assert cfg["wick_ratio_min"] == 0.95

@@ -78,7 +78,7 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
         ladder = [(defensive_multiple, 1.0)]
     defensive_entry_method = str(
         scoring.get("defensive_entry_method", "atr")).lower()
-    if defensive_entry_method not in {"atr", "lower_channel"}:
+    if defensive_entry_method not in {"atr", "lower_channel", "wick"}:
         defensive_entry_method = "atr"
     probe_fraction = float(np.clip(
         scoring.get("defensive_probe_fraction", 0.25), 0.01, 1.0))
@@ -133,7 +133,34 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
     previous_strategy = None
 
     reservation_channels: Dict[str, pd.Series] = {}
-    if defensive_entry_method == "lower_channel":
+    if defensive_entry_method == "wick":
+        # 아래꼬리 자리에 매설.
+        #
+        # 롤링 최저가(lower_channel)와 다릅니다. 최저가는 그냥 계속 흘러내린
+        # 날의 저가도 잡지만, 아래꼬리는 **찔렀다가 되돌아온** 자리입니다.
+        # 그 자리는 실제로 매수가 들어왔던 곳이라 다시 오면 받쳐 줄 확률이
+        # 높다는 것이 사용자의 경험칙입니다.
+        wick_window = max(2, int(scoring.get("wick_lookback", 20)))
+        wick_ratio_min = float(np.clip(
+            float(scoring.get("wick_ratio_min", 0.5) or 0.5), 0.05, 0.95))
+        for ticker, frame in data.items():
+            prefix = ("signal_" if use_reference
+                      and "signal_low" in frame.columns else "")
+            high = pd.to_numeric(frame.get(f"{prefix}high", frame["high"]),
+                                 errors="coerce")
+            low = pd.to_numeric(frame.get(f"{prefix}low", frame["low"]),
+                                errors="coerce")
+            open_ = pd.to_numeric(frame.get(f"{prefix}open", frame["open"]),
+                                  errors="coerce")
+            close = pd.to_numeric(frame["close"], errors="coerce")
+            span = (high - low).replace(0, np.nan)
+            body_low = pd.concat([open_, close], axis=1).min(axis=1)
+            wick = (body_low - low) / span
+            # 꼬리가 긴 날의 저가만 남기고, 완결된 봉만 봅니다.
+            candidate = low.where(wick >= wick_ratio_min)
+            reservation_channels[ticker] = candidate.shift(1).rolling(
+                wick_window, min_periods=1).min()
+    elif defensive_entry_method == "lower_channel":
         channel_window = max(2, int(scoring.get("breakout_lower_window", 10)))
         slope_bars = max(1, int(scoring.get("channel_slope_bars", 3)))
         for ticker, frame in data.items():
@@ -491,13 +518,18 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
                     for rung, (depth, weight) in enumerate(ladder):
                         if rung in done:
                             continue
-                        if defensive_entry_method == "lower_channel":
+                        if defensive_entry_method in {"lower_channel", "wick"}:
                             channel = reservation_channels.get(ticker)
                             lower_target = (float(channel.get(date, np.nan))
                                             if channel is not None else np.nan)
                         else:
                             lower_target = signal_open - depth * signal_atr
                         if not np.isfinite(lower_target) or lower_target <= 0:
+                            continue
+                        # 지뢰는 **시가 아래**에만 묻습니다. 과거 저점이 오늘
+                        # 시가보다 위에 있으면 그건 급락 매수가 아니라 그냥
+                        # 시장가 매수입니다(선 기반 방식에서 실제로 그랬습니다).
+                        if lower_target >= signal_open:
                             continue
                         lower_ratio = lower_target / signal_open
                         raw_entry = max(1e-12, float(r["open"]) * lower_ratio)
@@ -526,8 +558,8 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
                         locked_cash += budget
                         if ticker == "BTC":
                             btc_reserved = max(0.0, btc_reserved - budget)
-                        if defensive_entry_method == "lower_channel":
-                            break      # 채널선은 관문이 하나뿐입니다
+                        if defensive_entry_method in {"lower_channel", "wick"}:
+                            break      # 선 기반 방식은 관문이 하나뿐입니다
 
             if opening_equity > 0:
                 locked_cash_ratios.append(locked_cash / opening_equity)

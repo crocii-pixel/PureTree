@@ -41,6 +41,10 @@ DEFAULT_REGIME_SCORE_CONFIG: Dict[str, Any] = {
     "bear_strategy": "defensive_atr",
     "defensive_atr_multiple": 2.0,
     "defensive_entry_method": "atr",
+    # 아래꼬리 매설용. 최근 몇 봉을 볼지, 꼬리가 봉 전체의 몇 할 이상이어야
+    # '되돌아온 자리'로 볼지.
+    "wick_lookback": 20,
+    "wick_ratio_min": 0.5,
     # 예약 체결분(지뢰) 회수 방식.
     #   own   자기 익절·손절로만
     #   merge 포지션을 드는 전략으로 바뀌면 돌파분에 편입 (기본)
@@ -149,8 +153,12 @@ def scoring_config(config: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]
     # 필요합니다.
     result["defensive_atr_multiple"] = float(np.clip(
         float(result.get("defensive_atr_multiple", 2.0) or 2.0), 0.1, 20.0))
-    if result.get("defensive_entry_method") not in {"atr", "lower_channel"}:
+    if result.get("defensive_entry_method") not in {
+            "atr", "lower_channel", "wick"}:
         result["defensive_entry_method"] = "atr"
+    result["wick_lookback"] = max(2, int(result.get("wick_lookback", 20)))
+    result["wick_ratio_min"] = float(np.clip(
+        float(result.get("wick_ratio_min", 0.5) or 0.5), 0.05, 0.95))
     if result.get("defensive_carry_mode") not in {"own", "merge", "ma"}:
         result["defensive_carry_mode"] = "merge"
     result["defensive_probe_fraction"] = float(np.clip(
@@ -203,7 +211,7 @@ def validate_scoring_config(config: Optional[Mapping[str, Any]] = None,
     if str(merged.get("decision_interval", "")) not in DECISION_INTERVAL_IDS:
         errors.append("장세 판정 시간 간격을 선택해 주세요.")
     if str(merged.get("defensive_entry_method", "atr")) not in {
-            "atr", "lower_channel"}:
+            "atr", "lower_channel", "wick"}:
         errors.append("예약매수 방식을 선택해 주세요.")
     if str(merged.get("defensive_carry_mode", "merge")) not in {
             "own", "merge", "ma"}:
