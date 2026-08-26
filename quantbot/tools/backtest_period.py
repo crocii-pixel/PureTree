@@ -96,7 +96,17 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
         scoring.get("defensive_depth_max_atr", 0.0) or 0.0, 0.0, 20.0))
     if depth_band_max > 0 and depth_band_min > depth_band_max:
         depth_band_min, depth_band_max = depth_band_max, depth_band_min
-    use_reference = str(config.get("signal_reference", "binance")) == "binance"
+    # 종목 프레임은 업비트입니다. 신호 기준이 업비트면 그 프레임 자체가 신호라
+    # 참조를 덧붙이지 않고, 바이낸스면 signal_* 열이 붙습니다.
+    #
+    # 반드시 tools/backtest_config.py 와 **같은 방식으로** 풀어야 합니다.
+    # 예전에는 여기서만 날값을 그대로 비교해서, "bitstamp"/"global" 같은 옛
+    # 설정값이나 대문자가 섞인 값이면 backtest_config 는 signal_* 을 붙였는데
+    # 여기서는 안 쓴다고 판단했습니다. 컬럼 읽기가 전부 `in r.index` 로 막혀
+    # 있어 죽지는 않고, 대신 **조용히 체결 거래소 봉으로 판정**했습니다.
+    from reference_data import normalize_source
+    signal_reference = normalize_source(config.get("signal_reference"))
+    use_reference = signal_reference == "binance"
     btc_min_weight = float(np.clip(config.get("btc_min_weight", 0.0), 0.0, 1.0))
     sizing_cap = max(0.0, float(config.get("sizing_equity_cap_krw", 0.0)))
     auto_selection = bool(
@@ -689,6 +699,10 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
         "양의달_비율%": round(float((monthly > 0).mean()) * 100, 1) if len(monthly) else None,
         "차단_동반돌파": 0, "차단_BTC하락": 0,
         "fee_info": fee, "slippage_rate": slippage,
+        # 어떤 봉으로 판정했는지를 결과에 남깁니다. 이게 없어서 신호 기준이
+        # 조용히 무시되어도 아무도 몰랐습니다.
+        "signal_reference": signal_reference,
+        "signal_basis": "signal_columns" if use_reference else "execution_candles",
         "exit_timing": exit_timing,
         "selection_mode": "auto" if auto_selection else "fixed_manual",
         "exit_on_selection_drop": exit_on_selection_drop,
