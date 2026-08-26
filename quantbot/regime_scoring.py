@@ -43,8 +43,13 @@ DEFAULT_REGIME_SCORE_CONFIG: Dict[str, Any] = {
     "defensive_entry_method": "atr",
     # 아래꼬리 매설용. 최근 몇 봉을 볼지, 꼬리가 봉 전체의 몇 할 이상이어야
     # '되돌아온 자리'로 볼지.
+    # 선 기반 매설을 가둘 깊이 밴드(시가 대비 ATR). 0 이면 제한 없음.
+    "defensive_depth_min_atr": 0.0,
+    "defensive_depth_max_atr": 0.0,
     "wick_lookback": 20,
     "wick_ratio_min": 0.5,
+    # 꼬리 저점들의 기울기를 몇 봉으로 재서 이어 그릴지. 0 이면 이어 그리지 않음.
+    "wick_slope_bars": 0,
     # 예약 체결분(지뢰) 회수 방식.
     #   own   자기 익절·손절로만
     #   merge 포지션을 드는 전략으로 바뀌면 돌파분에 편입 (기본)
@@ -156,9 +161,14 @@ def scoring_config(config: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]
     if result.get("defensive_entry_method") not in {
             "atr", "lower_channel", "wick"}:
         result["defensive_entry_method"] = "atr"
+    result["defensive_depth_min_atr"] = float(np.clip(
+        float(result.get("defensive_depth_min_atr", 0.0) or 0.0), 0.0, 20.0))
+    result["defensive_depth_max_atr"] = float(np.clip(
+        float(result.get("defensive_depth_max_atr", 0.0) or 0.0), 0.0, 20.0))
     result["wick_lookback"] = max(2, int(result.get("wick_lookback", 20)))
     result["wick_ratio_min"] = float(np.clip(
         float(result.get("wick_ratio_min", 0.5) or 0.5), 0.05, 0.95))
+    result["wick_slope_bars"] = max(0, int(result.get("wick_slope_bars", 0)))
     if result.get("defensive_carry_mode") not in {"own", "merge", "ma"}:
         result["defensive_carry_mode"] = "merge"
     result["defensive_probe_fraction"] = float(np.clip(
@@ -392,25 +402,33 @@ def _project_lower_channel(raw_lower: pd.Series,
     changed = raw.ne(raw.shift(1)) & raw.notna() & raw.shift(1).notna()
     measured = measured.where(changed & measured.ne(0.0))
     continuing_slope = measured.ffill()
-    projected = pd.Series(np.nan, index=raw.index, dtype=float)
-    last_value = np.nan
-    last_slope = np.nan
-    previous_raw = np.nan
-    for stamp, value in raw.items():
-        if pd.isna(value):
-            continue
-        slope_value = continuing_slope.loc[stamp]
-        pivot = pd.isna(previous_raw) or not np.isclose(float(value), float(previous_raw))
-        if pivot or not np.isfinite(last_value):
-            last_value = float(value)
-        elif pd.notna(last_slope):
-            last_value = float(last_value) * float(np.exp(last_slope))
-        if pd.notna(slope_value):
-            last_slope = float(slope_value)
-        projected.loc[stamp] = last_value
-        previous_raw = float(value)
+
+    # 한 행씩 도는 대신 구간별로 한 번에 계산합니다. 값이 바뀐 자리가 새
+    # 지지점이고, 지지점 사이에서는 그 지지점에서 잰 각도 하나로 계속
+    # 이어지므로(측정 각도는 지지점에서만 갱신됩니다) 등비수열이 됩니다.
+    # 결과는 행 단위 루프와 같고, 종목 수와 봉 수가 늘어날수록 차이가 큽니다.
+    line = np.full(raw.shape[0], np.nan, dtype=float)
+    valid = raw.notna().to_numpy()
+    if valid.any():
+        values = raw.to_numpy(dtype=float)[valid]
+        slopes = continuing_slope.to_numpy(dtype=float)[valid]
+        pivot = np.empty(values.shape, dtype=bool)
+        pivot[0] = True
+        pivot[1:] = ~np.isclose(values[1:], values[:-1])
+        segment = np.cumsum(pivot) - 1
+        starts = np.flatnonzero(pivot)
+        # 각도가 아직 없는 초기 구간은 기울기 0, 즉 지지점 값 그대로입니다.
+        seg_slope = np.nan_to_num(slopes[starts], nan=0.0)[segment]
+        anchor = values[starts][segment]
+        steps = np.arange(values.size) - starts[segment]
+        projected_values = anchor * np.exp(seg_slope * steps)
+        # 각도가 극단적이면 투영이 발산할 수 있습니다. 그때는 지지점 값으로
+        # 되돌립니다(행 단위 루프도 같은 자리에서 값을 다시 잡았습니다).
+        projected_values = np.where(np.isfinite(projected_values),
+                                    projected_values, anchor)
+        line[valid] = projected_values
     return pd.DataFrame({
-        "lower_channel_line": projected,
+        "lower_channel_line": pd.Series(line, index=raw.index),
         "lower_channel_slope": continuing_slope,
     })
 

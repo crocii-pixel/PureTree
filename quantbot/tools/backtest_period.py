@@ -88,6 +88,14 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
         scoring.get("defensive_stop_atr_multiple", 2.0), 0.1, 20.0))
     cancel_buffer_atr = float(np.clip(
         scoring.get("defensive_cancel_buffer_atr", 0.25), 0.0, 10.0))
+    # 선 기반(채널선/아래꼬리) 매설을 몇 ATR 구간 안으로 가둘지. 0 이면 제한
+    # 없이 선이 가리키는 자리를 그대로 씁니다.
+    depth_band_min = float(np.clip(
+        scoring.get("defensive_depth_min_atr", 0.0) or 0.0, 0.0, 20.0))
+    depth_band_max = float(np.clip(
+        scoring.get("defensive_depth_max_atr", 0.0) or 0.0, 0.0, 20.0))
+    if depth_band_max > 0 and depth_band_min > depth_band_max:
+        depth_band_min, depth_band_max = depth_band_max, depth_band_min
     use_reference = str(config.get("signal_reference", "binance")) == "binance"
     btc_min_weight = float(np.clip(config.get("btc_min_weight", 0.0), 0.0, 1.0))
     sizing_cap = max(0.0, float(config.get("sizing_equity_cap_krw", 0.0)))
@@ -143,6 +151,8 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
         wick_window = max(2, int(scoring.get("wick_lookback", 20)))
         wick_ratio_min = float(np.clip(
             float(scoring.get("wick_ratio_min", 0.5) or 0.5), 0.05, 0.95))
+        # 0 이면 옛 저점을 그대로, 1 이상이면 그 각도로 이어 그립니다.
+        wick_slope_bars = max(0, int(scoring.get("wick_slope_bars", 0)))
         for ticker, frame in data.items():
             prefix = ("signal_" if use_reference
                       and "signal_low" in frame.columns else "")
@@ -158,8 +168,17 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
             wick = (body_low - low) / span
             # 꼬리가 긴 날의 저가만 남기고, 완결된 봉만 봅니다.
             candidate = low.where(wick >= wick_ratio_min)
-            reservation_channels[ticker] = candidate.shift(1).rolling(
+            raw_wick = candidate.shift(1).rolling(
                 wick_window, min_periods=1).min()
+            if wick_slope_bars > 0:
+                # 꼬리 저점들이 우상향/우하향하면 그 각도를 이어 붙입니다.
+                # 하방 채널선과 같은 투영이며, 고정된 옛 저점보다 지금 시세에
+                # 맞는 자리를 잡습니다. 투영이 시가 위로 올라가면 아래쪽의
+                # "시가 아래" 제한에서 걸러집니다.
+                reservation_channels[ticker] = _project_lower_channel(
+                    raw_wick, wick_slope_bars)["lower_channel_line"]
+            else:
+                reservation_channels[ticker] = raw_wick
     elif defensive_entry_method == "lower_channel":
         channel_window = max(2, int(scoring.get("breakout_lower_window", 10)))
         slope_bars = max(1, int(scoring.get("channel_slope_bars", 3)))
@@ -522,6 +541,18 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
                             channel = reservation_channels.get(ticker)
                             lower_target = (float(channel.get(date, np.nan))
                                             if channel is not None else np.nan)
+                            # 선이 그리는 깊이는 종목·시기마다 2 ATR 에서
+                            # 10 ATR 까지 흩어집니다. 밴드를 주면 그 선을
+                            # 참고하되 검증된 깊이 구간 안으로 당겨옵니다.
+                            if (np.isfinite(lower_target)
+                                    and (depth_band_min > 0 or depth_band_max > 0)
+                                    and np.isfinite(signal_atr) and signal_atr > 0):
+                                gap = (signal_open - lower_target) / signal_atr
+                                if depth_band_min > 0:
+                                    gap = max(gap, depth_band_min)
+                                if depth_band_max > 0:
+                                    gap = min(gap, depth_band_max)
+                                lower_target = signal_open - gap * signal_atr
                         else:
                             lower_target = signal_open - depth * signal_atr
                         if not np.isfinite(lower_target) or lower_target <= 0:
