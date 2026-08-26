@@ -451,3 +451,58 @@ def test_lower_channel_entry_method_places_different_reservations():
     assert atr_run["defensive_entry_method"] == "atr"
     assert channel_run["defensive_entry_method"] == "lower_channel"
     assert channel_run["atr_lower_buys"] != atr_run["atr_lower_buys"]
+
+
+def test_probe_exit_counters_account_for_every_fill():
+    """체결 = 익절 + 손절 + 강제청산 이어야 합니다.
+
+    화면에 "체결 8 · 익절 5 · 손절 0" 만 나오면 나머지 3건이 어디로 갔는지
+    알 수 없습니다. 장세 전환과 구간 종료로 정리된 건수를 따로 셉니다.
+    """
+    data = {"BTC": _defensive_frame(ma_ok=False)}
+    index = data["BTC"].index
+    # 중간에 장세가 바뀌어 강제 청산이 일어나도록 만듭니다.
+    labels = pd.Series("하락", index=index)
+    labels.iloc[len(index) // 2:] = "상승"
+    ctx = pd.DataFrame({"explosive": False, "bull": False,
+                        "regime_label": labels}, index=index)
+    config = _defensive_config()
+    config["regime_scoring"]["bull_strategy"] = "cash"
+    result = run_period_backtest(config, data, ctx)
+
+    filled = result["atr_lower_buys"]
+    assert filled > 0
+    accounted = (result["atr_probe_take_profit_exits"]
+                 + result["atr_probe_stop_exits"]
+                 + result["atr_probe_forced_exits"])
+    assert accounted == filled, (
+        f"체결 {filled} 중 {accounted} 만 설명됩니다")
+    # 구간이 끝난 뒤에는 예약분이 남아 있지 않아야 합니다.
+    assert result["atr_probe_open_at_end"] == 0
+
+
+def test_strategy_switch_is_reported_as_a_forced_probe_exit():
+    """장세가 바뀌면 예약분이 익절선에 닿기 전에 정리됩니다.
+
+    실전 백테스트에서 "체결 8 · 익절 5 · 손절 0" 이 나왔고 나머지 3건이
+    바로 이것이었습니다(장세 전환 시 +4.5~6.4% 에서 잘림). 설계상 의도이긴
+    하나 익절/손절과 섞이면 숫자가 안 맞아 보이므로 따로 셉니다.
+    """
+    data = {"BTC": _defensive_frame(ma_ok=False)}
+    index = data["BTC"].index
+    labels = pd.Series("하락", index=index)
+    labels.iloc[len(index) - 20:] = "상승"
+    ctx = pd.DataFrame({"explosive": False, "bull": False,
+                        "regime_label": labels}, index=index)
+    # 익절선을 최대(100%)로 올려 대부분의 예약분이 열린 채로 전환을 맞게 합니다.
+    config = _defensive_config(defensive_take_profit_pct=1.0)
+    config["regime_scoring"]["bull_strategy"] = "cash"
+    result = run_period_backtest(config, data, ctx)
+
+    switches = [t for t in result["_trades"] if t["reason"] == "strategy_switch"]
+    assert switches, "장세 전환 청산이 일어나지 않았습니다"
+    assert result["atr_probe_forced_exits"] >= 1
+    # 여기서도 합계는 맞아야 합니다.
+    assert (result["atr_probe_take_profit_exits"]
+            + result["atr_probe_stop_exits"]
+            + result["atr_probe_forced_exits"]) == result["atr_lower_buys"]

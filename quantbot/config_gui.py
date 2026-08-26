@@ -504,6 +504,12 @@ def build_config_window(parent: Any = None) -> Any:
             self.backtest_result.setWordWrap(True)
             self.backtest_result.setTextFormat(QtCore.Qt.TextFormat.RichText)
             self.backtest_result.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
+            # 결과 숫자를 다른 곳에 옮겨 적을 일이 많습니다. 드래그로 골라
+            # Ctrl+C 할 수 있게 합니다.
+            self.backtest_result.setTextInteractionFlags(
+                QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+                | QtCore.Qt.TextInteractionFlag.TextSelectableByKeyboard)
+            self.backtest_result.setCursor(QtCore.Qt.CursorShape.IBeamCursor)
             outer.addWidget(self.backtest_result)
 
             history_title = QtWidgets.QHBoxLayout()
@@ -801,6 +807,7 @@ def build_config_window(parent: Any = None) -> Any:
                     f"돌파접근 취소 {int(selected.get('atr_reservations_cancelled_near_breakout', 0))} · "
                     f"익절 {int(selected.get('atr_probe_take_profit_exits', 0))} · "
                     f"손절 {int(selected.get('atr_probe_stop_exits', 0))} · "
+                    f"강제청산 {int(selected.get('atr_probe_forced_exits', 0))} · "
                     f"평균 잠금 {float(selected.get('atr_locked_cash_average_pct', 0.0)):.2f}%"
                     "</span>"
                 )

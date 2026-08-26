@@ -1363,6 +1363,10 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
             self.summary = QtWidgets.QLabel("국면 계산 대기")
             self.summary.setWordWrap(True)
             self.summary.setObjectName("BacktestSummary")
+            self.summary.setTextInteractionFlags(
+                QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+                | QtCore.Qt.TextInteractionFlag.TextSelectableByKeyboard)
+            self.summary.setCursor(QtCore.Qt.CursorShape.IBeamCursor)
             self.panel_layout.addWidget(self.summary)
             self.panel_layout.addStretch(1)
 

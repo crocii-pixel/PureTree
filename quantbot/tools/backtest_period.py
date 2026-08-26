@@ -89,6 +89,10 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
     lower_buy_orders = 0
     reservation_placed = reservation_cancelled = reservation_expired = 0
     reservation_ambiguous = probe_take_profits = probe_stops = 0
+    # 예약 체결분이 **자기 익절·손절이 아닌 이유**로 정리된 건수.
+    # 장세 전환(strategy_switch)과 구간 종료(end)가 여기 들어갑니다.
+    # 이걸 안 세면 "체결 8, 익절 5, 손절 0" 처럼 숫자가 맞지 않아 보입니다.
+    probe_forced_exits = 0
     locked_cash_ratios = []
     previous_strategy = None
 
@@ -126,6 +130,7 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
 
     def sell(ticker, date, reason, close=False, fill_price=None,
              keep_probe=False):
+        nonlocal probe_forced_exits
         """
         보유분 청산.
 
@@ -151,6 +156,8 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
         else:
             pos = positions.pop(ticker)
             units, cost = float(pos["units"]), float(pos["cost"])
+            if probe_units > 0:
+                probe_forced_exits += 1
         r, exact = row_at_or_before(ticker, date)
         price_column = "close" if close or not exact else "open"
         raw_price = float(fill_price) if fill_price is not None else float(r[price_column])
@@ -557,6 +564,9 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
         "atr_same_bar_ambiguous": reservation_ambiguous,
         "atr_probe_take_profit_exits": probe_take_profits,
         "atr_probe_stop_exits": probe_stops,
+        "atr_probe_forced_exits": probe_forced_exits,
+        "atr_probe_open_at_end": sum(
+            1 for p in positions.values() if float(p.get("probe_units", 0.0)) > 0),
         "atr_locked_cash_average_pct": round(
             float(np.mean(locked_cash_ratios)) * 100, 2) if locked_cash_ratios else 0.0,
         "atr_locked_cash_max_pct": round(
