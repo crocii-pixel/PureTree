@@ -975,10 +975,55 @@ def build_config_window(parent: Any = None) -> Any:
             view_header.setSectionResizeMode(0, view_header.ResizeMode.ResizeToContents)
             view_header.setSectionResizeMode(1, view_header.ResizeMode.Stretch)
             layout.addWidget(self._config_view_table, 1)
+            buttons = QtWidgets.QHBoxLayout()
+            copy_button = QtWidgets.QPushButton("전체 복사")
+            copy_button.setToolTip(
+                "표 전체를 '항목<탭>값' 형태로 클립보드에 넣습니다. "
+                "표에서 직접 드래그해 고른 범위만 복사할 수도 있습니다.")
+            copy_button.clicked.connect(self._copy_config_view)
+            buttons.addWidget(copy_button)
+            buttons.addStretch(1)
             close_button = QtWidgets.QPushButton("닫기")
             close_button.clicked.connect(dialog.hide)
-            layout.addWidget(close_button)
+            buttons.addWidget(close_button)
+            layout.addLayout(buttons)
+            # 표에서 드래그로 고른 뒤 Ctrl+C 로도 복사되게 합니다.
+            self._config_view_table.setSelectionBehavior(
+                QtWidgets.QAbstractItemView.SelectionBehavior.SelectItems)
+            self._config_view_table.setSelectionMode(
+                QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+            self._config_view_table.installEventFilter(self)
             self._config_view_dialog = dialog
+
+        def eventFilter(self, source: Any, event: Any) -> bool:
+            """설정보기 표에서 Ctrl+C 를 가로채 선택 범위를 클립보드에 넣습니다."""
+            table = getattr(self, "_config_view_table", None)
+            if (source is table and table is not None
+                    and event.type() == QtCore.QEvent.Type.KeyPress
+                    and event.matches(QtGui.QKeySequence.StandardKey.Copy)):
+                self._copy_config_view(selected_only=True)
+                return True
+            return super().eventFilter(source, event)
+
+        def _copy_config_view(self, selected_only: bool = False) -> None:
+            table = getattr(self, "_config_view_table", None)
+            if table is None or table.rowCount() == 0:
+                return
+            rows = range(table.rowCount())
+            if selected_only:
+                picked = sorted({i.row() for i in table.selectedIndexes()})
+                if picked:
+                    rows = picked
+            lines = []
+            for row in rows:
+                key = table.item(row, 0)
+                value = table.item(row, 1)
+                lines.append(f"{key.text() if key else ''}\t"
+                             f"{value.text() if value else ''}")
+            text = "\n".join(lines)
+            QtWidgets.QApplication.clipboard().setText(text)
+            self.backtest_result.setText(
+                f"설정 {len(lines)}줄을 클립보드에 복사했습니다.")
 
         def _load_current_config_view(self) -> None:
             record_id = self._current_record_id()

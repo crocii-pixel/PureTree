@@ -113,6 +113,19 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
     # 장세 전환(strategy_switch)과 구간 종료(end)가 여기 들어갑니다.
     # 이걸 안 세면 "체결 8, 익절 5, 손절 0" 처럼 숫자가 맞지 않아 보입니다.
     probe_forced_exits = 0
+    #: 상승 전환 때 돌파분으로 넘어간 예약 체결분 건수
+    probe_merged_into_breakout = 0
+    # 예약 체결분(지뢰)을 어떻게 회수할 것인가.
+    #   "own"   자기 익절(+N%)·손절(N ATR)로만. 장세가 바뀌어도 그대로 유지.
+    #   "merge" 포지션을 드는 전략(상승 전환 등)으로 바뀌면 돌파분에 편입해
+    #           그때부터 MA 청산 규칙을 따름. 추세를 끝까지 탈 수 있음.
+    #   "ma"    처음부터 MA 청산 규칙만. 익절·손절선을 두지 않음.
+    carry_mode = str(scoring.get("defensive_carry_mode")
+                     or scoring.get("defensive_exit_mode") or "own").lower()
+    if carry_mode not in {"own", "merge", "ma"}:
+        carry_mode = "own"
+    #: MA 청산이 예약 체결분까지 함께 정리하는가
+    probe_follows_ma = carry_mode == "ma"
     #: 종목별로 이미 채워진 관문 번호. 포지션이 정리되면 비웁니다.
     filled_rungs: Dict[str, set] = {}
     rung_fills = [0] * len(ladder)
@@ -275,6 +288,9 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
         있어서, 장세가 현금 대기로 바뀌면 이미 깔린 지뢰가 회수되지 못한 채
         방치됐습니다.
         """
+        if probe_follows_ma:
+            # MA 청산에 맡기는 모드에서는 자기 익절·손절선을 두지 않습니다.
+            return
         for ticker in list(positions):
             if date not in data[ticker].index:
                 continue
@@ -321,7 +337,26 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
             for ticker in list(positions):
                 # 예약 체결분은 자기 익절·손절이 있으므로 전략이 바뀌어도
                 # 넘겨받아 이어 갑니다. 돌파분만 전환에 따라 정리합니다.
-                sell(ticker, date, "strategy_switch", keep_probe=True)
+                sell(ticker, date, "strategy_switch",
+                     keep_probe=not probe_follows_ma)
+            if carry_mode == "merge" and strategy in {
+                    "volatility_breakout", "defensive_atr"}:
+                # 상승 전환처럼 **새 전략도 포지션을 드는** 경우에는, 지뢰를
+                # 돌파분으로 넘겨 MA 청산 규칙에 맡깁니다. +10% 에서 끊지 않고
+                # 추세를 끝까지 탈 수 있습니다.
+                for ticker, pos in positions.items():
+                    probe = float(pos.get("probe_units", 0.0))
+                    if probe <= 0:
+                        continue
+                    pos["breakout_units"] = pos.get("breakout_units", 0.0) + probe
+                    pos["breakout_cost"] = (pos.get("breakout_cost", 0.0)
+                                            + float(pos.get("probe_cost", 0.0)))
+                    pos["probe_units"] = 0.0
+                    pos["probe_cost"] = 0.0
+                    pos["probe_entry"] = 0.0
+                    pos["probe_atr"] = 0.0
+                    filled_rungs.pop(ticker, None)
+                    probe_merged_into_breakout += 1
 
         # 전략이 무엇이든 이미 깔린 지뢰는 매일 자기 규칙으로 정산합니다.
         settled_today: set = set()
@@ -373,10 +408,11 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
                         fill, reason = stop * ratio, "ma_intraday"
                     if fill is not None:
                         sell(ticker, date, reason, fill_price=fill,
-                             keep_probe=True)
+                             keep_probe=not probe_follows_ma)
                         closed_today.add(ticker)
                 elif not bool(r[exit_col]):
-                    sell(ticker, date, "ma_daily", keep_probe=True)
+                    sell(ticker, date, "ma_daily",
+                         keep_probe=not probe_follows_ma)
                     closed_today.add(ticker)
 
 
@@ -617,6 +653,8 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
         "atr_probe_take_profit_exits": probe_take_profits,
         "atr_probe_stop_exits": probe_stops,
         "atr_probe_forced_exits": probe_forced_exits,
+        "atr_probe_merged_into_breakout": probe_merged_into_breakout,
+        "defensive_carry_mode": carry_mode,
         "atr_ladder": [[round(d, 2), round(w, 4)] for d, w in ladder],
         "atr_ladder_fills": list(rung_fills),
         "atr_probe_open_at_end": sum(

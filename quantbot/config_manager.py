@@ -143,6 +143,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "bear_strategy": "defensive_atr",
         "defensive_atr_multiple": 2.0,
         "defensive_entry_method": "atr",
+        "defensive_carry_mode": "merge",
         "defensive_probe_fraction": 0.25,
         "defensive_take_profit_pct": 0.05,
         "defensive_stop_atr_multiple": 2.0,

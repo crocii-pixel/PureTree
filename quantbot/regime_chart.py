@@ -1331,6 +1331,20 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
             entry_method.addItem("하방 채널선 돌파", "lower_channel")
             self.inputs["defensive_entry_method"] = entry_method
             strategy_form.addRow("예약매수 방식", entry_method)
+            carry = QtWidgets.QComboBox()
+            carry.addItem("상승전환 시 돌파분 편입", "merge")
+            carry.addItem("자기 익절·손절로만", "own")
+            carry.addItem("처음부터 MA 청산", "ma")
+            carry.setToolTip(
+                "이미 채워진 지뢰를 어떻게 회수할지 고릅니다.\n"
+                "\n"
+                "상승전환 시 편입  포지션을 드는 전략으로 바뀌면 돌파분에 넘겨\n"
+                "                MA 청산까지 끌고 갑니다. 9년 전 구간에서 +1.1%.\n"
+                "자기 익절·손절   장세와 무관하게 익절선·손절선만 봅니다.\n"
+                "처음부터 MA청산  익절·손절선을 두지 않습니다. 최근 5년은 지고\n"
+                "                9년 전체에서만 앞서 불안정합니다.")
+            self.inputs["defensive_carry_mode"] = carry
+            strategy_form.addRow("예약분 회수", carry)
             probe = QtWidgets.QDoubleSpinBox()
             probe.setRange(5.0, 100.0)
             probe.setSuffix(" %")

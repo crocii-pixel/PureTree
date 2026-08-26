@@ -41,6 +41,11 @@ DEFAULT_REGIME_SCORE_CONFIG: Dict[str, Any] = {
     "bear_strategy": "defensive_atr",
     "defensive_atr_multiple": 2.0,
     "defensive_entry_method": "atr",
+    # 예약 체결분(지뢰) 회수 방식.
+    #   own   자기 익절·손절로만
+    #   merge 포지션을 드는 전략으로 바뀌면 돌파분에 편입 (기본)
+    #   ma    처음부터 MA 청산 규칙만
+    "defensive_carry_mode": "merge",
     "defensive_probe_fraction": 0.25,
     # ATR lower orders are rebuilt from the latest completed candle every day.
     # Filled probe units are managed separately from core/breakout holdings.
@@ -146,6 +151,8 @@ def scoring_config(config: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]
         float(result.get("defensive_atr_multiple", 2.0) or 2.0), 0.1, 20.0))
     if result.get("defensive_entry_method") not in {"atr", "lower_channel"}:
         result["defensive_entry_method"] = "atr"
+    if result.get("defensive_carry_mode") not in {"own", "merge", "ma"}:
+        result["defensive_carry_mode"] = "merge"
     result["defensive_probe_fraction"] = float(np.clip(
         float(result.get("defensive_probe_fraction", 0.25) or 0.25), 0.01, 1.0))
     result["defensive_take_profit_pct"] = float(np.clip(
@@ -198,6 +205,9 @@ def validate_scoring_config(config: Optional[Mapping[str, Any]] = None,
     if str(merged.get("defensive_entry_method", "atr")) not in {
             "atr", "lower_channel"}:
         errors.append("예약매수 방식을 선택해 주세요.")
+    if str(merged.get("defensive_carry_mode", "merge")) not in {
+            "own", "merge", "ma"}:
+        errors.append("예약분 회수 방식을 선택해 주세요.")
     for phase, label in (("bull", "상승기"), ("stable", "안정기"),
                          ("bear", "하락기")):
         if str(merged.get(f"{phase}_strategy", "")) not in STRATEGY_IDS:

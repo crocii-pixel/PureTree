@@ -588,3 +588,66 @@ def test_atr_depth_accepts_free_values_not_just_2_4_6_8():
     # 범위를 벗어나면 잘립니다.
     assert scoring_config({"regime_scoring": {"defensive_atr_multiple": 100}}
                           )["defensive_atr_multiple"] == 20.0
+
+
+def _switching_ctx(index, bull_from):
+    labels = pd.Series("하락", index=index)
+    labels.iloc[bull_from:] = "상승"
+    return pd.DataFrame({"explosive": False, "bull": False,
+                         "regime_label": labels}, index=index)
+
+
+def test_three_probe_exit_modes_behave_differently():
+    """예약분 회수 방식 세 가지가 실제로 다르게 동작해야 합니다."""
+    data = {"BTC": _defensive_frame(ma_ok=False)}
+    index = data["BTC"].index
+    ctx = _switching_ctx(index, len(index) // 3)
+
+    results = {}
+    for mode in ("own", "merge", "ma"):
+        # 익절선을 최대로 올려 전환 시점에 지뢰가 열린 채로 남게 합니다.
+        config = _defensive_config(defensive_carry_mode=mode,
+                                   defensive_take_profit_pct=1.0)
+        config["regime_scoring"]["bull_strategy"] = "volatility_breakout"
+        results[mode] = run_period_backtest(config, data, ctx)
+
+    for mode, result in results.items():
+        assert result["defensive_carry_mode"] == mode
+        assert result["atr_lower_buys"] > 0
+
+    # ma 는 익절·손절선을 두지 않습니다.
+    assert results["ma"]["atr_probe_take_profit_exits"] == 0
+    assert results["ma"]["atr_probe_stop_exits"] == 0
+    # merge 는 상승 전환 때 돌파분으로 넘깁니다.
+    assert results["merge"]["atr_probe_merged_into_breakout"] > 0
+    assert results["own"]["atr_probe_merged_into_breakout"] == 0
+
+
+def test_carry_mode_defaults_to_merge_and_rejects_typos():
+    from regime_scoring import scoring_config
+
+    assert scoring_config({})["defensive_carry_mode"] == "merge"
+    for value in ("own", "merge", "ma"):
+        assert scoring_config({"regime_scoring": {"defensive_carry_mode": value}}
+                              )["defensive_carry_mode"] == value
+    for bad in ("nonsense", "", None, 5):
+        assert scoring_config({"regime_scoring": {"defensive_carry_mode": bad}}
+                              )["defensive_carry_mode"] == "merge"
+
+
+def test_ma_mode_lets_the_ma_exit_take_the_probe_too():
+    """MA 청산 모드에서는 MA 이탈이 예약분까지 함께 정리합니다."""
+    data = {"BTC": _defensive_frame(ma_ok=False)}
+    ctx = pd.DataFrame({"explosive": False, "bull": False,
+                        "regime_label": "하락"}, index=data["BTC"].index)
+
+    own = run_period_backtest(_defensive_config(defensive_carry_mode="own"),
+                              data, ctx)
+    ma = run_period_backtest(_defensive_config(defensive_carry_mode="ma"),
+                             data, ctx)
+
+    assert own["atr_probe_take_profit_exits"] > 0
+    assert ma["atr_probe_take_profit_exits"] == 0
+    # 어느 모드든 구간이 끝나면 남은 예약분이 없어야 합니다.
+    assert own["atr_probe_open_at_end"] == 0
+    assert ma["atr_probe_open_at_end"] == 0
