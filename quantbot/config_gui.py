@@ -335,8 +335,9 @@ def build_config_window(parent: Any = None, live_apply: Any = None) -> Any:
                     start = pd.Timestamp(self.start) if self.start else None
                 end = pd.Timestamp(self.end) if self.end else None
                 split_enabled = bool(self.split_options.get("enabled"))
-                include_full = (not split_enabled
-                                or bool(self.split_options.get("include_full")))
+                # 전체 결과는 늘 냅니다. 이력 트리의 부모가 이 값이고,
+                # 구간들을 견줄 기준선이기도 합니다.
+                include_full = True
                 full_result = {}
                 if include_full:
                     full_result = run_backtest(
@@ -409,7 +410,14 @@ def build_config_window(parent: Any = None, live_apply: Any = None) -> Any:
                 return True
             return False
 
-    class _HistoryTable(QtWidgets.QTableWidget):
+    class _HistoryTable(QtWidgets.QTreeWidget):
+        """
+        결과 이력. 실행 하나가 부모, 구간별 결과가 자식입니다.
+
+        예전에는 표에 ``├─`` 같은 글자로 트리를 흉내 냈습니다. 접을 수 없어서
+        18구간짜리 검증을 한 번 돌리면 목록이 19줄 늘어났고, 그 다음 실행을
+        보려면 계속 스크롤해야 했습니다.
+        """
         deletePressed = QtCore.pyqtSignal()
 
         def keyPressEvent(self, event: Any) -> None:
@@ -516,11 +524,9 @@ def build_config_window(parent: Any = None, live_apply: Any = None) -> Any:
             self.segment_count.setRange(0, 1000)
             self.segment_count.setValue(5)
             split_row.addWidget(self.segment_count)
-            self.include_full_result = QtWidgets.QCheckBox("전체 기간 포함")
-            self.include_full_result.setChecked(False)
-            self.include_full_result.setToolTip(
-                "구간 결과와 함께 현재 선택 기간 전체의 결과도 부모 행으로 계산·저장합니다.")
-            split_row.addWidget(self.include_full_result)
+            # "전체 기간 포함"을 없앴습니다. 이력이 트리가 되면서 **부모 줄이
+            # 곧 전체 결과**가 되었기 때문입니다. 끄면 부모 자리에 첫 구간이
+            # 올라와 계층이 깨지고, 구간끼리 견줄 기준선도 사라집니다.
             split_row.addStretch(1)
             period_layout.addLayout(split_row)
             split_hint = QtWidgets.QLabel(
@@ -611,9 +617,10 @@ def build_config_window(parent: Any = None, live_apply: Any = None) -> Any:
             history_title.addWidget(self.delete_results_button)
             outer.addLayout(history_title)
 
-            self.history_table = _HistoryTable(0, 8)
+            self.history_table = _HistoryTable()
             self.history_table.setObjectName("BacktestTable")
-            self.history_table.setHorizontalHeaderLabels([
+            self.history_table.setColumnCount(8)
+            self.history_table.setHeaderLabels([
                 "실행 구조", "테스트 기간", "누적수익",
                 "CAGR", "MDD", "MAR", "승률", "매매",
             ])
@@ -621,10 +628,14 @@ def build_config_window(parent: Any = None, live_apply: Any = None) -> Any:
                 "structure", "period", "total_return",
                 "cagr", "mdd", "mar", "win_rate", "trades",
             )
+            header_item = self.history_table.headerItem()
             for column, color_key in enumerate(header_color_keys):
-                self.history_table.horizontalHeaderItem(column).setForeground(
+                header_item.setForeground(
+                    column,
                     QtGui.QBrush(QtGui.QColor(BACKTEST_RESULT_COLORS[color_key])))
-            self.history_table.verticalHeader().setVisible(False)
+            self.history_table.setRootIsDecorated(True)
+            self.history_table.setUniformRowHeights(True)
+            self.history_table.setExpandsOnDoubleClick(True)
             self.history_table.setAlternatingRowColors(True)
             self.history_table.setEditTriggers(
                 QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -632,12 +643,13 @@ def build_config_window(parent: Any = None, live_apply: Any = None) -> Any:
                 QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
             self.history_table.setSelectionMode(
                 QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
-            self.history_table.cellClicked.connect(self._on_history_clicked)
+            self.history_table.itemClicked.connect(
+                lambda _item, _col: self._on_history_clicked(0, 0))
             self.history_table.deletePressed.connect(self._delete_selected_results)
-            header = self.history_table.horizontalHeader()
+            header = self.history_table.header()
             header.setSectionResizeMode(header.ResizeMode.ResizeToContents)
             header.setSectionResizeMode(1, header.ResizeMode.Stretch)
-            self.history_table.verticalHeader().setDefaultSectionSize(36)
+
             outer.addWidget(self.history_table, 1)
             self._update_split_controls()
             self._reload_history()
@@ -800,8 +812,7 @@ def build_config_window(parent: Any = None, live_apply: Any = None) -> Any:
         def _update_split_controls(self, _value: Any = None) -> None:
             enabled = self.split_enabled.isChecked()
             random_mode = self.segment_mode.currentData() == "random"
-            for widget in (self.segment_days, self.segment_mode,
-                           self.include_full_result):
+            for widget in (self.segment_days, self.segment_mode):
                 widget.setEnabled(enabled)
             self.segment_count.setEnabled(enabled and random_mode)
             self._recalculate_segment_count()
@@ -826,7 +837,6 @@ def build_config_window(parent: Any = None, live_apply: Any = None) -> Any:
                 "mode": str(self.segment_mode.currentData()),
                 "count": int(self.segment_count.value()),
                 "auto_count": self.segment_mode.currentData() == "continuous",
-                "include_full": self.include_full_result.isChecked(),
             }
 
         def _run_backtest(self) -> None:
@@ -950,43 +960,55 @@ def build_config_window(parent: Any = None, live_apply: Any = None) -> Any:
                 ))
             try:
                 self._history_store.add_many(records)
-                self._reload_history(scroll_bottom=True)
+                # 방금 돌린 결과를 골라 둡니다. 목록 어딘가에 조용히 추가되면
+                # 어느 줄이 새 것인지 찾아야 합니다. 구간 검증이면 부모(전체)를
+                # 고르고 아래를 펼쳐 둡니다.
+                stored = self._history_store.list()
+                newest = stored[-1]["id"] if stored else None
+                if records and stored:
+                    group_id = records[0]["group_id"]
+                    same = [r["id"] for r in stored if r["group_id"] == group_id]
+                    if same:
+                        newest = same[0]
+                self._reload_history(scroll_bottom=True, select_id=newest)
             except Exception as exc:
                 self.backtest_result.setText(
                     html + f"<br><span style='color:#FF8A80'>이력 저장 실패: {exc}</span>")
 
-        def _reload_history(self, scroll_bottom: bool = False) -> None:
+        def _reload_history(self, scroll_bottom: bool = False,
+                            select_id: Optional[int] = None) -> None:
+            """
+            이력을 다시 그립니다.
+
+            실행 하나가 부모, 구간별 결과가 자식입니다. 18구간짜리 검증도
+            접어 두면 한 줄이라, 여러 실행을 나란히 견줄 수 있습니다.
+
+            ``select_id`` 를 주면 그 줄을 골라 두고 화면에 보이게 합니다.
+            방금 돌린 결과가 목록 어딘가에 조용히 추가되면 찾아야 합니다.
+            """
             records = self._history_store.list()
-            self.history_table.setRowCount(len(records))
-            group_numbers: Dict[str, int] = {}
-            group_sizes: Dict[str, int] = {}
-            group_positions: Dict[str, int] = {}
+            tree = self.history_table
+            expanded = {
+                tree.topLevelItem(i).data(0, QtCore.Qt.ItemDataRole.UserRole + 1)
+                for i in range(tree.topLevelItemCount())
+                if tree.topLevelItem(i).isExpanded()
+            }
+            tree.clear()
+            colors = BACKTEST_RESULT_COLORS
+
+            groups: Dict[str, list] = {}
+            order: list = []
             for entry in records:
                 group_id = entry["group_id"]
-                if group_id not in group_numbers:
-                    group_numbers[group_id] = len(group_numbers) + 1
-                group_sizes[group_id] = group_sizes.get(group_id, 0) + 1
-            colors = BACKTEST_RESULT_COLORS
-            for row, entry in enumerate(records):
+                if group_id not in groups:
+                    groups[group_id] = []
+                    order.append(group_id)
+                groups[group_id].append(entry)
+
+            def fill(item, entry, label: str) -> None:
                 result = entry["result"]
-                group_id = entry["group_id"]
-                position = group_positions.get(group_id, 0)
-                group_positions[group_id] = position + 1
-                group_size = group_sizes[group_id]
-                group_number = group_numbers[group_id]
-                segment_index = int(entry["segment_index"])
-                if position == 0:
-                    detail = ("전체" if segment_index == 0 else
-                              f"구간 {segment_index}/{entry['segment_count']}")
-                    tree_label = (f"실행 {group_number}" if group_size == 1 else
-                                  f"▼ 실행 {group_number} · {detail}")
-                else:
-                    branch = "└─" if position == group_size - 1 else "├─"
-                    detail = ("전체" if segment_index == 0 else
-                              f"구간 {segment_index}/{entry['segment_count']}")
-                    tree_label = f"  {branch} {detail}"
                 values = [
-                    (tree_label, colors["structure"]),
+                    (label, colors["structure"]),
                     (f"{entry['start_date']} ~ {entry['end_date']}", colors["period"]),
                     (self._metric_text(result, "총수익률%"), colors["total_return"]),
                     (self._metric_text(result, "CAGR%"), colors["cagr"]),
@@ -995,16 +1017,48 @@ def build_config_window(parent: Any = None, live_apply: Any = None) -> Any:
                     (self._metric_text(result, "승률%"), colors["win_rate"]),
                     (f"{int(result.get('매매', 0)):,}", colors["trades"]),
                 ]
-                for col, (value, color) in enumerate(values):
-                    item = QtWidgets.QTableWidgetItem(value)
-                    item.setForeground(QtGui.QBrush(QtGui.QColor(color)))
-                    item.setData(QtCore.Qt.ItemDataRole.UserRole, entry["id"])
-                    if col >= 2:
-                        item.setTextAlignment(int(QtCore.Qt.AlignmentFlag.AlignRight |
-                                                  QtCore.Qt.AlignmentFlag.AlignVCenter))
-                    self.history_table.setItem(row, col, item)
-            if scroll_bottom and records:
-                self.history_table.scrollToBottom()
+                for column, (text, color) in enumerate(values):
+                    item.setText(column, text)
+                    item.setForeground(column, QtGui.QBrush(QtGui.QColor(color)))
+                    if column >= 2:
+                        item.setTextAlignment(
+                            column, int(QtCore.Qt.AlignmentFlag.AlignRight
+                                        | QtCore.Qt.AlignmentFlag.AlignVCenter))
+                item.setData(0, QtCore.Qt.ItemDataRole.UserRole, entry["id"])
+
+            selected_item = None
+            for number, group_id in enumerate(order, 1):
+                entries = groups[group_id]
+                head = entries[0]
+                segments = entries[1:]
+                label = f"실행 {number}"
+                if segments:
+                    label += f" · 구간 {len(segments)}개"
+                parent = QtWidgets.QTreeWidgetItem(tree)
+                fill(parent, head, label)
+                parent.setData(0, QtCore.Qt.ItemDataRole.UserRole + 1, group_id)
+                if head["id"] == select_id:
+                    selected_item = parent
+                for entry in segments:
+                    child = QtWidgets.QTreeWidgetItem(parent)
+                    index = int(entry["segment_index"])
+                    fill(child, entry,
+                         f"구간 {index}/{entry['segment_count']}")
+                    if entry["id"] == select_id:
+                        selected_item = child
+                # 접힘 상태는 다시 그려도 유지합니다. 펼쳐 보던 것이 매번
+                # 닫히면 결과를 비교하다 자리를 잃습니다.
+                parent.setExpanded(group_id in expanded)
+
+            if selected_item is not None:
+                tree.setCurrentItem(selected_item)
+                if selected_item.parent() is not None:
+                    selected_item.parent().setExpanded(True)
+                tree.scrollToItem(
+                    selected_item,
+                    QtWidgets.QAbstractItemView.ScrollHint.PositionAtCenter)
+            elif scroll_bottom and tree.topLevelItemCount():
+                tree.scrollToItem(tree.topLevelItem(tree.topLevelItemCount() - 1))
 
         def _reload_presets(self, keep: str = "") -> None:
             import strategy_presets
@@ -1113,11 +1167,11 @@ def build_config_window(parent: Any = None, live_apply: Any = None) -> Any:
             return "—" if value is None else f"{float(value):,.2f}{suffix}"
 
         def _current_record_id(self) -> Optional[int]:
-            row = self.history_table.currentRow()
-            if row < 0:
+            item = self.history_table.currentItem()
+            if item is None:
                 return None
-            item = self.history_table.item(row, 0)
-            return int(item.data(QtCore.Qt.ItemDataRole.UserRole)) if item else None
+            value = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
+            return int(value) if value is not None else None
 
         def _on_history_clicked(self, _row: int, _column: int) -> None:
             # 평소에는 행 선택만 합니다. 설정보기 창이 이미 떠 있을 때만
@@ -1240,10 +1294,18 @@ def build_config_window(parent: Any = None, live_apply: Any = None) -> Any:
 
         def _delete_selected_results(self) -> None:
             ids = set()
-            for index in self.history_table.selectionModel().selectedRows():
-                item = self.history_table.item(index.row(), 0)
-                if item:
-                    ids.add(int(item.data(QtCore.Qt.ItemDataRole.UserRole)))
+            for item in self.history_table.selectedItems():
+                # 트리에서는 한 줄을 고르면 열마다 항목이 잡히므로 0열만 봅니다.
+                value = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
+                if value is not None:
+                    ids.add(int(value))
+                # 부모를 지우면 그 아래 구간도 같이 지웁니다. 실행 하나를
+                # 버리는데 구간만 남으면 고아가 됩니다.
+                for index in range(item.childCount()):
+                    child = item.child(index).data(
+                        0, QtCore.Qt.ItemDataRole.UserRole)
+                    if child is not None:
+                        ids.add(int(child))
             if not ids:
                 self.backtest_result.setText(
                     "삭제할 결과를 클릭하거나 Ctrl/Shift로 여러 행을 선택하세요.")

@@ -495,11 +495,15 @@ class _FakeHistoryStore:
         return before - len(self._records)
 
 
-def test_result_history_drops_the_checkbox_column_and_deletes_with_del(monkeypatch):
-    """체크박스 대신 행 선택 + Del 로 지웁니다.
+def test_result_history_is_a_tree_and_deletes_with_del(monkeypatch):
+    """
+    이력은 트리입니다. 실행 하나가 부모, 구간별 결과가 자식입니다.
 
-    체크박스를 없애면 컬럼 인덱스가 한 칸씩 당겨집니다. 삭제 대상 id를 읽는
-    컬럼이 어긋나면 Del 이 조용히 아무것도 지우지 않으므로 여기서 고정합니다.
+    예전에는 표에 ``├─`` 같은 글자로 트리를 흉내 냈습니다. 접을 수 없어서
+    18구간짜리 검증을 한 번 돌리면 목록이 19줄 늘어났고, 다음 실행을 보려면
+    계속 스크롤해야 했습니다.
+
+    삭제 대상 id 는 0열이 들고 있어야 Del 이 동작합니다.
     """
     try:
         from PyQt6 import QtCore, QtGui, QtWidgets
@@ -520,11 +524,14 @@ def test_result_history_drops_the_checkbox_column_and_deletes_with_del(monkeypat
     window._open_backtest()
     backtest = window._backtest_window
 
-    headers = [backtest.history_table.horizontalHeaderItem(col).text()
+    header_item = backtest.history_table.headerItem()
+    headers = [header_item.text(col)
                for col in range(backtest.history_table.columnCount())]
     assert headers[0] == "실행 구조"
     assert "선택" not in headers
     assert not hasattr(backtest, "select_all_results_button")
+    # 전체 기간 포함 옵션은 없앴습니다 - 부모 줄이 곧 전체 결과입니다.
+    assert not hasattr(backtest, "include_full_result")
 
     store = _FakeHistoryStore([
         {"id": 41, "group_id": "g7", "segment_index": 0, "segment_count": 1,
@@ -538,22 +545,22 @@ def test_result_history_drops_the_checkbox_column_and_deletes_with_del(monkeypat
     ])
     backtest._history_store = store
     backtest._reload_history()
-    assert backtest.history_table.rowCount() == 2
-    # 첫 컬럼이 삭제 대상 id를 들고 있어야 Del 이 동작합니다.
-    assert backtest.history_table.item(0, 0).data(
-        QtCore.Qt.ItemDataRole.UserRole) == 41
+    tree = backtest.history_table
+    assert tree.topLevelItemCount() == 2
+    # 0열이 삭제 대상 id를 들고 있어야 Del 이 동작합니다.
+    assert tree.topLevelItem(0).data(0, QtCore.Qt.ItemDataRole.UserRole) == 41
 
     monkeypatch.setattr(
         QtWidgets.QMessageBox, "question",
         staticmethod(lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Yes))
-    backtest.history_table.selectRow(1)
+    tree.setCurrentItem(tree.topLevelItem(1))
     event = QtGui.QKeyEvent(QtCore.QEvent.Type.KeyPress,
                             int(QtCore.Qt.Key.Key_Delete),
                             QtCore.Qt.KeyboardModifier.NoModifier)
-    backtest.history_table.keyPressEvent(event)
+    tree.keyPressEvent(event)
     app.processEvents()
     assert store.deleted == [{42}]
-    assert backtest.history_table.rowCount() == 1
+    assert tree.topLevelItemCount() == 1
 
     backtest.close()
     window.close()
