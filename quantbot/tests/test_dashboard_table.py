@@ -337,3 +337,32 @@ def test_units_column_handles_both_bitcoin_and_stellar_scales():
     assert fmt(3.14159) == "3.14"
     assert fmt(0.0342) == "0.0342"
     assert fmt(0.00341234) == "0.00341234"
+
+
+def test_config_window_opens_docked_to_the_dashboard():
+    """
+    설정 창은 대시보드를 보면서 고치는 창이라 오른쪽에 붙여 엽니다.
+
+    붙이는 기준이 대시보드 자신인데 `self.dashboard` 로 적어 두어 창을 열자마자
+    AttributeError 로 죽었습니다. open_config 는 Dashboard 의 메서드이므로
+    기준은 `self` 입니다.
+    """
+    import ui_theme
+
+    dashboard = _dashboard()
+    docked = []
+    original = ui_theme.dock_right_of
+    ui_theme.dock_right_of = lambda widget, anchor, gap=8: docked.append(anchor)
+    opened = []
+
+    import config_gui
+    original_build = config_gui.build_config_window
+    config_gui.build_config_window = lambda *a, **k: opened.append(1) or dashboard
+    try:
+        dashboard.open_config()
+    finally:
+        ui_theme.dock_right_of = original
+        config_gui.build_config_window = original_build
+        dashboard._config_window = None
+    assert docked == [dashboard]
+    dashboard.close()

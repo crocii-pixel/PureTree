@@ -406,7 +406,7 @@ class Dashboard(QWidget):
             self._config_window = build_config_window()
         self._config_window.show()
         # 대시보드를 보면서 고치는 창이라 오른쪽에 붙여 엽니다.
-        ui_theme.dock_right_of(self._config_window, self.dashboard)
+        ui_theme.dock_right_of(self._config_window, self)
         self._config_window.raise_()
         self._config_window.activateWindow()
 
