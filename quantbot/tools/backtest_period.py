@@ -116,6 +116,9 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
     use_reference = signal_reference == "binance"
     btc_min_weight = float(np.clip(config.get("btc_min_weight", 0.0), 0.0, 1.0))
     sizing_cap = max(0.0, float(config.get("sizing_equity_cap_krw", 0.0)))
+    # 청산선이 매수선 위에 있으면 사자마자 팔 자리입니다. 실전이 그 매수를
+    # 막으므로 백테스트도 같이 막아야 검증이 실전과 어긋나지 않습니다.
+    skip_immediate_exit = bool(config.get("skip_immediate_exit_buys", True))
     # 현금 슬롯. 목록에 CASH 를 넣은 수만큼 기준자산에서 떼어 놓습니다.
     # 슬롯 하나가 1/N 이고, 그 몫은 어떤 포지션도 건드리지 못합니다.
     # 노출을 낮추는 손잡이가 아니라 **노출 자체를 선택지로** 만드는 장치입니다.
@@ -144,6 +147,7 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
     buy_fee, sell_fee = float(fee["buy_rate"]), float(fee["sell_rate"])
 
     cash = INITIAL_CAPITAL
+    immediate_exit_skips = 0        # 사자마자 팔 자리라 건너뛴 횟수
     positions: Dict[str, Dict[str, float]] = {}
     trades = []
     curve = [INITIAL_CAPITAL]
@@ -673,6 +677,23 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
                 target_col = plan["target_col"]
                 ma_col = plan["ma_col"]
                 target_units = plan["target_units"]
+                # 사자마자 청산될 자리는 건너뜁니다. 진입 MA(전일 종가)와
+                # 청산 MA 는 창이 달라 진입 조건만으로는 안 걸러집니다.
+                if skip_immediate_exit:
+                    day_ctx = ctx.loc[date]
+                    exit_ma_now = (bear_ma if config.get("bear_market_exit", True)
+                                   and not bool(day_ctx["explosive"])
+                                   and not bool(day_ctx["bull"]) else ma)
+                    exit_price_col = (
+                        f"signal_ma{exit_ma_now}" if use_reference
+                        and f"signal_ma{exit_ma_now}" in r.index
+                        else f"ma{exit_ma_now}")
+                    if exit_price_col in r.index:
+                        exit_price = float(r[exit_price_col])
+                        if (np.isfinite(exit_price) and exit_price > 0
+                                and exit_price >= float(r[target_col])):
+                            immediate_exit_skips += 1
+                            continue
                 if strategy == "cash_with_atr":
                     continue
                 breakout_share = (1.0 - probe_fraction
@@ -739,6 +760,8 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
         # 조용히 무시되어도 아무도 몰랐습니다.
         "cash_slots": requested_slots,
         "cash_slot_share": round(cash_slot_share, 4),
+        "skip_immediate_exit_buys": skip_immediate_exit,
+        "immediate_exit_skips": immediate_exit_skips,
         "signal_reference": signal_reference,
         "signal_basis": "signal_columns" if use_reference else "execution_candles",
         "exit_timing": exit_timing,

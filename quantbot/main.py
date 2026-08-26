@@ -1286,7 +1286,37 @@ class QuantBot:
             return False, f"{self.config.get('higher_timeframe_filter')} 추세 하락"
         if not self.btc_regime_ok(ticker):
             return False, "BTC 하락 국면"
+        blocked, reason = self.immediate_exit_block(ticker)
+        if blocked:
+            return False, reason
         return True, ""
+
+    def immediate_exit_block(self, ticker: str) -> Tuple[bool, str]:
+        """
+        청산선이 매수선 위에 있으면 사지 않습니다.
+
+        급락 직후에는 시가가 내려앉는데 MA 는 아직 위에 남아 있어, 돌파선이
+        청산선 아래로 내려옵니다. 그 자리를 돌파해서 사면 **산 순간 이미 청산
+        조건**이라 다음 판정에서 그대로 팝니다.
+
+        9년 실측으로 이런 날은 0.2%(39일)뿐이라 수익에 미치는 영향은 오차
+        수준입니다. 그래도 막는 이유는 따로 있습니다. 사자마자 파는 장면은
+        보는 사람에게 "봇이 자기가 뭘 하는지 모른다"로 읽힙니다. 그 인상은
+        39번이 아니라 한 번으로 생깁니다.
+
+        진입 MA(전일 종가 기준)와 청산 MA 는 창이 달라서, 진입 조건만으로는
+        이 구간을 걸러내지 못합니다.
+        """
+        if not bool(self.config.get("skip_immediate_exit_buys", True)):
+            return False, ""
+        target = float(self.signal_targets.get(ticker, 0.0) or 0.0)
+        exit_line = float(self.exit_ma_values.get(ticker, 0.0) or 0.0)
+        if target <= 0 or exit_line <= 0:
+            return False, ""
+        if exit_line < target:
+            return False, ""
+        return True, (f"즉시청산 구간 (청산선 {exit_line:,.4g} ≥ "
+                      f"매수선 {target:,.4g})")
 
     def restore_daily_state(self) -> None:
         """

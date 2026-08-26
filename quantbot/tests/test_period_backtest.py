@@ -718,3 +718,73 @@ def test_wick_settings_are_clamped():
     assert cfg["defensive_entry_method"] == "wick"
     assert cfg["wick_lookback"] == 2
     assert cfg["wick_ratio_min"] == 0.95
+
+
+def test_immediate_exit_buys_are_skipped():
+    """
+    청산선이 매수선 위면 사자마자 팔 자리입니다. 사서 다음 날 파는 장면은
+    보는 사람에게 "봇이 자기가 뭘 하는지 모른다"로 읽힙니다. 그 인상은
+    9년에 39번이 아니라 한 번으로 생깁니다.
+
+    진입 MA(전일 종가)와 청산 MA 는 창이 달라서, 진입 조건만으로는 이 구간을
+    걸러내지 못합니다.
+    """
+    index = pd.date_range("2020-01-01", periods=180, freq="D")
+    close = np.linspace(100.0, 300.0, len(index))
+    frame = pd.DataFrame({
+        "open": close * 0.995, "high": close * 1.05, "low": close * 0.98,
+        "close": close, "N": close * 0.02,
+        "target": close * 0.99,          # 매수선
+        "ma10": close * 1.02,            # 청산선이 매수선 **위**
+        "ma3": close * 1.02,
+        "above_ma10": True, "above_ma3": True, "auto_selected": True,
+    }, index=index)
+    data = {"BTC": frame, "ETH": frame.copy()}
+    ctx = pd.DataFrame({"explosive": False, "bull": True}, index=index)
+    config = {
+        "exchange": "bithumb", "investment_strategy": "period_rebalance",
+        "regime_short_ma": 10, "regime_long_ma": 20,
+        "regime_entry_confirm_days": 2, "regime_exit_confirm_days": 1,
+        "ma_window": 10, "bear_exit_ma_window": 3,
+        "risk_per_trade": 0.01, "atr_stop_multiple": 2.0,
+        "_fee_info": {"buy_rate": 0.0004, "sell_rate": 0.0004},
+        "backtest_slippage_rate": 0.0005,
+    }
+    blocked = run_period_backtest(
+        {**config, "skip_immediate_exit_buys": True}, data, ctx)
+    allowed = run_period_backtest(
+        {**config, "skip_immediate_exit_buys": False}, data, ctx)
+
+    assert blocked["immediate_exit_skips"] > 0
+    assert allowed["immediate_exit_skips"] == 0
+    # 막았으면 그 자리에서 산 게 없어야 합니다.
+    assert blocked["매수주문"] < allowed["매수주문"]
+
+
+def test_guard_leaves_healthy_setups_alone():
+    """청산선이 매수선 아래인 평범한 날은 그대로 사야 합니다."""
+    index = pd.date_range("2020-01-01", periods=180, freq="D")
+    close = np.linspace(100.0, 300.0, len(index))
+    frame = pd.DataFrame({
+        "open": close * 0.995, "high": close * 1.05, "low": close * 0.98,
+        "close": close, "N": close * 0.02,
+        "target": close * 0.99,
+        "ma10": close * 0.90,            # 청산선이 매수선 아래 - 정상
+        "ma3": close * 0.90,
+        "above_ma10": True, "above_ma3": True, "auto_selected": True,
+    }, index=index)
+    data = {"BTC": frame, "ETH": frame.copy()}
+    ctx = pd.DataFrame({"explosive": False, "bull": True}, index=index)
+    config = {
+        "exchange": "bithumb", "investment_strategy": "period_rebalance",
+        "regime_short_ma": 10, "regime_long_ma": 20,
+        "regime_entry_confirm_days": 2, "regime_exit_confirm_days": 1,
+        "ma_window": 10, "bear_exit_ma_window": 3,
+        "risk_per_trade": 0.01, "atr_stop_multiple": 2.0,
+        "_fee_info": {"buy_rate": 0.0004, "sell_rate": 0.0004},
+        "backtest_slippage_rate": 0.0005,
+        "skip_immediate_exit_buys": True,
+    }
+    result = run_period_backtest(config, data, ctx)
+    assert result["immediate_exit_skips"] == 0
+    assert result["매수주문"] > 0
