@@ -109,6 +109,24 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
     use_reference = signal_reference == "binance"
     btc_min_weight = float(np.clip(config.get("btc_min_weight", 0.0), 0.0, 1.0))
     sizing_cap = max(0.0, float(config.get("sizing_equity_cap_krw", 0.0)))
+    # 현금 슬롯. 목록에 CASH 를 넣은 수만큼 기준자산에서 떼어 놓습니다.
+    # 슬롯 하나가 1/N 이고, 그 몫은 어떤 포지션도 건드리지 못합니다.
+    # 노출을 낮추는 손잡이가 아니라 **노출 자체를 선택지로** 만드는 장치입니다.
+    from universe_selector import cash_slots as _cash_slots, static_tickers as _static
+    try:
+        requested_slots = _cash_slots(_static(config))
+        requested_total = len(_static(config))
+    except Exception:
+        requested_slots, requested_total = 0, 0
+    if not requested_slots:
+        for frame in data.values():
+            requested_slots = int(frame.attrs.get("cash_slots", 0) or 0)
+            if requested_slots:
+                requested_total = len(data) + requested_slots
+                break
+    cash_slot_share = (requested_slots / requested_total
+                       if requested_slots and requested_total > 0 else 0.0)
+    cash_slot_share = float(np.clip(cash_slot_share, 0.0, 0.95))
     auto_selection = bool(
         config.get("additional_selection_enabled")
         and str(config.get("additional_selection_mode", "manual")).lower() == "auto")
@@ -266,6 +284,7 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
         if not names:
             return
         deployable = min(cash, sizing_cap) if sizing_cap > 0 else cash
+        deployable *= (1.0 - cash_slot_share)
         equal_budget = deployable / len(names)
         budgets = {ticker: equal_budget for ticker in names}
         if "BTC" in budgets and btc_min_weight > 0:
@@ -477,6 +496,10 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
                 for t, p in positions.items())
             sizing_equity = (min(opening_equity, sizing_cap)
                              if sizing_cap > 0 else opening_equity)
+            # 현금 자리는 사이징 대상에서 빠집니다. 리밸런싱 때마다 이 몫이
+            # 다시 채워지므로, 오른 뒤에는 이익을 현금으로 덜어내고 내린 뒤에는
+            # 현금을 다시 태우는 모양이 됩니다.
+            sizing_equity *= (1.0 - cash_slot_share)
             active_names = active(date)
             btc_reserved = 0.0
             if btc_min_weight > 0 and "BTC" in active_names:
@@ -701,6 +724,8 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
         "fee_info": fee, "slippage_rate": slippage,
         # 어떤 봉으로 판정했는지를 결과에 남깁니다. 이게 없어서 신호 기준이
         # 조용히 무시되어도 아무도 몰랐습니다.
+        "cash_slots": requested_slots,
+        "cash_slot_share": round(cash_slot_share, 4),
         "signal_reference": signal_reference,
         "signal_basis": "signal_columns" if use_reference else "execution_candles",
         "exit_timing": exit_timing,

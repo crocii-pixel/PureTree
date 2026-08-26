@@ -85,7 +85,12 @@ def build_env_payload(exchange: str, entered: Dict[str, str]) -> Dict[str, str]:
 
 
 def parse_tickers(text: str) -> List[str]:
-    """'BTC, ETH , KRW-SOL' -> ['BTC', 'ETH', 'SOL'] (중복 제거 + 정규화)"""
+    """
+    'BTC, ETH , KRW-SOL' -> ['BTC', 'ETH', 'SOL'] (중복 제거 + 정규화)
+
+    CASH 만 예외로 접지 않습니다. 두 번 적으면 현금 두 자리(2/N)를 묶겠다는
+    뜻이고, 접어 버리면 현금 비중이 한 칸에서 멈춥니다.
+    """
     result: List[str] = []
     for chunk in str(text).replace("\n", ",").split(","):
         symbol = chunk.strip().upper()
@@ -93,7 +98,7 @@ def parse_tickers(text: str) -> List[str]:
             continue
         if "-" in symbol:
             symbol = symbol.split("-")[-1]
-        if symbol not in result:
+        if symbol == "CASH" or symbol not in result:
             result.append(symbol)
     return result
 
@@ -1267,7 +1272,12 @@ def build_config_window(parent: Any = None) -> Any:
                 bool(self.config.get("fixed_selection_enabled", True)))
             self.fixed_tickers_edit = QtWidgets.QLineEdit(format_tickers(
                 self.config.get("fixed_tickers", ["BTC", "ETH"])))
-            self.fixed_tickers_edit.setPlaceholderText("BTC, ETH")
+            self.fixed_tickers_edit.setPlaceholderText("BTC, ETH, CASH")
+            self.fixed_tickers_edit.setToolTip(
+                "CASH 를 넣으면 그 자리만큼 자금이 묶입니다. 슬롯 하나가 "
+                "1/N 이고, 리밸런싱 때마다 그 몫이 다시 채워집니다.\n"
+                "오른 뒤에는 이익을 현금으로 덜어내고, 내린 뒤에는 현금을 "
+                "다시 태우는 모양이 됩니다.")
             fixed_row.addWidget(self.fixed_selection)
             fixed_row.addWidget(self.fixed_tickers_edit, 1)
             form.addRow(QtWidgets.QLabel("고정 종목"), fixed_row)
@@ -1287,9 +1297,51 @@ def build_config_window(parent: Any = None) -> Any:
             additional_row.addStretch(1)
             form.addRow(QtWidgets.QLabel("추가 방식"), additional_row)
 
+            auto_row = QtWidgets.QHBoxLayout()
+            auto_row.setSpacing(4)
+            self.auto_rebalance_spin = QtWidgets.QSpinBox()
+            self.auto_rebalance_spin.setRange(1, 90)
+            self.auto_rebalance_spin.setSuffix("일")
+            self.auto_rebalance_spin.setValue(
+                int(self.config.get("auto_rebalance_days", 7)))
+            self.auto_rebalance_spin.setToolTip(
+                "재선정 주기. 예전에는 월요일에 박혀 있어 7일 말고는 시험할 수 "
+                "없었습니다. 7 로 두면 예전과 같은 자리에 섭니다.")
+            self.auto_universe_combo = QtWidgets.QComboBox()
+            self.auto_universe_combo.addItem("거래대금 상위", "turnover")
+            self.auto_universe_combo.addItem("시총 상위", "marketcap")
+            universe = str(self.config.get("auto_universe_source", "turnover"))
+            self.auto_universe_combo.setCurrentIndex(
+                max(0, self.auto_universe_combo.findData(universe)))
+            self.auto_universe_combo.setToolTip(
+                "거래대금은 그날 터진 종목이 올라오고, 시총은 크기 자체를 "
+                "잽니다. 시총이어야 순위대를 나눠 볼 수 있습니다.")
+            self.auto_top_spin = QtWidgets.QSpinBox()
+            self.auto_top_spin.setRange(3, 200)
+            self.auto_top_spin.setValue(
+                int(self.config.get("auto_liquidity_top", 20)))
+            self.auto_band_edit = QtWidgets.QLineEdit(
+                str(self.config.get("auto_rank_band", "") or ""))
+            self.auto_band_edit.setPlaceholderText("1-6 · 8,10,12,14 · 15-")
+            self.auto_band_edit.setToolTip(
+                "모집단 순위 중 어느 구간을 쓸지.\n"
+                "  1-6           1~6위 6종\n"
+                "  8,10,12,14    그 네 자리만\n"
+                "  15-           15위부터 끝까지\n\n"
+                "비워 두면 상위 N종을 씁니다. 밴드를 쓰면 칸 수가 곧 종목 "
+                "수입니다.\n밴드마다 종목 수가 다르면 분산 효과가 섞이므로, "
+                "크기를 비교할 때는 1-6 / 7-12 / 13-18 처럼 개수를 맞추십시오.")
+            auto_row.addWidget(QtWidgets.QLabel("주기"))
+            auto_row.addWidget(self.auto_rebalance_spin)
+            auto_row.addWidget(self.auto_universe_combo)
+            auto_row.addWidget(self.auto_top_spin)
+            auto_row.addWidget(QtWidgets.QLabel("순위"))
+            auto_row.addWidget(self.auto_band_edit, 1)
+            form.addRow(QtWidgets.QLabel("자동 선정"), auto_row)
+
             self.additional_tickers_edit = QtWidgets.QLineEdit(format_tickers(
                 self.config.get("additional_tickers", [])))
-            self.additional_tickers_edit.setPlaceholderText("SOL, XRP, LINK")
+            self.additional_tickers_edit.setPlaceholderText("SOL, XRP, LINK, CASH")
             self.tickers_edit = self.additional_tickers_edit  # 이전 UI 접근과 호환
             form.addRow(QtWidgets.QLabel("추가 종목"), self.additional_tickers_edit)
 
@@ -1316,9 +1368,7 @@ def build_config_window(parent: Any = None) -> Any:
             self.simulation.setChecked(bool(self.config.get("force_simulation", False)))
             layout.addWidget(self.simulation)
 
-            selection_hint = QtWidgets.QLabel(
-                "자동은 BTC·ETH를 제외하고 Binance USDT 최근 10일 평균 거래대금 "
-                "상위 20개 중 7일 수익률이 0% 이상인 상위 6종을 매주 재선정합니다.")
+            selection_hint = QtWidgets.QLabel()
             selection_hint.setObjectName("Hint")
             selection_hint.setWordWrap(True)
             layout.addWidget(selection_hint)
@@ -1328,6 +1378,11 @@ def build_config_window(parent: Any = None) -> Any:
             self.strategy_hint.setWordWrap(True)
             layout.addWidget(self.strategy_hint)
 
+            def auto_return_days_value() -> int:
+                return int(self.config.get("auto_return_days", 7))
+
+            self.auto_return_days_value = auto_return_days_value
+
             def sync_selection() -> None:
                 self.fixed_tickers_edit.setEnabled(self.fixed_selection.isChecked())
                 enabled = self.additional_selection.isChecked()
@@ -1335,6 +1390,22 @@ def build_config_window(parent: Any = None) -> Any:
                 self.additional_manual.setEnabled(enabled)
                 self.additional_tickers_edit.setEnabled(
                     enabled and self.additional_manual.isChecked())
+                auto_on = enabled and self.additional_auto.isChecked()
+                for widget in (self.auto_rebalance_spin, self.auto_universe_combo,
+                               self.auto_top_spin, self.auto_band_edit):
+                    widget.setEnabled(auto_on)
+                band = self.auto_band_edit.text().strip()
+                pool = ("시총" if self.auto_universe_combo.currentData() == "marketcap"
+                        else "최근 10일 평균 거래대금")
+                where = f"{int(self.auto_top_spin.value())}위 중 "
+                where += f"{band} 자리" if band else "상위"
+                selection_hint.setText(
+                    f"자동은 {pool} {where}에서 "
+                    f"{int(self.auto_return_days_value())}일 수익률이 0% 이상인 "
+                    f"종목을 많이 오른 순으로 "
+                    f"{int(self.auto_rebalance_spin.value())}일마다 재선정합니다."
+                    + ("" if self.auto_universe_combo.currentData() == "marketcap"
+                       else "  BTC·ETH 는 제외됩니다."))
                 period = self.investment_strategy_combo.currentData() == "period_rebalance"
                 for widget in (self.regime_short_ma_spin, self.regime_long_ma_spin,
                                self.regime_entry_days_spin, self.regime_exit_days_spin):
@@ -1345,6 +1416,10 @@ def build_config_window(parent: Any = None) -> Any:
                     if period else
                     "현재 방식: 종목별 변동성 돌파 신호에 따라 진입하고 ATR/균등 사이징과 MA 청산을 적용합니다.")
 
+            self.auto_rebalance_spin.valueChanged.connect(sync_selection)
+            self.auto_top_spin.valueChanged.connect(sync_selection)
+            self.auto_universe_combo.currentIndexChanged.connect(sync_selection)
+            self.auto_band_edit.textChanged.connect(sync_selection)
             self.fixed_selection.toggled.connect(sync_selection)
             self.additional_selection.toggled.connect(sync_selection)
             self.additional_auto.toggled.connect(sync_selection)
@@ -1768,6 +1843,10 @@ def build_config_window(parent: Any = None) -> Any:
                 "additional_selection_enabled": additional_enabled,
                 "additional_selection_mode": additional_mode,
                 "additional_tickers": manual,
+                "auto_rebalance_days": int(self.auto_rebalance_spin.value()),
+                "auto_universe_source": self.auto_universe_combo.currentData(),
+                "auto_liquidity_top": int(self.auto_top_spin.value()),
+                "auto_rank_band": self.auto_band_edit.text().strip(),
                 "ma_window": int(self.ma_spin.value()),
                 "fixed_k": float(self.k_spin.value()),
                 "use_dynamic_k": bool(self.dynamic_k.isChecked()),

@@ -531,15 +531,21 @@ def prepare_data(config: Dict[str, Any], refresh: bool = False):
     """
     from tools.market_data import (fetch_binance_reference, fetch_ohlcv, fetch_upbit,
                                    load_auto_selection_frames)
-    from universe_selector import (automatic_enabled, build_weekly_schedule,
-                                   selection_config, static_tickers)
+    from universe_selector import (automatic_enabled, build_schedule,
+                                   cash_slots, selection_config, static_tickers)
 
     ma = int(config.get("ma_window", 10))
     bear_ma = int(config.get("bear_exit_ma_window", 5))
     atr_w = int(config.get("atr_window", 20))
     windows = [ma, bear_ma]
 
-    tickers = [str(t).upper() for t in (static_tickers(config) or ["BTC"])]
+    requested = [str(t).upper() for t in (static_tickers(config) or ["BTC"])]
+    # CASH 는 종목이 아니라 자리입니다. 시세를 받으러 가면 안 되고, 대신 몇
+    # 자리를 차지했는지만 세어 사이징에 넘깁니다.
+    cash_reserved_slots = cash_slots(requested)
+    tickers = [t for t in requested if t != "CASH"]
+    if not tickers:
+        tickers = ["BTC"]
     selection_frames: Dict[str, pd.DataFrame] = {}
     selection_schedule: Dict[pd.Timestamp, List[str]] = {}
     selection_calendar = []
@@ -553,7 +559,7 @@ def prepare_data(config: Dict[str, Any], refresh: bool = False):
         # After local/reference validation we rank again with only usable coins,
         # so a missing winner is replaced by the next valid coin instead of
         # silently shrinking an automatic six-coin portfolio.
-        selection_schedule = build_weekly_schedule(
+        selection_schedule = build_schedule(
             selection_frames, config, selection_calendar,
             count=opts["liquidity_top"])
         selected_union = sorted({
@@ -594,7 +600,7 @@ def prepare_data(config: Dict[str, Any], refresh: bool = False):
         opts = selection_config(config)
         fixed = set(opts["fixed"] if opts["fixed_enabled"] else [])
         available = set(data)
-        selection_schedule = build_weekly_schedule(
+        selection_schedule = build_schedule(
             selection_frames, config, selection_calendar,
             allowed=available, count=opts["count"])
         chosen_by_date = {
@@ -609,6 +615,10 @@ def prepare_data(config: Dict[str, Any], refresh: bool = False):
 
     if "BTC" not in data:
         raise RuntimeError("BTC 일봉을 가져오지 못해 시장 상태를 만들 수 없습니다")
+    if cash_reserved_slots:
+        # 백테스트 쪽에서 설정을 다시 읽지 않아도 되게 프레임에 붙여 둡니다.
+        for frame in data.values():
+            frame.attrs["cash_slots"] = cash_reserved_slots
 
     btc_raw = fetch_upbit("BTC", refresh=refresh)
     # 폭등기 판정에는 15년치 Bitstamp BTC/USD 가 필요합니다.  예전에는 ccxt 로
@@ -695,7 +705,8 @@ def prepare_data(config: Dict[str, Any], refresh: bool = False):
     ctx.attrs["regime_decision_interval"] = regime_interval
 
     # 매매 대상에서 BTC를 뺐다면 지표만 쓰고 매매에서는 제외
-    if "BTC" not in [str(t).upper() for t in static_tickers(config)]:
+    if "BTC" not in [str(t).upper() for t in static_tickers(config)
+                     if str(t).upper() != "CASH"]:
         data.pop("BTC", None)
 
     return data, ctx, list(dict.fromkeys(missing))

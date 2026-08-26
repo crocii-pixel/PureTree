@@ -23,13 +23,100 @@ EXCLUDED = {
 }
 
 
+#: 현금 슬롯. 종목처럼 목록에 넣지만 사지 않고 그 몫만큼 자금을 묶어 둡니다.
+#: 노출을 줄이는 것이 아니라 **노출 자체를 선택지로** 만드는 장치입니다.
+CASH_SYMBOL = "CASH"
+
+#: 자동 선정 모집단.
+#:   turnover  - 거래대금 상위 (기존). 그날 터진 종목이 올라옵니다.
+#:   marketcap - 시총 상위. 크기 자체를 재므로 순위대를 나눠 볼 수 있습니다.
+UNIVERSE_SOURCES = ("turnover", "marketcap")
+
+
+def is_cash(symbol: Any) -> bool:
+    return str(symbol).strip().upper() == CASH_SYMBOL
+
+
+def parse_rank_band(spec: Any, default: Optional[List[int]] = None) -> List[int]:
+    """
+    순위 밴드 문법을 순위 목록으로.
+
+        "1-6"           -> [1,2,3,4,5,6]
+        "8,10,12,14"    -> [8,10,12,14]
+        "15-"           -> [15..20]  (열린 끝은 모집단 크기까지)
+        "1-3,7,11-13"   -> 섞어 써도 됩니다
+
+    밴드마다 종목 수가 다르면 분산 효과가 섞여 **크기 비교가 흐려집니다.**
+    대조가 필요하면 "1-6"/"7-12"/"13-18" 처럼 개수를 맞춰 쓰십시오.
+    """
+    if spec is None or (isinstance(spec, str) and not spec.strip()):
+        return list(default or [])
+    if isinstance(spec, (list, tuple, set)):
+        ranks = [int(v) for v in spec]
+        return sorted({r for r in ranks if r >= 1})
+    ranks: Set[int] = set()
+    open_ended = False
+    for chunk in str(spec).replace(" ", "").split(","):
+        if not chunk:
+            continue
+        if "-" in chunk:
+            lo, _, hi = chunk.partition("-")
+            try:
+                low = max(1, int(lo)) if lo else 1
+            except ValueError:
+                continue
+            if not hi:
+                open_ended = True
+                ranks.update(range(low, low + 1))     # 자리 표시. 아래에서 확장
+                ranks.add(-low)                       # 음수로 열린 시작을 기록
+                continue
+            try:
+                high = int(hi)
+            except ValueError:
+                continue
+            if high >= low:
+                ranks.update(range(low, high + 1))
+        else:
+            try:
+                ranks.add(max(1, int(chunk)))
+            except ValueError:
+                continue
+    if open_ended:
+        return sorted(ranks)                          # 확장은 expand_band 에서
+    return sorted(r for r in ranks if r >= 1)
+
+
+def expand_band(ranks: Iterable[int], universe_size: int) -> List[int]:
+    """열린 끝("15-")을 모집단 크기까지 채웁니다."""
+    values = list(ranks)
+    opens = [-r for r in values if r < 0]
+    fixed = {r for r in values if r > 0}
+    for low in opens:
+        fixed.update(range(low, max(low, int(universe_size)) + 1))
+    return sorted(r for r in fixed if 1 <= r <= max(1, int(universe_size)))
+
+
 def unique_symbols(values: Iterable[Any]) -> List[str]:
     out: List[str] = []
     for value in values:
         symbol = str(value).split("-")[-1].split("/")[0].strip().upper()
-        if symbol and symbol not in out:
+        if not symbol:
+            continue
+        # CASH 는 접지 않습니다. 두 번 적으면 두 자리, 즉 2/N 을 묶겠다는
+        # 뜻입니다. 접어 버리면 현금 비중이 한 칸에서 멈춥니다.
+        if symbol == CASH_SYMBOL or symbol not in out:
             out.append(symbol)
     return out
+
+
+def tradable_symbols(values: Iterable[Any]) -> List[str]:
+    """CASH 를 뺀 실제 매매 종목. 시세를 받으러 갈 때 씁니다."""
+    return [symbol for symbol in unique_symbols(values) if not is_cash(symbol)]
+
+
+def cash_slots(values: Iterable[Any]) -> int:
+    """목록에 든 현금 슬롯 수. 슬롯 하나가 기준자산의 1/N 을 묶습니다."""
+    return sum(1 for value in values if is_cash(value))
 
 
 def selection_config(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -46,6 +133,17 @@ def selection_config(config: Dict[str, Any]) -> Dict[str, Any]:
         "liquidity_top": max(1, int(config.get("auto_liquidity_top", 20))),
         "volume_days": max(2, int(config.get("auto_volume_days", 10))),
         "return_days": max(1, int(config.get("auto_return_days", 7))),
+        # 모집단을 무엇으로 자를지. 시총이면 순위대(밴드)로 크기를 갈라 볼 수
+        # 있습니다.
+        "universe_source": (str(config.get("auto_universe_source", "turnover"))
+                            .strip().lower()
+                            if str(config.get("auto_universe_source", "turnover"))
+                            .strip().lower() in UNIVERSE_SOURCES else "turnover"),
+        "rank_band": parse_rank_band(config.get("auto_rank_band")),
+        # 재선정 주기. 예전에는 월요일에 박혀 있어 7일 말고는 시험할 수
+        # 없었습니다. 주기를 값으로 빼면 한 달 주기를 확인했던 것처럼
+        # 주간 주기도 스윕할 수 있습니다.
+        "rebalance_days": max(1, int(config.get("auto_rebalance_days", 7))),
     }
 
 
@@ -92,13 +190,55 @@ def rank_frames(frames: Dict[str, pd.DataFrame], config: Dict[str, Any],
         momentum = float(df["close"].iloc[-1] / df["close"].iloc[-1 - opts["return_days"]] - 1.0)
         if turnover > 0:
             rows.append((symbol, turnover, momentum))
-    liquid = sorted(rows, key=lambda row: (-row[1], row[0]))[:opts["liquidity_top"]]
-    # 원 전략 순서: 먼저 거래대금 TOP N을 확정한 다음, 그 안에서만
-    # 7일 수익률이 0 이상인 종목을 모멘텀 순으로 고릅니다.
-    liquid = [row for row in liquid if row[2] >= 0]
+    if opts["universe_source"] == "marketcap":
+        universe = marketcap_universe(cutoff, opts["liquidity_top"])
+        order = {symbol: index for index, symbol in enumerate(universe)}
+        pool = [row for row in rows if row[0] in order]
+        pool.sort(key=lambda row: order[row[0]])
+    else:
+        pool = sorted(rows, key=lambda row: (-row[1], row[0]))[:opts["liquidity_top"]]
+
+    # 순위 밴드가 지정되면 **모집단 순위로 먼저 자릅니다.** 1~6위(대형)와
+    # 15~20위(소형)를 갈라 돌리면 수익 배수가 크기에서 오는지 전략에서
+    # 오는지가 드러납니다.
+    band = expand_band(opts["rank_band"], len(pool)) if opts["rank_band"] else []
+    if band:
+        pool = [pool[rank - 1] for rank in band if 1 <= rank <= len(pool)]
+
+    # 원 전략 순서: 모집단을 확정한 다음, 그 안에서만 7일 수익률이 0 이상인
+    # 종목을 모멘텀 순으로 고릅니다.
+    pool = [row for row in pool if row[2] >= 0]
+    limit = count if count is not None else opts["count"]
+    if band and count is None:
+        # 밴드를 지정했으면 그 칸 수가 곧 목표 종목 수입니다.
+        limit = len(band)
     return [row[0] for row in sorted(
-        liquid, key=lambda row: (-row[2], -row[1], row[0]))[
-            :max(1, int(count if count is not None else opts["count"]))]]
+        pool, key=lambda row: (-row[2], -row[1], row[0]))[:max(1, int(limit))]]
+
+
+def marketcap_universe(cutoff: Any, limit: int) -> List[str]:
+    """
+    그 시점 시총 상위 심볼. 오늘 목록으로 과거를 돌리면 생존 편향이 들어갑니다.
+
+    실측: 2017-09 상위 20 중 지금 목록과 겹치는 건 3개뿐이고, 종목만 그때
+    기준으로 바꾸면 9년 수익이 20배 안팎으로 줄었습니다.
+    """
+    try:
+        from tools.market_cap import top_at
+
+        universe = [row["symbol"] for row in top_at(cutoff, int(limit))]
+    except Exception as exc:
+        # 조용히 거래대금으로 물러서면 안 됩니다. 크기별로 나눠 재려고 시총을
+        # 고른 것인데, 대신 거래대금으로 답하면 그 측정이 통째로 오염됩니다.
+        # (같은 종류의 조용한 대체가 signal_reference 에서 이미 한 번 있었습니다.)
+        raise RuntimeError(
+            f"{pd.Timestamp(cutoff).date()} 시총 순위를 읽지 못했습니다. "
+            "모집단을 '거래대금'으로 두거나 연결을 확인해 주세요."
+        ) from exc
+    if not universe:
+        raise RuntimeError(
+            f"{pd.Timestamp(cutoff).date()} 시총 순위가 비어 있습니다.")
+    return universe
 
 
 def binance_usdt_symbols(timeout: float = 8.0) -> Set[str]:
@@ -188,18 +328,33 @@ def select_live(exchange: Any, config: Dict[str, Any],
             "source": source, "candidate_count": len(frames)}
 
 
-def build_weekly_schedule(frames: Dict[str, pd.DataFrame],
-                          config: Dict[str, Any],
-                          dates: Iterable[Any],
-                          allowed: Optional[Set[str]] = None,
-                          count: Optional[int] = None) -> Dict[pd.Timestamp, List[str]]:
-    """매주 월요일마다 과거 마감봉만 사용해 선정하고 다음 선정일까지 유지."""
+def build_schedule(frames: Dict[str, pd.DataFrame],
+                   config: Dict[str, Any],
+                   dates: Iterable[Any],
+                   allowed: Optional[Set[str]] = None,
+                   count: Optional[int] = None,
+                   rebalance_days: Optional[int] = None
+                   ) -> Dict[pd.Timestamp, List[str]]:
+    """
+    주기마다 과거 마감봉만 사용해 선정하고 다음 선정일까지 유지합니다.
+
+    주기가 7일이면 예전의 '매주 월요일'과 같은 자리에 떨어집니다. 다만 값으로
+    빼 두었으므로 1~30일을 훑어 주간 주기가 실재하는지 볼 수 있습니다.
+    """
     normalized = sorted({pd.Timestamp(d).normalize() for d in dates})
     if not normalized:
         return {}
-    rebalance = [d for d in normalized if d.weekday() == 0]
-    if not rebalance:
-        rebalance = [normalized[0]]
+    period = int(rebalance_days if rebalance_days is not None
+                 else selection_config(config)["rebalance_days"])
+    period = max(1, period)
+    if period == 7:
+        # 7일 주기는 예전과 같은 요일에 서도록 월요일에 맞춥니다. 이렇게 해야
+        # 기존 결과와 직접 비교됩니다.
+        rebalance = [d for d in normalized if d.weekday() == 0] or [normalized[0]]
+    else:
+        first = normalized[0]
+        rebalance = [d for d in normalized
+                     if (d - first).days % period == 0] or [first]
     current: List[str] = []
     schedule: Dict[pd.Timestamp, List[str]] = {}
     rebalance_set = set(rebalance)
@@ -209,3 +364,7 @@ def build_weekly_schedule(frames: Dict[str, pd.DataFrame],
                 frames, config, before=date, allowed=allowed, count=count)
         schedule[date] = list(current)
     return schedule
+
+
+#: 옛 이름. 호출부가 아직 남아 있어 유지합니다.
+build_weekly_schedule = build_schedule

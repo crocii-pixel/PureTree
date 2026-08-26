@@ -162,6 +162,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "auto_liquidity_top": 20,
     "auto_volume_days": 10,
     "auto_return_days": 7,
+    # 모집단을 무엇으로 자를지. "marketcap" 이면 순위대(밴드)로 크기를
+    # 갈라 볼 수 있습니다. 기본은 기존 동작 유지.
+    "auto_universe_source": "turnover",
+    # 모집단 순위 중 쓸 구간. "1-6" / "8,10,12,14" / "15-" / 비우면 상위 N종.
+    "auto_rank_band": "",
+    # 재선정 주기(일). 예전에는 월요일에 박혀 있었습니다. 7 이면 같은 자리.
+    "auto_rebalance_days": 7,
     # 자동 TOP6에서 탈락하면 기존 MA 청산을 기다리지 않고 전량 시장가 청산.
     "exit_on_selection_drop": True,
     # 워크포워드 검증에서 MA5보다 OOS 성과가 나았던 값 (31개 구간 중 19개 우위)
