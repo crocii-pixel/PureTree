@@ -54,6 +54,35 @@ OVERLAY_SERIES: Tuple[Tuple[str, str, str, str], ...] = (
 PARAM_INPUT_WIDTH = 50
 
 
+def _chart_settings_path():
+    import config_manager
+
+    return config_manager.DATA_DIR / "chart_settings.json"
+
+
+def _load_chart_settings() -> Dict[str, Any]:
+    """마지막으로 쓰던 판정값. 못 읽으면 빈 값이고, 그때는 설정 기본값을 씁니다."""
+    try:
+        import json
+
+        return json.loads(_chart_settings_path().read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_chart_settings(score: Dict[str, Any]) -> None:
+    try:
+        import json
+
+        path = _chart_settings_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(dict(score), ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+    except Exception:
+        # 저장 실패가 차트를 막으면 안 됩니다. 다음 변경 때 다시 시도합니다.
+        return
+
+
 def _span_text(seconds: int) -> str:
     """초를 사람이 읽는 기간으로. 판정이 실제로 보는 창의 길이입니다."""
     def trim(value: float, unit: str) -> str:
@@ -1101,6 +1130,21 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
             self._bootstrap_worker = None
             self._bootstrap_thread = None
             self._config = dict(config_provider())
+            # 창을 닫았다 열면 값이 초기화되던 것을 막습니다. 마지막으로 쓰던
+            # 판정값을 파일에 남기고 여기서 되읽습니다. 실전 config.json 은
+            # 건드리지 않습니다 - 이건 연구용 초안입니다.
+            saved = _load_chart_settings()
+            if saved:
+                merged = dict(self._config.get("regime_scoring") or {})
+                merged.update(saved)
+                # 봉 간격은 화면 선택이지 판정값이 아닙니다. 부르는 쪽이
+                # 정한 값을 저장본이 덮으면, 1분봉을 열어 달라고 해도 지난번
+                # 일봉으로 뜹니다.
+                if "decision_interval" in (self._config.get("regime_scoring") or {}):
+                    merged["decision_interval"] = self._config["regime_scoring"][
+                        "decision_interval"]
+                self._config = dict(self._config)
+                self._config["regime_scoring"] = merged
             self._score = scoring_config(self._config)
             self._current_interval = str(self._score.get("decision_interval", "1d"))
             self._requested_interval = self._current_interval
@@ -1194,7 +1238,9 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
             panel.setWidgetResizable(True)
             panel.setHorizontalScrollBarPolicy(
                 QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-            panel.setMinimumWidth(380)
+            # 최소폭이 380 이라 스플리터를 왼쪽으로 밀어도 거의 안 줄었습니다.
+            # 입력란을 좁힌 뒤로 300 이면 값이 잘리지 않습니다.
+            panel.setMinimumWidth(300)
             panel.setMaximumWidth(420)
             content = QtWidgets.QWidget()
             self.panel_layout = QtWidgets.QVBoxLayout(content)
@@ -1483,6 +1529,41 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
                 + ("" if 20 <= days <= 45 else
                    f"\n\n지금 단기 MA 는 {_span_text(int(days * 86_400))} 입니다."))
 
+        def apply_scoring(self, values: Dict[str, Any]) -> None:
+            """
+            바깥(백테스트 이력)에서 넘어온 판정 설정을 패널에 꽂습니다.
+
+            ``_building`` 을 켜 두는 이유는, 위젯을 하나 바꿀 때마다 재계산이
+            예약되어 중간 상태로 여러 번 도는 것을 막기 위해서입니다.
+            """
+            self._building = True
+            try:
+                for key, widget in self.inputs.items():
+                    if key not in values:
+                        continue
+                    value = values[key]
+                    if isinstance(widget, QtWidgets.QComboBox):
+                        index = widget.findData(value)
+                        if index >= 0:
+                            widget.setCurrentIndex(index)
+                    elif isinstance(widget, QtWidgets.QCheckBox):
+                        widget.setChecked(bool(value))
+                    else:
+                        try:
+                            widget.setValue(
+                                float(value) * 100.0 if key in {
+                                    "defensive_probe_fraction",
+                                    "defensive_take_profit_pct"} else value)
+                        except (TypeError, ValueError):
+                            continue
+                if "enabled" in values:
+                    self.regime_check.setChecked(bool(values["enabled"]))
+                if "use_for_backtest" in values:
+                    self.strategy_check.setChecked(bool(values["use_for_backtest"]))
+            finally:
+                self._building = False
+            self._recalculate()
+
         def _settings(self) -> Dict[str, Any]:
             result = dict(self._score)
             result["enabled"] = self.regime_check.isChecked()
@@ -1689,6 +1770,8 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
             self._config = dict(config_provider())
             self._config["regime_scoring"] = deepcopy(self._score)
             config_changed(deepcopy(self._score))
+            _save_chart_settings({k: v for k, v in self._score.items()
+                                  if k != "decision_interval"})
             self.chart.set_options(show_regime=self.regime_check.isChecked())
             if self._data.empty:
                 return

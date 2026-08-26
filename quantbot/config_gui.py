@@ -400,8 +400,9 @@ def build_config_window(parent: Any = None) -> Any:
             self._chart_period_sync_timer.timeout.connect(self._sync_chart_period)
             self.setWindowTitle("QuantBot 백테스트")
             self.setMinimumSize(900, 650)
-            self.resize(1120, 780)
-            ui_theme.fit_available_height(self, 1120)
+            # 차트를 옆에 붙여 열므로 백테스트 창은 1/5 줄였습니다.
+            self.resize(900, 780)
+            ui_theme.fit_available_height(self, 900)
 
             outer = QtWidgets.QVBoxLayout(self)
             outer.setContentsMargins(22, 20, 22, 20)
@@ -534,7 +535,7 @@ def build_config_window(parent: Any = None) -> Any:
             self.history_table = _HistoryTable(0, 9)
             self.history_table.setObjectName("BacktestTable")
             self.history_table.setHorizontalHeaderLabels([
-                "실행 구조", "테스트 기간", "설정", "누적수익",
+                "실행 구조", "테스트 기간", "설정 적용", "누적수익",
                 "CAGR", "MDD", "MAR", "승률", "매매",
             ])
             header_color_keys = (
@@ -702,6 +703,8 @@ def build_config_window(parent: Any = None) -> Any:
             else:
                 self._chart_window.sync_period()
             self._chart_window.show()
+            # 백테스트 결과를 보면서 설정을 만지는 창이라 오른쪽에 붙입니다.
+            ui_theme.dock_right_of(self._chart_window, self)
             self._chart_window.raise_()
             self._chart_window.activateWindow()
 
@@ -920,8 +923,36 @@ def build_config_window(parent: Any = None) -> Any:
                         item.setTextAlignment(int(QtCore.Qt.AlignmentFlag.AlignRight |
                                                   QtCore.Qt.AlignmentFlag.AlignVCenter))
                     self.history_table.setItem(row, col, item)
+                # "설정" 칸은 어느 줄이나 "현재 설정"이라 읽을 게 없었습니다.
+                # 그 자리에 그 줄의 설정을 차트로 불러오는 버튼을 둡니다.
+                self._install_apply_button(row, entry)
             if scroll_bottom and records:
                 self.history_table.scrollToBottom()
+
+        def _install_apply_button(self, row: int, entry: Dict[str, Any]) -> None:
+            """이력 한 줄의 판정 설정을 차트로 보내는 버튼."""
+            scoring = dict((entry.get("config") or {}).get("regime_scoring") or {})
+            if not scoring:
+                return
+            button = QtWidgets.QPushButton("설정 적용")
+            button.setObjectName("HistoryApply")
+            button.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+            button.setToolTip(
+                "이 줄을 만든 판정 설정을 차트 패널에 넣습니다.\n"
+                "차트가 닫혀 있으면 열면서 넣습니다.")
+            button.clicked.connect(
+                lambda _checked=False, values=scoring: self._apply_history_scoring(values))
+            self.history_table.setCellWidget(row, 2, button)
+
+        def _apply_history_scoring(self, scoring: Dict[str, Any]) -> None:
+            from regime_scoring import scoring_config
+
+            merged = scoring_config({"regime_scoring": dict(scoring)})
+            self._update_regime_draft(merged)
+            self._open_regime_chart()
+            window = self._chart_window
+            if window is not None and hasattr(window, "apply_scoring"):
+                window.apply_scoring(merged)
 
         @staticmethod
         def _metric_text(result: Dict[str, Any], key: str, suffix: str = "%") -> str:

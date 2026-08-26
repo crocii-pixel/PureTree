@@ -90,7 +90,7 @@ def _text(table, row, col):
 def test_columns_are_ordered_and_labelled_by_currency():
     dashboard = _dashboard()
     assert dashboard.COLUMNS == [
-        "종목", "현재가(KRW)", "현재가(USD)", "매수기준(USD)",
+        "종목", "현재가(KRW)", "기준가(USD)", "매수기준(USD)",
         "매도기준(USD)", "보유수량", "평가금액(KRW)",
         "적용 K", "진입 MA", "당일 상태",
     ]
@@ -249,7 +249,9 @@ def test_column_units_follow_the_signal_source():
     assert dashboard.signal_unit == "KRW"
     headers = [dashboard.table.horizontalHeaderItem(c).text()
                for c in range(dashboard.table.columnCount())]
-    assert headers[2] == "현재가(KRW)"
+    # 신호 기준이 업비트면 두 번째 값도 원화입니다. 다만 이름은 "기준가" 라야
+    # 첫 열(거래소 현재가)과 구별됩니다 - 값이 같아도 출처가 다릅니다.
+    assert headers[2] == "기준가(KRW)"
     assert headers[3] == "매수기준(KRW)"
     assert headers[4] == "매도기준(KRW)"
     assert "USD" not in " ".join(headers)

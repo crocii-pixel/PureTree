@@ -254,7 +254,9 @@ class Dashboard(QWidget):
     #: 주문은 항상 원화로 나가지만 판정 통화는 신호 기준에 따라 달라집니다.
     #: 컬럼 제목이 실제 값의 통화와 어긋나면 숫자를 잘못 읽게 되므로 제목을
     #: 신호 기준에서 만들어 붙입니다.
-    COLUMN_TEMPLATE = ("종목", "현재가(KRW)", "현재가({unit})", "매수기준({unit})",
+    #: 두 번째 현재가는 **신호 시장**의 값입니다. 둘 다 "현재가"로 적으면
+    #: 같은 값이 두 번 나온 것처럼 읽혀 어느 쪽이 판정 기준인지 알 수 없습니다.
+    COLUMN_TEMPLATE = ("종목", "현재가(KRW)", "기준가({unit})", "매수기준({unit})",
                        "매도기준({unit})", "보유수량", "평가금액(KRW)",
                        "적용 K", "진입 MA", "당일 상태")
     #: 값을 가운데로 정렬할 컬럼 (숫자는 오른쪽, 나머지는 왼쪽)
@@ -278,13 +280,14 @@ class Dashboard(QWidget):
         self._log_revision = -1        # 마지막으로 화면에 그린 로그 리비전
 
         self.setWindowTitle("QuantBot")
-        self.resize(930, 660)
+        # 열이 늘어 930 으로는 표가 좁습니다. 1/4 넓혔습니다.
+        self.resize(1160, 660)
         if ICO_PATH.exists():
             self.setWindowIcon(QIcon(str(ICO_PATH)))
 
         self._build_ui()
         # 종목 목록과 로그가 세로로 쌓이므로 화면 높이를 끝까지 씁니다.
-        ui_theme.fit_available_height(self, 930)
+        ui_theme.fit_available_height(self, 1160)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
@@ -402,6 +405,8 @@ class Dashboard(QWidget):
         if getattr(self, "_config_window", None) is None:
             self._config_window = build_config_window()
         self._config_window.show()
+        # 대시보드를 보면서 고치는 창이라 오른쪽에 붙여 엽니다.
+        ui_theme.dock_right_of(self._config_window, self.dashboard)
         self._config_window.raise_()
         self._config_window.activateWindow()
 

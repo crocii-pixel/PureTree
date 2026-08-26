@@ -20,6 +20,36 @@ TOP_GAP = 8
 BOTTOM_GAP = 16
 
 
+def dock_right_of(widget: Any, anchor: Any, gap: int = 8) -> None:
+    """
+    ``widget`` 을 ``anchor`` 창 **오른쪽에 붙여** 놓습니다.
+
+    설정·차트처럼 원래 창을 보면서 같이 쓰는 창은 겹쳐 뜨면 매번 손으로
+    옮겨야 합니다. 화면 오른쪽에 자리가 모자라면 왼쪽으로, 그것도 안 되면
+    화면 안으로 밀어 넣습니다.
+    """
+    try:
+        if anchor is None or not anchor.isVisible():
+            return
+        screen = widget.screen() or anchor.screen()
+        if screen is None:
+            return
+        area = screen.availableGeometry()
+        frame = anchor.frameGeometry()
+        width = widget.frameGeometry().width() or widget.width()
+        left = frame.right() + gap
+        if left + width > area.right():
+            # 오른쪽이 모자라면 왼쪽에 붙여 봅니다.
+            left = frame.left() - gap - width
+        left = max(area.left(), min(left, area.right() - width + 1))
+        chrome = widget.frameGeometry().height() - widget.geometry().height()
+        top = max(area.top(), min(anchor.y(), area.bottom() - widget.height()
+                                  - max(chrome, 0)))
+        widget.move(left, top)
+    except Exception:
+        return
+
+
 def fit_available_height(widget: Any, preferred_width: int | None = None) -> None:
     """
     창을 현재 화면의 사용 가능한 **높이** 전체로 늘립니다.
