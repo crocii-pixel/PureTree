@@ -1,7 +1,7 @@
 """Period-rebalancing backtest: confirmed BTC bull + defensive ATR breakout."""
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -56,6 +56,26 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
         "판정 준비": "cash",
     }
     defensive_multiple = float(scoring.get("defensive_atr_multiple", 2.0))
+    # 계단식 매설: [[깊이(ATR), 비중], ...] 을 얕은 곳부터.
+    # 비어 있으면 기존처럼 defensive_atr_multiple 한 곳에만 겁니다.
+    # 얕은 관문이 채워지면 그 종목은 다음(더 깊은) 관문만 남겨 두므로,
+    # 더 내려갈수록 자동으로 물타기가 되고 평단가가 낮아집니다.
+    ladder_raw = scoring.get("defensive_ladder") or config.get("defensive_ladder")
+    ladder: List[Tuple[float, float]] = []
+    if ladder_raw:
+        for item in ladder_raw:
+            try:
+                depth, weight = float(item[0]), float(item[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if depth > 0 and weight > 0:
+                ladder.append((depth, weight))
+        ladder.sort(key=lambda pair: pair[0])
+        total_weight = sum(weight for _d, weight in ladder)
+        if total_weight > 0:
+            ladder = [(depth, weight / total_weight) for depth, weight in ladder]
+    if not ladder:
+        ladder = [(defensive_multiple, 1.0)]
     defensive_entry_method = str(
         scoring.get("defensive_entry_method", "atr")).lower()
     if defensive_entry_method not in {"atr", "lower_channel"}:
@@ -93,6 +113,9 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
     # 장세 전환(strategy_switch)과 구간 종료(end)가 여기 들어갑니다.
     # 이걸 안 세면 "체결 8, 익절 5, 손절 0" 처럼 숫자가 맞지 않아 보입니다.
     probe_forced_exits = 0
+    #: 종목별로 이미 채워진 관문 번호. 포지션이 정리되면 비웁니다.
+    filled_rungs: Dict[str, set] = {}
+    rung_fills = [0] * len(ladder)
     locked_cash_ratios = []
     previous_strategy = None
 
@@ -158,6 +181,7 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
             units, cost = float(pos["units"]), float(pos["cost"])
             if probe_units > 0:
                 probe_forced_exits += 1
+            filled_rungs.pop(ticker, None)
         r, exact = row_at_or_before(ticker, date)
         price_column = "close" if close or not exact else "open"
         raw_price = float(fill_price) if fill_price is not None else float(r[price_column])
@@ -237,6 +261,7 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
         if bucket == "probe_units":
             pos["probe_entry"] = 0.0
             pos["probe_atr"] = 0.0
+            filled_rungs.pop(ticker, None)
         if pos["units"] <= 1e-12:
             positions.pop(ticker, None)
         return True
@@ -395,56 +420,57 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
                             or not np.isfinite(signal_atr) or signal_open <= 0
                             or signal_atr <= 0):
                         continue
-                    if defensive_entry_method == "lower_channel":
-                        channel = reservation_channels.get(ticker)
-                        lower_target = (float(channel.get(date, np.nan))
-                                        if channel is not None else np.nan)
-                    else:
-                        lower_target = signal_open - defensive_multiple * signal_atr
-                    if lower_target <= 0:
-                        continue
-                    if not np.isfinite(lower_target):
-                        continue
-                    lower_ratio = lower_target / signal_open
-                    raw_entry = max(1e-12, float(r["open"]) * lower_ratio)
-                    probe_target = plan["target_units"] * probe_fraction
-                    held_probe = positions.get(ticker, {}).get("probe_units", 0.0)
-                    if held_probe >= probe_target * refill:
-                        continue
-                    desired_budget = max(
-                        0.0, (probe_target - held_probe) * raw_entry *
-                        (1 + slippage) * (1 + buy_fee))
-                    available = (max(0.0, cash - locked_cash) if ticker == "BTC"
-                                 else max(0.0, cash - btc_reserved - locked_cash))
-                    budget = min(desired_budget, available)
-                    if budget <= 0:
-                        continue
-
-                    # The local target is executable in KRW.  Cancel at the
-                    # session open if it is already within the configured ATR
-                    # buffer; otherwise an intraday approach cancels only when
-                    # the lower order was not hit in that same daily candle.
+                    # 돌파선 근접 취소는 종목 단위 판단이라 관문마다 다시
+                    # 계산할 이유가 없습니다.
                     local_atr = max(float(r["N"]), 1e-12)
                     near_level = float(r[plan["target_col"]]) - (
                         cancel_buffer_atr * local_atr)
-                    near_at_open = float(r["open"]) >= near_level
+                    if float(r["open"]) >= near_level:
+                        continue
                     near_intraday = float(r["high"]) >= near_level
-                    lower_hit = signal_low <= lower_target
-                    if near_at_open:
-                        continue
-                    reservation_placed += 1
-                    if near_intraday and not lower_hit:
-                        reservation_cancelled += 1
-                        continue
-                    if near_intraday and lower_hit:
-                        reservation_ambiguous += 1
-                    open_reservations[ticker] = {
-                        "budget": budget, "raw_entry": raw_entry,
-                        "lower_hit": lower_hit, "local_atr": local_atr,
-                    }
-                    locked_cash += budget
-                    if ticker == "BTC":
-                        btc_reserved = max(0.0, btc_reserved - budget)
+
+                    done = filled_rungs.get(ticker, set())
+                    probe_target = plan["target_units"] * probe_fraction
+                    for rung, (depth, weight) in enumerate(ladder):
+                        if rung in done:
+                            continue
+                        if defensive_entry_method == "lower_channel":
+                            channel = reservation_channels.get(ticker)
+                            lower_target = (float(channel.get(date, np.nan))
+                                            if channel is not None else np.nan)
+                        else:
+                            lower_target = signal_open - depth * signal_atr
+                        if not np.isfinite(lower_target) or lower_target <= 0:
+                            continue
+                        lower_ratio = lower_target / signal_open
+                        raw_entry = max(1e-12, float(r["open"]) * lower_ratio)
+                        rung_units = probe_target * weight
+                        if rung_units <= 0:
+                            continue
+                        desired_budget = max(
+                            0.0, rung_units * raw_entry
+                            * (1 + slippage) * (1 + buy_fee))
+                        available = (max(0.0, cash - locked_cash) if ticker == "BTC"
+                                     else max(0.0, cash - btc_reserved - locked_cash))
+                        budget = min(desired_budget, available)
+                        if budget <= 0:
+                            continue
+                        lower_hit = signal_low <= lower_target
+                        reservation_placed += 1
+                        if near_intraday and not lower_hit:
+                            reservation_cancelled += 1
+                            continue
+                        if near_intraday and lower_hit:
+                            reservation_ambiguous += 1
+                        open_reservations[(ticker, rung)] = {
+                            "budget": budget, "raw_entry": raw_entry,
+                            "lower_hit": lower_hit, "local_atr": local_atr,
+                        }
+                        locked_cash += budget
+                        if ticker == "BTC":
+                            btc_reserved = max(0.0, btc_reserved - budget)
+                        if defensive_entry_method == "lower_channel":
+                            break      # 채널선은 관문이 하나뿐입니다
 
             if opening_equity > 0:
                 locked_cash_ratios.append(locked_cash / opening_equity)
@@ -452,7 +478,10 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
             # A same-candle lower hit and later rally is modelled downside-first:
             # the reservation fills before any breakout order can use that cash.
             filled_reservations = set()
-            for ticker, reservation in open_reservations.items():
+            # 깊은 관문이 먼저 체결돼 현금을 다 쓰면 얕은 관문이 남습니다.
+            # 실제로는 얕은 곳을 먼저 지나므로 얕은 순서대로 채웁니다.
+            for (ticker, rung), reservation in sorted(
+                    open_reservations.items(), key=lambda kv: kv[0][1]):
                 if not reservation["lower_hit"]:
                     continue
                 budget = min(float(reservation["budget"]), cash)
@@ -466,6 +495,8 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
                 cash -= budget
                 buy_orders += 1
                 lower_buy_orders += 1
+                rung_fills[rung] += 1
+                filled_rungs.setdefault(ticker, set()).add(rung)
                 filled_reservations.add(ticker)
 
             for ticker in active_names:
@@ -500,7 +531,7 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
 
             reservation_expired += sum(
                 ticker not in filled_reservations
-                for ticker in open_reservations)
+                for ticker, _rung in open_reservations)
 
         holdings = sum(p["units"] * mark_price(t, date, "close")
                        for t, p in positions.items())
@@ -565,6 +596,8 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
         "atr_probe_take_profit_exits": probe_take_profits,
         "atr_probe_stop_exits": probe_stops,
         "atr_probe_forced_exits": probe_forced_exits,
+        "atr_ladder": [[round(d, 2), round(w, 4)] for d, w in ladder],
+        "atr_ladder_fills": list(rung_fills),
         "atr_probe_open_at_end": sum(
             1 for p in positions.values() if float(p.get("probe_units", 0.0)) > 0),
         "atr_locked_cash_average_pct": round(

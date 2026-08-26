@@ -506,3 +506,62 @@ def test_strategy_switch_is_reported_as_a_forced_probe_exit():
     assert (result["atr_probe_take_profit_exits"]
             + result["atr_probe_stop_exits"]
             + result["atr_probe_forced_exits"]) == result["atr_lower_buys"]
+
+
+def test_ladder_places_one_reservation_per_unfilled_rung():
+    """계단식 매설: 얕은 관문이 채워지면 그 종목은 다음 관문만 남습니다."""
+    data = {"BTC": _defensive_frame(ma_ok=False)}
+    ctx = pd.DataFrame({
+        "explosive": False, "bull": False, "regime_label": "하락",
+    }, index=data["BTC"].index)
+
+    single = run_period_backtest(
+        _defensive_config(defensive_atr_multiple=2.0), data, ctx)
+    ladder = run_period_backtest(
+        _defensive_config(defensive_ladder=[[1, 1], [2, 1], [3, 1]]), data, ctx)
+
+    # 관문이 셋이면 체결 기회도 늘어납니다.
+    assert ladder["atr_ladder"] == [[1.0, 0.3333], [2.0, 0.3333], [3.0, 0.3333]]
+    assert len(ladder["atr_ladder_fills"]) == 3
+    assert sum(ladder["atr_ladder_fills"]) == ladder["atr_lower_buys"]
+    assert ladder["atr_lower_buys"] > single["atr_lower_buys"]
+    # 얕은 관문일수록 자주 닿습니다.
+    fills = ladder["atr_ladder_fills"]
+    assert fills[0] >= fills[1] >= fills[2]
+    # 사다리에서는 여러 관문이 채워진 뒤 **한 번에** 청산됩니다.
+    # 따라서 체결 >= 청산이고, 등호는 관문이 하나일 때만 성립합니다.
+    exits = (ladder["atr_probe_take_profit_exits"]
+             + ladder["atr_probe_stop_exits"]
+             + ladder["atr_probe_forced_exits"])
+    assert 0 < exits <= ladder["atr_lower_buys"]
+    assert ladder["atr_probe_open_at_end"] == 0
+
+
+def test_no_ladder_config_keeps_the_single_rung_behaviour():
+    """사다리를 안 쓰면 예전과 완전히 같아야 합니다."""
+    data = {"BTC": _defensive_frame(ma_ok=False)}
+    ctx = pd.DataFrame({
+        "explosive": False, "bull": False, "regime_label": "하락",
+    }, index=data["BTC"].index)
+
+    plain = run_period_backtest(
+        _defensive_config(defensive_atr_multiple=2.0), data, ctx)
+    explicit = run_period_backtest(
+        _defensive_config(defensive_atr_multiple=2.0,
+                          defensive_ladder=[[2.0, 1.0]]), data, ctx)
+
+    assert plain["atr_ladder"] == [[2.0, 1.0]]
+    assert plain["최종자산"] == explicit["최종자산"]
+    assert plain["atr_lower_buys"] == explicit["atr_lower_buys"]
+
+
+def test_atr_depth_accepts_free_values_not_just_2_4_6_8():
+    """예전에는 2/4/6/8 중 가까운 값으로 붙어 1.5 를 넣어도 2 가 됐습니다."""
+    from regime_scoring import scoring_config
+
+    for value in (0.5, 1.0, 1.5, 2.5, 3.7):
+        cfg = scoring_config({"regime_scoring": {"defensive_atr_multiple": value}})
+        assert cfg["defensive_atr_multiple"] == pytest.approx(value)
+    # 범위를 벗어나면 잘립니다.
+    assert scoring_config({"regime_scoring": {"defensive_atr_multiple": 100}}
+                          )["defensive_atr_multiple"] == 20.0

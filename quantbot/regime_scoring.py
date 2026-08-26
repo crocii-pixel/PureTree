@@ -139,9 +139,11 @@ def scoring_config(config: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]
         key = f"{phase}_strategy"
         if result.get(key) not in STRATEGY_IDS:
             result[key] = DEFAULT_REGIME_SCORE_CONFIG[key]
-    multiple = float(result.get("defensive_atr_multiple", 2.0) or 2.0)
-    result["defensive_atr_multiple"] = min((2.0, 4.0, 6.0, 8.0),
-                                              key=lambda value: abs(value - multiple))
+    # 예전에는 2/4/6/8 중 가까운 값으로 붙였습니다. 실측해 보니 깊이별 도달률이
+    # 1 ATR 연 28회 / 2 ATR 5.8회 / 4 ATR 1.0회로 급격히 갈려, 0.5 단위 조절이
+    # 필요합니다.
+    result["defensive_atr_multiple"] = float(np.clip(
+        float(result.get("defensive_atr_multiple", 2.0) or 2.0), 0.1, 20.0))
     if result.get("defensive_entry_method") not in {"atr", "lower_channel"}:
         result["defensive_entry_method"] = "atr"
     result["defensive_probe_fraction"] = float(np.clip(

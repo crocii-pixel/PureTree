@@ -1315,11 +1315,17 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
                     combo.addItem(text_label, value)
                 self.inputs[key] = combo
                 strategy_form.addRow(label, combo)
-            atr_combo = QtWidgets.QComboBox()
-            for multiple in (2.0, 4.0, 6.0, 8.0):
-                atr_combo.addItem(f"{multiple:g} ATR", multiple)
-            self.inputs["defensive_atr_multiple"] = atr_combo
-            strategy_form.addRow("ATR 하단 거리", atr_combo)
+            atr_depth = QtWidgets.QDoubleSpinBox()
+            atr_depth.setRange(0.1, 20.0)
+            atr_depth.setSingleStep(0.5)
+            atr_depth.setDecimals(1)
+            atr_depth.setSuffix(" ATR")
+            atr_depth.setToolTip(
+                "시가에서 이만큼 아래에 지정가를 겁니다. 깊을수록 덜 닿습니다.\n"
+                "실측(최근 1년, 안정·하락 장세) 도달 횟수:\n"
+                "  1 ATR 연 28회 · 2 ATR 5.8회 · 3 ATR 1.9회 · 4 ATR 1.0회")
+            self.inputs["defensive_atr_multiple"] = atr_depth
+            strategy_form.addRow("ATR 하단 거리", atr_depth)
             entry_method = QtWidgets.QComboBox()
             entry_method.addItem("ATR 하단", "atr")
             entry_method.addItem("하방 채널선 돌파", "lower_channel")
