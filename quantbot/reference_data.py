@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Optional
+from typing import Any, Optional, Tuple
 
 import pandas as pd
 import requests
@@ -157,6 +157,99 @@ def fetch_global_price(ticker: str, timeout: float = 3.0) -> Optional[float]:
     except Exception as exc:
         logger.warning("[글로벌 BTC 현재가] Bitstamp 조회 실패: %s", exc)
         return None
+
+
+#: 고를 수 있는 **종목 매매 신호** 기준.
+#:
+#: 조건은 두 가지입니다.
+#:   - 일봉 경계가 09:00 KST(=00:00 UTC)   : 서로, 그리고 정본과 정렬됨
+#:   - 전 종목을 한 곳에서 커버            : 종목마다 소스가 갈리면 봉 규약이
+#:     달라져 일부 종목만 하루 늦게 판정되는 사고가 납니다(실제 발생)
+#:
+#: 그래서 제외한 것들:
+#:   빗썸   경계 00:00 + 공개 API 200개 제한 -> 백테스트 검증 불가
+#:   코인원 400일 -> 검증 구간 1년
+#:   Bitstamp BTC 만 있어 알트 7종이 조용히 바이낸스로 대체됨
+#:
+#: 장세·시대 판정용 BTC 는 이 선택과 무관하게 **글로벌 정본(2011~)** 고정입니다.
+REFERENCE_SOURCES: Tuple[Tuple[str, str], ...] = (
+    ("upbit", "업비트 (원화)"),
+    ("binance", "바이낸스 (USDT)"),
+)
+
+#: 원화로 값이 매겨지는 소스.  체결 거래소와 통화가 같아 목표가를 그대로
+#: 옮길 수 있습니다(같은 순간 거래소 간 가격차 실측 0.066%).
+KRW_SOURCES = frozenset({"upbit"})
+
+DEFAULT_SOURCE = "upbit"
+
+
+def normalize_source(value: Any) -> str:
+    """
+    설정값을 유효한 소스 이름으로 정리합니다.
+
+    옛 값 이관:
+      "bitstamp"/"global" 은 실제로는 대부분 바이낸스였으므로 바이낸스로,
+      "local"(거래소 자체 일봉)은 더 이상 지원하지 않아 기본값으로 보냅니다.
+    """
+    raw = str(value or "").strip().lower()
+    if raw in {name for name, _ in REFERENCE_SOURCES}:
+        return raw
+    if raw in {"bitstamp", "global", "binance_global"}:
+        return "binance"
+    return DEFAULT_SOURCE
+
+
+def fetch_upbit_daily(ticker: str, limit: int = 100,
+                      timeout: float = 8.0) -> Optional[pd.DataFrame]:
+    """업비트 원화 일봉.  진행 중인 오늘 봉을 마지막 행으로 포함합니다."""
+    ticker = str(ticker).split("-")[-1].upper()
+    if ticker in {"KRW"}:
+        return None
+    try:
+        import pyupbit
+
+        frame = pyupbit.get_ohlcv(
+            f"KRW-{ticker}", interval="day", count=max(22, int(limit)))
+        if frame is None or frame.empty:
+            return None
+        return frame[["open", "high", "low", "close", "volume"]].astype(float)
+    except Exception as exc:
+        logger.warning("[업비트 기준신호] %s 일봉 조회 실패: %s", ticker, exc)
+        return None
+
+
+def fetch_upbit_price(ticker: str, timeout: float = 3.0) -> Optional[float]:
+    """업비트 원화 현재가."""
+    ticker = str(ticker).split("-")[-1].upper()
+    if ticker in {"KRW"}:
+        return None
+    try:
+        import pyupbit
+
+        price = pyupbit.get_current_price(f"KRW-{ticker}")
+        return float(price) if price else None
+    except Exception as exc:
+        logger.warning("[업비트 현재가] %s 조회 실패: %s", ticker, exc)
+        return None
+
+
+def fetch_reference_daily(ticker: str, source: str = DEFAULT_SOURCE,
+                          limit: int = 100) -> Optional[pd.DataFrame]:
+    """선택한 신호 기준의 일봉."""
+    source = normalize_source(source)
+    if source == "upbit":
+        return fetch_upbit_daily(ticker, limit=limit)
+    return fetch_binance_daily(ticker, limit=limit)
+
+
+def fetch_reference_price(ticker: str,
+                          source: str = DEFAULT_SOURCE) -> Optional[float]:
+    """선택한 신호 기준의 현재가."""
+    source = normalize_source(source)
+    if source == "upbit":
+        return fetch_upbit_price(ticker)
+    return fetch_binance_price(ticker)
 
 
 def fetch_binance_history(ticker: str, start: str = "2017-01-01",

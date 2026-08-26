@@ -219,3 +219,47 @@ def test_breakout_colour_follows_the_live_price():
     assert broke.foreground().color().name().lower() ==         ui_theme.COLORS["info"].lower()
     assert "매수 조건 성립" in broke.toolTip()
     dashboard.close()
+
+
+def test_column_units_follow_the_signal_source():
+    """원화 기준을 쓰면 컬럼 제목도 (KRW) 여야 합니다.
+
+    제목이 실제 값의 통화와 어긋나면 숫자를 잘못 읽습니다.
+    """
+    gui_manager = pytest.importorskip("gui_manager")
+    global _APP
+    try:
+        from PyQt6 import QtWidgets
+    except ImportError:
+        from PyQt5 import QtWidgets
+    _APP = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    bot = _Bot()
+    bot.signal_same_currency = True          # 업비트 기준
+    bot.signal_targets = {"BTC": 158_400_000, "DOGE": 312, "XRP": 2_011}
+    bot.exit_ma_values = {"BTC": 152_000_000, "DOGE": 298, "XRP": 2_050}
+    dashboard = gui_manager.Dashboard(bot, gui_manager.LogBuffer())
+    dashboard.timer.stop()
+    dashboard.set_price("BTC", 158_120_000)
+    dashboard.set_reference_price("BTC", 158_120_000)
+    dashboard.refresh()
+
+    assert dashboard.signal_unit == "KRW"
+    headers = [dashboard.table.horizontalHeaderItem(c).text()
+               for c in range(dashboard.table.columnCount())]
+    assert headers[2] == "현재가(KRW)"
+    assert headers[3] == "매수기준(KRW)"
+    assert headers[4] == "매도기준(KRW)"
+    assert "USD" not in " ".join(headers)
+    # 원화는 소수점 없이
+    assert _text(dashboard.table, 0, 3) == "158,400,000"
+    dashboard.close()
+
+
+def test_usd_source_keeps_the_usd_labels():
+    dashboard = _dashboard()                 # _Bot 기본 = 달러 기준
+    assert dashboard.signal_unit == "USD"
+    headers = [dashboard.table.horizontalHeaderItem(c).text()
+               for c in range(dashboard.table.columnCount())]
+    assert headers[3] == "매수기준(USD)"
+    dashboard.close()

@@ -294,7 +294,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 
     # 진입 방향(MA)과 동적 K의 기준 시장. local은 실제 거래소 일봉,
     # binance는 Binance USDT 일봉을 공통 기준으로 쓰되 목표가 범위와 ATR은 현지 KRW를 씁니다.
-    "signal_reference": "binance",
+    # 신호 기준. upbit / binance / bitstamp 중 선택.
+    # 셋 다 일봉 경계가 09:00 KST 로 같아 서로 정렬됩니다.
+    "signal_reference": "upbit",
 
     # 공개 WebSocket 가격 캐시. 화면과 돌파 감시의 순차 REST 지연을 줄이며,
     # 스트림이 끊기거나 오래되면 기존 REST 조회로 자동 대체합니다.
@@ -374,6 +376,19 @@ def load_config(path: Optional[Path] = None, create_if_missing: bool = True) -> 
     try:
         with open(path, "r", encoding="utf-8") as f:
             raw = json.load(f)
+        # 신호 기준을 **저장 시점에** 유효한 값으로 맞춥니다. 런타임만 정규화하면
+        # 설정 파일과 설정 창이 서로 다른 값을 보여 주게 됩니다.
+        #   local    거래소 자체 일봉 - 빗썸 경계는 200일 제한이라 검증 불가
+        #   bitstamp BTC 만 있어 알트가 조용히 바이낸스로 대체되던 혼합 모드
+        if "signal_reference" in raw:
+            from reference_data import normalize_source
+
+            before = str(raw.get("signal_reference"))
+            after = normalize_source(before)
+            if after != before:
+                raw["signal_reference"] = after
+                logger.warning("[설정 이관] signal_reference: %s -> %s",
+                               before, after)
         if "fixed_tickers" not in raw:
             legacy = [str(t).upper() for t in (raw.get("tickers") or ["BTC", "ETH"])]
             fixed = [t for t in ("BTC", "ETH") if t in legacy]

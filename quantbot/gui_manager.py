@@ -251,18 +251,27 @@ def _card(title: str):
 class Dashboard(QWidget):
     """봇 상태를 1초 주기로 갱신하는 미니 대시보드 창"""
 
-    #: 판정은 글로벌 시세(USD)로 하고 주문만 KRW로 나가므로, 현재가를 두 통화로
-    #: 나란히 놓고 매수·매도 기준은 판정 통화인 USD로 통일합니다.
-    COLUMNS = ["종목", "현재가(KRW)", "현재가(USD)", "매수기준(USD)",
-               "매도기준(USD)", "적용 K", "진입 MA", "당일 상태"]
+    #: 주문은 항상 원화로 나가지만 판정 통화는 신호 기준에 따라 달라집니다.
+    #: 컬럼 제목이 실제 값의 통화와 어긋나면 숫자를 잘못 읽게 되므로 제목을
+    #: 신호 기준에서 만들어 붙입니다.
+    COLUMN_TEMPLATE = ("종목", "현재가(KRW)", "현재가({unit})", "매수기준({unit})",
+                       "매도기준({unit})", "적용 K", "진입 MA", "당일 상태")
     #: 값을 가운데로 정렬할 컬럼 (숫자는 오른쪽, 나머지는 왼쪽)
     CENTERED_COLUMNS = (5, 6, 7)
     NUMERIC_COLUMNS = (1, 2, 3, 4)
+
+    @property
+    def COLUMNS(self):
+        return [name.format(unit=self.signal_unit)
+                for name in self.COLUMN_TEMPLATE]
 
     def __init__(self, bot: Any, log_buffer: LogBuffer):
         super().__init__()
         self.bot = bot
         self.log_buffer = log_buffer
+        #: 신호 기준의 표시 통화. 업비트면 원화, 바이낸스면 달러입니다.
+        self.signal_unit = "KRW" if getattr(
+            bot, "signal_same_currency", False) else "USD"
         self._price_cache: Dict[str, float] = {}
         self._usd_cache: Dict[str, float] = {}
         self._log_revision = -1        # 마지막으로 화면에 그린 로그 리비전
@@ -411,19 +420,20 @@ class Dashboard(QWidget):
         """신호 시장(글로벌 USD) 현재가를 공유"""
         self._usd_cache[ticker] = price
 
-    @staticmethod
-    def _usd_text(value: float) -> str:
+    def _usd_text(self, value: float) -> str:
         """
-        USD 표기. 단위는 컬럼 제목이 이미 말해 주므로 숫자만 씁니다.
+        신호 통화 표기. 단위는 컬럼 제목이 말해 주므로 숫자만 씁니다.
 
-        기본은 소수점 2자리입니다. 다만 1달러 미만 종목까지 2자리로 자르면
-        도지(0.2185)와 그 매수기준(0.2241)이 **둘 다 "0.22"** 로 찍혀서 돌파
-        여부를 눈으로 확인할 수 없습니다. 그래서 1달러 미만은 유효숫자를
-        남깁니다.
+        원화는 소수점이 의미 없어 정수로 씁니다. 달러는 소수점 2자리가 기본인데,
+        1달러 미만 종목까지 2자리로 자르면 도지(0.2185)와 그 매수기준(0.2241)이
+        **둘 다 "0.22"** 로 찍혀 돌파 여부를 눈으로 확인할 수 없습니다.
+        그래서 1달러 미만은 유효숫자를 남깁니다.
         """
         if not value:
             return "—"
         value = float(value)
+        if self.signal_unit == "KRW":
+            return f"{value:,.0f}"
         if abs(value) >= 1:
             return f"{value:,.2f}"
         if abs(value) >= 0.01:
@@ -514,7 +524,8 @@ class Dashboard(QWidget):
                 cells[0] = (f"{ticker}  {name}", ui_theme.COLORS["text"], False)
 
             krw_target = self.bot.target_prices.get(ticker, 0.0)
-            unit = "글로벌 USD" if signal_source == "global" else "거래소 KRW"
+            unit = (f"신호 {self.signal_unit}" if signal_source == "global"
+                    else "거래소 KRW")
             buy_tip = (f"돌파 매수 판정선 · {unit} 기준\n"
                        f"실제 주문 목표가 {krw_target:,.0f} KRW")
             if broke_out:

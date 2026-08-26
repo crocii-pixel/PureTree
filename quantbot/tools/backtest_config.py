@@ -239,7 +239,10 @@ def run_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
     sizing_cap = max(0.0, float(config.get("sizing_equity_cap_krw", 0.0)))
     refill_threshold = max(
         0.0, min(1.0, float(config.get("position_refill_threshold", 0.95))))
-    use_reference = str(config.get("signal_reference", "binance")).lower() == "binance"
+    # 종목 프레임은 업비트입니다. 신호 기준이 업비트면 **그 프레임 자체**가
+    # 신호이므로 참조를 덧붙이지 않습니다(판정과 체결이 같은 창).
+    from reference_data import normalize_source
+    use_reference = normalize_source(config.get("signal_reference")) == "binance"
     # "local"  : 현지 시가·전일범위 + 글로벌 K (기본, 지금까지의 동작)
     # "global" : 시가·전일범위·K 를 모두 신호 시장에서 (경계가 09:00 KST 로 통일)
     breakout_reference = str(config.get("breakout_reference", "local")).lower()
@@ -562,7 +565,10 @@ def prepare_data(config: Dict[str, Any], refresh: bool = False):
     data: Dict[str, pd.DataFrame] = {}
     missing: List[str] = []
     references: Dict[str, pd.DataFrame] = {}
-    use_reference = str(config.get("signal_reference", "binance")).lower() == "binance"
+    # 종목 프레임은 업비트입니다. 신호 기준이 업비트면 **그 프레임 자체**가
+    # 신호이므로 참조를 덧붙이지 않습니다(판정과 체결이 같은 창).
+    from reference_data import normalize_source
+    use_reference = normalize_source(config.get("signal_reference")) == "binance"
     for ticker in tickers:
         raw = fetch_upbit(ticker, refresh=refresh)
         if raw is None or len(raw) < 200:

@@ -1829,7 +1829,7 @@ class TestPositionSizing:
         assert config_manager.DEFAULT_CONFIG["btc_min_weight"] == 0.0
         assert config_manager.DEFAULT_CONFIG["position_refill_threshold"] == 0.95
         assert config_manager.DEFAULT_CONFIG["sizing_equity_cap_krw"] == 0.0
-        assert config_manager.DEFAULT_CONFIG["signal_reference"] == "binance"
+        assert config_manager.DEFAULT_CONFIG["signal_reference"] == "upbit"
         assert config_manager.DEFAULT_CONFIG["realtime_price_stream"] is True
 
         bot = self._make_bot(tmp_path)
@@ -2006,17 +2006,48 @@ class TestPositionSizing:
         bot.price_stream = Cache()
         assert bot.current_price("BTC") == 12_345.0
 
-    def test_binance_reference_sets_common_k_and_ma(self, tmp_path, monkeypatch):
+    def test_reference_source_sets_common_k_and_ma(self, tmp_path, monkeypatch):
         import main
 
         bot = self._make_bot(tmp_path, signal_reference="binance")
         reference = make_ohlcv(100, base_price=500.0)
-        monkeypatch.setattr(main, "fetch_binance_daily", lambda *args, **kwargs: reference)
+        monkeypatch.setattr(main, "fetch_reference_daily",
+                            lambda *args, **kwargs: reference)
         bot.update_daily_settings(notify=False)
 
         assert bot.signal_sources == {"BTC": "global", "ETH": "global"}
         expected = bot.strategy_engine.calculate_noise_ratio(reference, 20)
         assert bot.effective_ks["BTC"] == pytest.approx(expected)
+
+    def test_krw_source_carries_the_target_price_across_unchanged(
+            self, tmp_path, monkeypatch):
+        """업비트 기준은 체결 통화가 같으므로 목표가를 그대로 옮깁니다.
+
+        달러 기준은 환산이 필요해 목표가의 시가·전일범위를 현지에서 가져오지만,
+        원화 기준은 같은 순간 가격이 사실상 같아(실측 0.066%) 그럴 이유가
+        없습니다. 여기서 두 경로가 뒤섞이지 않도록 못 박습니다.
+        """
+        import main
+
+        reference = make_ohlcv(100, base_price=500.0)
+        krw = self._make_bot(tmp_path / "krw", signal_reference="upbit")
+        usd = self._make_bot(tmp_path / "usd", signal_reference="binance")
+        assert krw.signal_same_currency is True
+        assert usd.signal_same_currency is False
+
+        monkeypatch.setattr(main, "fetch_reference_daily",
+                            lambda *args, **kwargs: reference)
+        for bot in (krw, usd):
+            bot.update_daily_settings(notify=False)
+
+        expected = krw.strategy_engine.calculate_target_price(
+            reference, k=krw.effective_ks["BTC"], use_dynamic_k=False)
+        # 원화 기준: 신호 목표가 == 주문 목표가
+        assert krw.target_prices["BTC"] == pytest.approx(expected)
+        assert krw.signal_targets["BTC"] == pytest.approx(expected)
+        # 달러 기준: 주문 목표가는 현지 프레임에서 나오므로 달라야 합니다
+        assert usd.signal_targets["BTC"] == pytest.approx(expected)
+        assert usd.target_prices["BTC"] != pytest.approx(expected)
 
     def test_missing_global_reference_disables_ticker_instead_of_local_fallback(
             self, tmp_path, monkeypatch):
@@ -2025,7 +2056,8 @@ class TestPositionSizing:
         bot = self._make_bot(tmp_path, signal_reference="binance")
         bot.exit_ma_values.update({"BTC": 123.0, "ETH": 456.0})
         bot.daily_exit_due.update({"BTC": False, "ETH": True})
-        monkeypatch.setattr(main, "fetch_binance_daily", lambda *args, **kwargs: None)
+        monkeypatch.setattr(main, "fetch_reference_daily",
+                            lambda *args, **kwargs: None)
         bot.update_daily_settings(notify=False)
 
         assert bot.signal_sources == {

@@ -14,8 +14,8 @@ from fee_manager import refresh_from_exchange, resolve_fee_info
 from exchange_base import ExchangeBase, create_exchange
 from live_price_stream import LivePriceStream
 from notifier import TelegramNotifier
-from reference_data import (fetch_global_daily as fetch_binance_daily,
-                            fetch_global_price as fetch_binance_price)
+from reference_data import (KRW_SOURCES, fetch_reference_daily,
+                            fetch_reference_price, normalize_source)
 from regime_strategy import current_regime_from_config, is_period_rebalance
 from strategy_engine import StrategyEngine
 from trade_store import TradeStore, session_date
@@ -256,11 +256,14 @@ class QuantBot:
             0.0, min(1.0, float(self.config.get("position_refill_threshold", 0.95))))
         self.btc_reserved_cash: float = 0.0
         self.last_recalculated_at: Optional[datetime] = None
-        self.signal_reference: str = str(
-            self.config.get("signal_reference", "binance")).strip().lower()
-        if self.signal_reference not in {"local", "binance"}:
-            self.signal_reference = "binance"
-        initial_signal = "global_pending" if self.signal_reference == "binance" else "local"
+        # 신호 기준은 upbit / binance / bitstamp 중 하나. 셋 다 일봉 경계가
+        # 09:00 KST 라 서로 정렬되고, 백테스트로 검증할 이력도 충분합니다.
+        self.signal_reference: str = normalize_source(
+            self.config.get("signal_reference"))
+        #: 신호 통화가 체결 통화(원화)와 같은가.  같으면 목표가를 환산 없이
+        #: 그대로 옮길 수 있습니다(같은 순간 거래소 간 가격차 실측 0.066%).
+        self.signal_same_currency: bool = self.signal_reference in KRW_SOURCES
+        initial_signal = "global_pending"
         self.signal_sources: Dict[str, str] = {t: initial_signal for t in self.tickers}
         self.realtime_price_max_age: float = max(
             1.0, float(self.config.get("realtime_price_max_age_seconds", 30.0)))
@@ -1606,39 +1609,45 @@ class QuantBot:
                     df, ticker=ticker, use_dynamic_k=self.use_dynamic_k
                 )
 
-                # 글로벌 일봉에서 방향(MA)과 동적 K를 공통으로 가져옵니다.
-                # 목표가의 시가/전일범위와 ATR은 실제 주문이 체결되는 KRW 거래소 데이터를
-                # 유지해 환율·김치프리미엄·현지 변동성을 버리지 않습니다.
+                # 방향(MA)과 동적 K는 선택한 신호 기준에서 가져옵니다.
+                #
+                # 목표가는 신호 통화에 따라 갈립니다.
+                #   원화 기준(업비트) : 체결 통화와 같고 같은 순간 가격도 사실상
+                #     같으므로(실측 0.066%) 목표가를 **그대로** 옮깁니다.
+                #   달러 기준(바이낸스/Bitstamp) : 환산이 필요하므로 목표가의
+                #     시가·전일범위는 실제 체결되는 원화 거래소 값을 쓰고 K 만
+                #     신호 기준에서 얹습니다.
                 signal_df = df
-                self.signal_sources[ticker] = "local"
-                if self.signal_reference == "binance":
-                    reference_df = fetch_binance_daily(ticker, limit=100)
-                    if reference_df is not None and len(reference_df) >= max(22, self.ma_window + 1):
-                        reference_eval = self.strategy_engine.evaluate(
-                            reference_df, ticker=ticker, use_dynamic_k=self.use_dynamic_k)
-                        effective_k = float(reference_eval["effective_k"])
-                        eval_res["effective_k"] = effective_k
-                        eval_res["noise_ratio_20d"] = reference_eval.get("noise_ratio_20d")
-                        eval_res["is_above_ma"] = bool(reference_eval["is_above_ma"])
-                        eval_res["ma_value"] = reference_eval.get("ma_value", 0.0)
+                reference_df = fetch_reference_daily(
+                    ticker, self.signal_reference, limit=100)
+                if reference_df is not None and len(reference_df) >= max(22, self.ma_window + 1):
+                    reference_eval = self.strategy_engine.evaluate(
+                        reference_df, ticker=ticker, use_dynamic_k=self.use_dynamic_k)
+                    effective_k = float(reference_eval["effective_k"])
+                    eval_res["effective_k"] = effective_k
+                    eval_res["noise_ratio_20d"] = reference_eval.get("noise_ratio_20d")
+                    eval_res["is_above_ma"] = bool(reference_eval["is_above_ma"])
+                    eval_res["ma_value"] = reference_eval.get("ma_value", 0.0)
+                    reference_target = float(
+                        self.strategy_engine.calculate_target_price(
+                            reference_df, k=effective_k, use_dynamic_k=False) or 0.0)
+                    if self.signal_same_currency:
+                        eval_res["target_price"] = reference_target
+                    else:
                         eval_res["target_price"] = self.strategy_engine.calculate_target_price(
                             df, k=effective_k, use_dynamic_k=False)
-                        # 같은 K로 신호 시장의 목표가도 계산합니다.  주문에는 쓰지
-                        # 않고 화면 표시 전용입니다.
-                        self.signal_targets[ticker] = float(
-                            self.strategy_engine.calculate_target_price(
-                                reference_df, k=effective_k, use_dynamic_k=False) or 0.0)
-                        signal_df = reference_df
-                        self.signal_sources[ticker] = "global"
-                    else:
-                        self.target_prices[ticker] = 0.0
-                        self.signal_targets[ticker] = 0.0
-                        self.is_above_ma[ticker] = False
-                        self.signal_sources[ticker] = "global_unavailable"
-                        logger.error(
-                            f"[{ticker}] 글로벌 기준신호 없음 - 국내 데이터로 대체하지 않고 "
-                            "해당 종목 매매를 중지합니다")
-                        continue
+                    self.signal_targets[ticker] = reference_target
+                    signal_df = reference_df
+                    self.signal_sources[ticker] = "global"
+                else:
+                    self.target_prices[ticker] = 0.0
+                    self.signal_targets[ticker] = 0.0
+                    self.is_above_ma[ticker] = False
+                    self.signal_sources[ticker] = "global_unavailable"
+                    logger.error(
+                        f"[{ticker}] {self.signal_reference} 기준신호 없음 - 다른 "
+                        "데이터로 대체하지 않고 해당 종목 매매를 중지합니다")
+                    continue
 
                 self.target_prices[ticker] = eval_res["target_price"]
                 if self.signal_sources[ticker] != "global":
@@ -1750,7 +1759,7 @@ class QuantBot:
                 logger.error(
                     "[기간리밸런싱] 연구용 3국면 라우팅은 실거래에 아직 지원되지 "
                     "않습니다. 기존 확인형 글로벌 MA 판정을 유지합니다.")
-            frame = fetch_binance_daily("BTC", limit=need)
+            frame = fetch_reference_daily("BTC", self.signal_reference, limit=need)
             if frame is None or len(frame) < long_window + 2:
                 logger.warning("[기간리밸런싱] 글로벌 BTC 국면 데이터 부족 - 기존 상태 유지")
                 return False
@@ -2001,7 +2010,7 @@ class QuantBot:
         now = time.monotonic()
         if cached and now - cached[1] <= 2.0:
             return cached[0]
-        price = fetch_binance_price(ticker)
+        price = fetch_reference_price(ticker, self.signal_reference)
         if price is not None:
             self._reference_price_cache[ticker] = (price, now)
         return price

@@ -176,3 +176,60 @@ def test_breakout_reference_defaults_to_local():
 
     glob = run_backtest(dict(config, breakout_reference="global"), data, ctx)
     assert glob["breakout_reference"] == "global"
+
+
+# --- 신호 기준 선택 -------------------------------------------------------
+
+def test_only_sources_that_share_the_09_boundary_are_offered():
+    """빗썸(경계 00:00·200일)과 코인원(400일)은 검증이 불가능해 뺐습니다.
+
+    Bitstamp 는 BTC 만 있어 알트가 조용히 바이낸스로 대체되는데, 그 혼합이
+    'BTC 만 하루 늦게 판정되는' 사고의 원인이었으므로 역시 뺐습니다.
+    """
+    from reference_data import REFERENCE_SOURCES
+
+    names = [name for name, _ in REFERENCE_SOURCES]
+    assert names == ["upbit", "binance"]
+    for name in ("bithumb", "coinone", "bitstamp", "local"):
+        assert name not in names
+
+
+def test_legacy_values_are_migrated_without_leaving_an_invalid_state():
+    from reference_data import DEFAULT_SOURCE, normalize_source
+
+    assert DEFAULT_SOURCE == "upbit"
+    # 옛 "global"/"bitstamp" 는 사실상 바이낸스였습니다.
+    assert normalize_source("bitstamp") == "binance"
+    assert normalize_source("global") == "binance"
+    # 지원이 끊긴 값과 오타는 기본값으로
+    for value in ("local", "bithumb", "", None, "  ", "nonsense"):
+        assert normalize_source(value) == "upbit"
+    # 대소문자/공백 허용
+    assert normalize_source("  UPBIT ") == "upbit"
+    assert normalize_source("Binance") == "binance"
+
+
+def test_every_offered_source_returns_the_in_progress_bar(monkeypatch):
+    """소스마다 봉 규약이 다르면 일부 종목만 하루 늦게 판정됩니다."""
+    import reference_data
+
+    made = {}
+
+    def fake_upbit(ticker, limit=100, timeout=8.0):
+        made["upbit"] = True
+        return _daily("2026-08-01", 21)
+
+    def fake_binance(ticker, limit=100, timeout=8.0):
+        made["binance"] = True
+        return _daily("2026-08-01", 21)
+
+    monkeypatch.setattr(reference_data, "fetch_upbit_daily", fake_upbit)
+    monkeypatch.setattr(reference_data, "fetch_binance_daily", fake_binance)
+    last = None
+    for source, _label in reference_data.REFERENCE_SOURCES:
+        frame = reference_data.fetch_reference_daily("BTC", source, limit=21)
+        assert frame is not None
+        if last is not None:
+            assert frame.index[-1] == last
+        last = frame.index[-1]
+    assert made == {"upbit": True, "binance": True}

@@ -1364,16 +1364,32 @@ def build_config_window(parent: Any = None) -> Any:
                 "ATR/균등 목표수량 계산에 반영합니다.")
             form.addRow(QtWidgets.QLabel("복리 기준자산 상한"), self.sizing_cap_spin)
 
+            from reference_data import REFERENCE_SOURCES, normalize_source
+
             self.signal_reference_combo = QtWidgets.QComboBox()
-            self.signal_reference_combo.addItem("글로벌 공통 기준", "binance")
-            self.signal_reference_combo.addItem("실제 거래소 일봉 (호환용)", "local")
-            signal_reference = str(self.config.get("signal_reference", "binance"))
+            for value, label in REFERENCE_SOURCES:
+                self.signal_reference_combo.addItem(label, value)
+            signal_reference = normalize_source(self.config.get("signal_reference"))
             signal_index = self.signal_reference_combo.findData(signal_reference)
-            self.signal_reference_combo.setCurrentIndex(signal_index if signal_index >= 0 else 0)
+            self.signal_reference_combo.setCurrentIndex(max(0, signal_index))
             self.signal_reference_combo.setToolTip(
-                "BTC는 공용 Bitstamp USD 정본, 나머지는 Binance USDT로 K와 MA 방향을 "
-                "공통화합니다. 실제 목표가 범위와 ATR은 거래 중인 KRW 거래소 데이터를 유지합니다.")
-            form.addRow(QtWidgets.QLabel("K·MA 신호 기준"), self.signal_reference_combo)
+                "종목 매매 신호(K·MA·목표가)를 어느 시장에서 뽑을지 고릅니다.\n"
+                "\n"
+                "업비트   원화. 체결 통화와 같아 목표가를 그대로 씁니다. 2017~\n"
+                "바이낸스 USDT. 목표가의 시가·전일범위는 거래소 값을 쓰고\n"
+                "         K·MA만 가져옵니다. 2017~\n"
+                "\n"
+                "둘 다 일봉 경계가 09:00 KST 라 서로, 그리고 장세 판정용 글로벌\n"
+                "정본과 정렬됩니다. 빗썸(경계 00:00, 200일 제한)과 코인원(400일)은\n"
+                "백테스트로 검증할 수 없어 뺐습니다.\n"
+                "\n"
+                "장세·시대 판정용 BTC는 이 선택과 무관하게 글로벌 정본(2011~)입니다.")
+            form.addRow(QtWidgets.QLabel("종목 신호 기준"), self.signal_reference_combo)
+
+            regime_note = QtWidgets.QLabel(
+                "장세 판정: 글로벌 BTC 정본 (Bitstamp, 2011~) 고정")
+            regime_note.setObjectName("Hint")
+            form.addRow(QtWidgets.QLabel(""), regime_note)
 
             self.exit_timing_combo = QtWidgets.QComboBox()
             self.exit_timing_combo.addItem("일봉 종가 확정 (다음 세션 시장가)", "daily")
