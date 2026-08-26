@@ -112,10 +112,15 @@ def attach_reference_signals(local: pd.DataFrame, reference: pd.DataFrame,
             ref[f"above_ma{window}"], out.index).fillna(out[f"above_ma{window}"]).astype(bool)
         out[f"signal_ma{window}"] = _align_by_date(
             ref[f"ma{window}"], out.index).fillna(out[f"ma{window}"])
-    for column in ("open", "low"):
+    for column in ("open", "high", "low"):
         out[f"signal_{column}"] = _align_by_date(ref[column], out.index)
     out["signal_N"] = _align_by_date(ref["N"], out.index).fillna(out["N"])
+    # 현지 시가·전일범위에 글로벌 K 만 얹은 값(= 지금까지의 기본 동작).
     out["signal_target"] = out["open"] + out["prev_range"] * out["signal_k"]
+    # 목표가까지 통째로 신호 시장에서 만든 값. 경계가 하나로 모입니다.
+    out["signal_prev_range"] = _align_by_date(ref["prev_range"], out.index)
+    out["signal_target_global"] = (
+        out["signal_open"] + out["signal_prev_range"] * out["signal_k"])
     return out
 
 
@@ -235,6 +240,10 @@ def run_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
     refill_threshold = max(
         0.0, min(1.0, float(config.get("position_refill_threshold", 0.95))))
     use_reference = str(config.get("signal_reference", "binance")).lower() == "binance"
+    # "local"  : 현지 시가·전일범위 + 글로벌 K (기본, 지금까지의 동작)
+    # "global" : 시가·전일범위·K 를 모두 신호 시장에서 (경계가 09:00 KST 로 통일)
+    breakout_reference = str(config.get("breakout_reference", "local")).lower()
+    global_breakout = use_reference and breakout_reference == "global"
     exit_timing = str(config.get("exit_timing", "daily")).lower()
     slippage = max(0.0, float(config.get("backtest_slippage_rate", 0.001) or 0.0))
     from fee_manager import resolve_fee_info
@@ -358,13 +367,19 @@ def run_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
             r = df.loc[date]
             if auto_selection and not bool(r.get("auto_selected", False)):
                 continue
-            target_col = ("signal_target" if use_reference
-                          and "signal_target" in r.index else "target")
+            if global_breakout and "signal_target_global" in r.index:
+                # 신호 시장 안에서 판정하고, 체결만 현지 가격으로 환산합니다.
+                target_col, high_col = "signal_target_global", "signal_high"
+            else:
+                target_col = ("signal_target" if use_reference
+                              and "signal_target" in r.index else "target")
+                high_col = "high"
             ma_col = (f"signal_above_ma{ma}" if use_reference
                       and f"signal_above_ma{ma}" in r.index else f"above_ma{ma}")
-            if pd.isna(r[target_col]) or pd.isna(r["N"]) or float(r["N"]) <= 0:
+            if (pd.isna(r[target_col]) or pd.isna(r[high_col])
+                    or pd.isna(r["N"]) or float(r["N"]) <= 0):
                 continue
-            if not (float(r["high"]) >= float(r[target_col]) and bool(r[ma_col])):
+            if not (float(r[high_col]) >= float(r[target_col]) and bool(r[ma_col])):
                 continue
 
             is_btc = ticker == "BTC"
@@ -376,7 +391,15 @@ def run_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
                     blocked["btc_decline"] += 1
                     continue
 
-            entry = max(float(r[target_col]), float(r["open"]))
+            if global_breakout and target_col == "signal_target_global":
+                # 글로벌 기준 체결가를 그날의 현지/글로벌 시가 비율로 환산.
+                signal_open_px = float(r.get("signal_open", np.nan))
+                if not np.isfinite(signal_open_px) or signal_open_px <= 0:
+                    continue
+                ratio = float(r["open"]) / signal_open_px
+                entry = max(float(r[target_col]), signal_open_px) * ratio
+            else:
+                entry = max(float(r[target_col]), float(r["open"]))
             # BTC 확인을 기다리다 늦게 들어가는 경우를 비관적으로 모사
             if use_confirm and not is_btc and not explosive and confirm_fill == "close":
                 entry = max(entry, float(r["close"]))
@@ -483,6 +506,7 @@ def run_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
         "fee_info": fee_info,
         "slippage_rate": slippage,
         "exit_timing": exit_timing,
+        "breakout_reference": "global" if global_breakout else "local",
         "selection_mode": "auto" if auto_selection else "fixed_manual",
         "exit_on_selection_drop": exit_on_selection_drop,
         "selection_drop_exits": sum(

@@ -103,3 +103,76 @@ def test_bitstamp_daily_labels_align_with_the_archive(monkeypatch):
     assert frame.index[0].hour == 9
     assert list(frame.columns) == ["open", "high", "low", "close", "volume"]
     assert frame["close"].iloc[0] == 1.5
+
+
+# --- 돌파 기준을 어디서 잡을 것인가 -------------------------------------
+
+def _local_and_reference(days=60):
+    """현지/신호 두 시장. 시가가 서로 다르게 움직이도록 만듭니다."""
+    index = pd.date_range("2024-01-01", periods=days, freq="D")
+    base = pd.Series([100.0 + i for i in range(days)], index=index)
+    local = pd.DataFrame({
+        "open": base, "high": base * 1.05,
+        "low": base * 0.96, "close": base * 1.01,
+        "volume": 10.0,
+    }, index=index)
+    # 신호 시장은 김치프리미엄만큼 낮고 변동폭도 다릅니다.
+    ref = pd.DataFrame({
+        "open": base * 0.9, "high": base * 0.9 * 1.02,
+        "low": base * 0.9 * 0.99, "close": base * 0.9 * 1.005,
+        "volume": 10.0,
+    }, index=index)
+    return local, ref
+
+
+def test_global_target_uses_the_signal_market_open_and_range():
+    """breakout_reference=global 이면 목표가가 통째로 신호 시장에서 나옵니다."""
+    from tools.backtest_config import attach_reference_signals
+
+    from tools.backtest_config import add_indicators
+
+    local, ref = _local_and_reference()
+    out = attach_reference_signals(add_indicators(local, [10], 20), ref, [10], 20)
+
+    assert "signal_target_global" in out
+    assert "signal_high" in out
+    assert "signal_prev_range" in out
+
+    row = out.iloc[-1]
+    # 기본값(signal_target)은 현지 시가 + 현지 전일범위 + 글로벌 K
+    assert row["signal_target"] == pytest.approx(
+        row["open"] + row["prev_range"] * row["signal_k"])
+    # 새 값은 셋 다 신호 시장
+    assert row["signal_target_global"] == pytest.approx(
+        row["signal_open"] + row["signal_prev_range"] * row["signal_k"])
+    # 두 값은 확실히 다릅니다(같으면 시험이 무의미)
+    assert row["signal_target"] != pytest.approx(row["signal_target_global"])
+
+
+def test_breakout_reference_defaults_to_local():
+    """실전 동작을 바꾸지 않도록 기본값은 지금까지의 방식입니다."""
+    from tools.backtest_config import run_backtest
+
+    from tools.backtest_config import add_indicators, attach_reference_signals
+
+    local, ref = _local_and_reference(days=80)
+    frame = attach_reference_signals(
+        add_indicators(local, [10, 3], 20), ref, [10, 3], 20)
+    frame["auto_selected"] = True
+    data = {"BTC": frame}
+    ctx = pd.DataFrame({"explosive": False, "bull": True,
+                        "regime_label": "상승"}, index=frame.index)
+    config = {
+        "exchange": "bithumb", "tickers": ["BTC"],
+        "ma_window": 10, "bear_exit_ma_window": 3,
+        "risk_per_trade": 0.01, "atr_stop_multiple": 2.0,
+        "signal_reference": "binance",
+        "_fee_info": {"buy_rate": 0.0004, "sell_rate": 0.0004},
+    }
+    default = run_backtest(dict(config), data, ctx)
+    explicit = run_backtest(dict(config, breakout_reference="local"), data, ctx)
+    assert default["breakout_reference"] == "local"
+    assert default["최종자산"] == explicit["최종자산"]
+
+    glob = run_backtest(dict(config, breakout_reference="global"), data, ctx)
+    assert glob["breakout_reference"] == "global"
