@@ -1457,8 +1457,50 @@ class QuantBot:
             "/동기화": self.command_sync,
             "/sync": self.command_sync,
             "/재산정": self.command_recalculate,
+            # 인자를 받는 명령. "/설정" 이면 목록, "/설정:이름" 이면 적용.
+            "/설정": self.command_preset,
+            "/preset": self.command_preset,
         }
         self.notifier.start_polling(handlers)
+
+    def command_preset(self, name: str = "") -> str:
+        """
+        텔레그램 /설정 · /설정:이름
+
+        이름 없이 부르면 저장된 목록을, 이름을 주면 그 설정으로 갈아끼웁니다.
+        재시작 없이 반영되지만 **전부는 아닙니다** - 종목·투자전략처럼 장중에
+        바꾸면 위험한 값은 다음 일일 판정에서 들어갑니다. 거래소와 API 키는
+        프리셋에 담기지도 않고 갈아끼우지도 않습니다.
+        """
+        import strategy_presets
+
+        available = strategy_presets.names()
+        if not name:
+            if not available:
+                return ("📁 <b>[저장된 설정]</b>\n아직 없습니다. "
+                        "백테스트 창의 이력에서 줄을 골라 저장하세요.")
+            lines = "\n".join(f"• {strategy_presets.describe(n)}"
+                              for n in available)
+            return (f"📁 <b>[저장된 설정 {len(available)}개]</b>\n{lines}\n\n"
+                    "적용: <code>/설정:이름</code>")
+        try:
+            merged = strategy_presets.apply_to(self.config, name)
+        except KeyError:
+            listed = ", ".join(available) or "없음"
+            return (f"❓ '<b>{name}</b>' 이라는 저장된 설정이 없습니다.\n"
+                    f"있는 것: {listed}")
+        changes = self.apply_config(merged)
+        try:
+            config_manager.save_config(merged)
+        except Exception as exc:
+            logger.warning("설정 저장 실패: %s", exc)
+        if not changes:
+            return f"✅ '<b>{name}</b>' 적용 — 바뀐 값이 없습니다."
+        body = "\n".join(f"• {c}" for c in changes[:12])
+        more = ("\n… 외 " + str(len(changes) - 12) + "건"
+                if len(changes) > 12 else "")
+        return (f"✅ <b>[설정 변경]</b> '{name}'\n{body}{more}\n\n"
+                "거래소·API 키는 바뀌지 않습니다.")
 
     def command_sync(self) -> str:
         """

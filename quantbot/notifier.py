@@ -130,13 +130,30 @@ class TelegramNotifier:
             time.sleep(1.0)
 
     def _dispatch_command(self, raw_text: str):
-        """수신된 텍스트 명령어를 파싱하고 매핑된 콜백 실행 후 응답 전송"""
-        cmd = raw_text.split("@")[0].strip().lower()  # '/자산@botname' 처리
+        """
+        수신된 텍스트 명령어를 파싱하고 매핑된 콜백 실행 후 응답 전송.
+
+        ``/설정:이름`` 처럼 인자가 붙는 형태도 받습니다. 콜론 뒤가 인자이고,
+        핸들러가 인자를 받도록 정의돼 있으면 넘겨 줍니다. 인자 없이 ``/설정``
+        만 치면 빈 문자열이 갑니다(대개 목록을 보여 줍니다).
+        """
+        text = raw_text.split("@")[0].strip()
+        cmd = text.lower()
+        argument = ""
+        if ":" in text:
+            base, _, argument = text.partition(":")
+            # 이름은 대소문자를 지킵니다. 명령만 소문자로 맞춥니다.
+            cmd, argument = base.strip().lower(), argument.strip()
 
         if cmd in self.command_handlers:
             handler_func = self.command_handlers[cmd]
             try:
-                reply_text = handler_func()
+                import inspect
+
+                takes_argument = bool(
+                    inspect.signature(handler_func).parameters)
+                reply_text = (handler_func(argument) if takes_argument
+                              else handler_func())
                 self.send_message(reply_text)
             except Exception as e:
                 err_reply = f"🚨 <b>[명령어 처리 오류]</b> {cmd} 실행 중 에러 발생: {e}"
@@ -146,7 +163,9 @@ class TelegramNotifier:
                 "🤖 <b>[QuantBot 명령어 안내]</b>\n"
                 "• <b>/자산</b> 또는 <b>/balance</b> : 원화 및 보유 코인 실시간 평가 현황\n"
                 "• <b>/상태</b> 또는 <b>/status</b> : 봇 가동 상태 및 종목별 목표가/동적 K값 현황\n"
-                "• <b>/재산정</b> : 최신 입출금·잔고로 목표가와 ATR 목표수량 다시 계산"
+                "• <b>/재산정</b> : 최신 입출금·잔고로 목표가와 ATR 목표수량 다시 계산\n"
+                "• <b>/설정</b> : 저장된 설정 목록\n"
+                "• <b>/설정:이름</b> : 그 설정으로 일괄 변경 (재시작 불필요)"
             )
             self.send_message(help_text)
 
