@@ -266,6 +266,52 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
             positions.pop(ticker, None)
         return True
 
+    def settle_probes(date, closed_today, probe_rearm_blocked):
+        nonlocal probe_stops, probe_take_profits
+        """
+        예약 체결분을 **자기 익절·손절로만** 정산합니다.
+
+        전략과 무관하게 매일 돕니다. 예전에는 돌파/방어 전략 분기 안에만
+        있어서, 장세가 현금 대기로 바뀌면 이미 깔린 지뢰가 회수되지 못한 채
+        방치됐습니다.
+        """
+        for ticker in list(positions):
+            if date not in data[ticker].index:
+                continue
+            r = data[ticker].loc[date]
+            # ATR reservation fills are a separate bucket.  A take-profit
+            # or ATR stop never liquidates unrelated core/breakout units.
+            # ``closed_today`` 는 돌파분이 정리됐다는 뜻일 뿐이라 여기서
+            # 건너뛰면 안 됩니다.  같은 날 MA 이탈로 돌파분을 팔았어도
+            # 예약 체결분은 자기 익절·손절선을 그대로 봅니다.
+            if ticker not in positions:
+                continue
+            pos = positions[ticker]
+            if float(pos.get("probe_units", 0.0)) <= 0:
+                continue
+            probe_entry = float(pos.get("probe_entry", 0.0))
+            local_atr = float(pos.get("probe_atr", r.get("N", np.nan)))
+            if (not np.isfinite(probe_entry) or probe_entry <= 0
+                    or not np.isfinite(local_atr) or local_atr <= 0):
+                continue
+            stop_price = max(0.0, probe_entry - probe_stop_multiple * local_atr)
+            take_price = probe_entry * (1.0 + probe_take_profit)
+            open_price = float(r["open"])
+            low_price = float(r["low"])
+            high_price = float(r["high"])
+            # When both boundaries occur in one daily candle, use the
+            # downside-first ordering.  This is deliberately conservative.
+            if open_price <= stop_price or low_price <= stop_price:
+                fill = open_price if open_price <= stop_price else stop_price
+                if sell_bucket(ticker, date, "probe_units", "atr_probe_stop", fill):
+                    probe_stops += 1
+                    probe_rearm_blocked.add(ticker)
+            elif open_price >= take_price or high_price >= take_price:
+                fill = open_price if open_price >= take_price else take_price
+                if sell_bucket(ticker, date, "probe_units", "atr_probe_take_profit", fill):
+                    probe_take_profits += 1
+                    probe_rearm_blocked.add(ticker)
+
     for date in dates:
         phase = str(regime_labels.get(date, "판정 준비"))
         strategy = phase_strategies.get(phase, "cash")
@@ -273,7 +319,14 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
         if changed:
             switches += 1
             for ticker in list(positions):
-                sell(ticker, date, "strategy_switch")
+                # 예약 체결분은 자기 익절·손절이 있으므로 전략이 바뀌어도
+                # 넘겨받아 이어 갑니다. 돌파분만 전환에 따라 정리합니다.
+                sell(ticker, date, "strategy_switch", keep_probe=True)
+
+        # 전략이 무엇이든 이미 깔린 지뢰는 매일 자기 규칙으로 정산합니다.
+        settled_today: set = set()
+        rearm_blocked_today: set = set()
+        settle_probes(date, settled_today, rearm_blocked_today)
 
         # On a strategy-transition day the daily OHLC cannot reveal whether a
         # new trigger occurred before or after liquidation.  Stay in cash until
@@ -287,7 +340,7 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
                 buy_equal(date, active(date))
         elif strategy in {"volatility_breakout", "defensive_atr", "cash_with_atr"}:
             closed_today = set()
-            probe_rearm_blocked = set()
+            probe_rearm_blocked = set(rearm_blocked_today)
             for ticker in list(positions):
                 if date not in data[ticker].index:
                     continue
@@ -326,38 +379,6 @@ def run_period_backtest(config: Dict[str, Any], data: Dict[str, pd.DataFrame],
                     sell(ticker, date, "ma_daily", keep_probe=True)
                     closed_today.add(ticker)
 
-                # ATR reservation fills are a separate bucket.  A take-profit
-                # or ATR stop never liquidates unrelated core/breakout units.
-                # ``closed_today`` 는 돌파분이 정리됐다는 뜻일 뿐이라 여기서
-                # 건너뛰면 안 됩니다.  같은 날 MA 이탈로 돌파분을 팔았어도
-                # 예약 체결분은 자기 익절·손절선을 그대로 봅니다.
-                if ticker not in positions:
-                    continue
-                pos = positions[ticker]
-                if float(pos.get("probe_units", 0.0)) <= 0:
-                    continue
-                probe_entry = float(pos.get("probe_entry", 0.0))
-                local_atr = float(pos.get("probe_atr", r.get("N", np.nan)))
-                if (not np.isfinite(probe_entry) or probe_entry <= 0
-                        or not np.isfinite(local_atr) or local_atr <= 0):
-                    continue
-                stop_price = max(0.0, probe_entry - probe_stop_multiple * local_atr)
-                take_price = probe_entry * (1.0 + probe_take_profit)
-                open_price = float(r["open"])
-                low_price = float(r["low"])
-                high_price = float(r["high"])
-                # When both boundaries occur in one daily candle, use the
-                # downside-first ordering.  This is deliberately conservative.
-                if open_price <= stop_price or low_price <= stop_price:
-                    fill = open_price if open_price <= stop_price else stop_price
-                    if sell_bucket(ticker, date, "probe_units", "atr_probe_stop", fill):
-                        probe_stops += 1
-                        probe_rearm_blocked.add(ticker)
-                elif open_price >= take_price or high_price >= take_price:
-                    fill = open_price if open_price >= take_price else take_price
-                    if sell_bucket(ticker, date, "probe_units", "atr_probe_take_profit", fill):
-                        probe_take_profits += 1
-                        probe_rearm_blocked.add(ticker)
 
             opening_equity = cash + sum(
                 p["units"] * mark_price(t, date, "open")

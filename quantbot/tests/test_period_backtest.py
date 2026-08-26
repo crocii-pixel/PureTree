@@ -481,31 +481,54 @@ def test_probe_exit_counters_account_for_every_fill():
     assert result["atr_probe_open_at_end"] == 0
 
 
-def test_strategy_switch_is_reported_as_a_forced_probe_exit():
-    """장세가 바뀌면 예약분이 익절선에 닿기 전에 정리됩니다.
+def test_probe_survives_a_strategy_switch():
+    """장세가 바뀌어도 이미 깔린 지뢰는 넘겨받아 이어 갑니다.
 
-    실전 백테스트에서 "체결 8 · 익절 5 · 손절 0" 이 나왔고 나머지 3건이
-    바로 이것이었습니다(장세 전환 시 +4.5~6.4% 에서 잘림). 설계상 의도이긴
-    하나 익절/손절과 섞이면 숫자가 안 맞아 보이므로 따로 셉니다.
+    예전에는 전략이 바뀌면 보유분을 전부 정리해, 예약 체결분이 익절선에 닿기
+    전에 잘려 나갔습니다(실측 11건 중 8건). 지뢰는 자기 익절·손절로만
+    회수되어야 합니다. 돌파분은 종전대로 전환에 따라 정리합니다.
     """
     data = {"BTC": _defensive_frame(ma_ok=False)}
     index = data["BTC"].index
     labels = pd.Series("하락", index=index)
-    labels.iloc[len(index) - 20:] = "상승"
+    labels.iloc[len(index) - 30:] = "상승"
     ctx = pd.DataFrame({"explosive": False, "bull": False,
                         "regime_label": labels}, index=index)
-    # 익절선을 최대(100%)로 올려 대부분의 예약분이 열린 채로 전환을 맞게 합니다.
     config = _defensive_config(defensive_take_profit_pct=1.0)
     config["regime_scoring"]["bull_strategy"] = "cash"
     result = run_period_backtest(config, data, ctx)
 
-    switches = [t for t in result["_trades"] if t["reason"] == "strategy_switch"]
-    assert switches, "장세 전환 청산이 일어나지 않았습니다"
-    assert result["atr_probe_forced_exits"] >= 1
-    # 여기서도 합계는 맞아야 합니다.
-    assert (result["atr_probe_take_profit_exits"]
-            + result["atr_probe_stop_exits"]
-            + result["atr_probe_forced_exits"]) == result["atr_lower_buys"]
+    assert result["regime_switches"] >= 1, "장세 전환이 없으면 시험이 무의미"
+    # 전환 때문에 잘려 나간 예약분이 없어야 합니다.
+    switch_trades = [t for t in result["_trades"]
+                     if t["reason"] == "strategy_switch"]
+    assert not switch_trades, "전략 전환이 예약 체결분을 팔았습니다"
+    assert result["atr_lower_buys"] > 0
+
+
+def test_probe_is_settled_even_after_the_regime_turns_to_cash():
+    """현금 대기로 바뀐 뒤에도 지뢰는 매일 익절·손절을 봐야 합니다.
+
+    정산이 돌파·방어 전략 분기 안에만 있으면, 현금 대기 구간에서는 회수되지
+    못한 채 구간 끝까지 방치됩니다.
+    """
+    data = {"BTC": _defensive_frame(ma_ok=False)}
+    index = data["BTC"].index
+    labels = pd.Series("하락", index=index)
+    labels.iloc[len(index) // 3:] = "상승"      # 이른 시점에 현금 대기로
+    ctx = pd.DataFrame({"explosive": False, "bull": False,
+                        "regime_label": labels}, index=index)
+    config = _defensive_config()
+    config["regime_scoring"]["bull_strategy"] = "cash"
+    result = run_period_backtest(config, data, ctx)
+
+    assert result["atr_lower_buys"] > 0
+    # 현금 대기 구간에서도 익절이 일어납니다.
+    exits = (result["atr_probe_take_profit_exits"]
+             + result["atr_probe_stop_exits"])
+    assert exits > 0, "현금 대기 구간에서 지뢰가 회수되지 않았습니다"
+    # 구간 종료 시점에 남은 것이 없어야 합니다.
+    assert result["atr_probe_open_at_end"] == 0
 
 
 def test_ladder_places_one_reservation_per_unfilled_rung():
