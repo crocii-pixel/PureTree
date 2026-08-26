@@ -271,7 +271,7 @@ def _save_chart_settings(score: Dict[str, Any]) -> None:
         return
 
 
-def build_config_window(parent: Any = None) -> Any:
+def build_config_window(parent: Any = None, live_apply: Any = None) -> Any:
     """설정 창 위젯을 생성해 반환 (QApplication은 호출자가 준비)"""
     QtCore, QtGui, QtWidgets = _qt()
     import ui_theme
@@ -442,6 +442,8 @@ def build_config_window(parent: Any = None) -> Any:
                 }
             })
             self._chart_window = None
+            #: 프리셋을 설정 창에 채워 넣는 콜백. 설정 창이 붙여 줍니다.
+            self._preset_applied = None
             self._chart_period_sync_timer = QtCore.QTimer(self)
             self._chart_period_sync_timer.setSingleShot(True)
             self._chart_period_sync_timer.setInterval(350)
@@ -573,12 +575,33 @@ def build_config_window(parent: Any = None) -> Any:
             history_title.addStretch(1)
             # 줄마다 버튼을 두면 표가 산만하고, 결국 한 번에 하나만 씁니다.
             # 선택한 줄의 판정 설정을 차트로 보내는 버튼 하나로 충분합니다.
+            # 프리셋: 이력에서 고른 줄을 이름 붙여 저장하고, 콤보에서 되불러옵니다.
+            self.preset_combo = QtWidgets.QComboBox()
+            self.preset_combo.setMinimumWidth(150)
+            self.preset_combo.setToolTip(
+                "저장된 설정. 고르면 설정 창의 값이 통째로 바뀝니다.\n"
+                "실제 반영은 설정 창에서 [저장]을 눌러야 됩니다.")
+            self.preset_combo.currentIndexChanged.connect(self._preset_selected)
+            history_title.addWidget(QtWidgets.QLabel("저장된 설정"))
+            history_title.addWidget(self.preset_combo)
+            self.save_preset_strategy_button = QtWidgets.QPushButton("이 결과를 저장")
+            self.save_preset_strategy_button.setToolTip(
+                "이력에서 고른 줄의 설정을 이름 붙여 저장합니다.\n"
+                "나중에 텔레그램에서 /설정:이름 으로도 불러옵니다.")
+            self.save_preset_strategy_button.clicked.connect(self._save_preset)
+            history_title.addWidget(self.save_preset_strategy_button)
+
             self.apply_chart_button = QtWidgets.QPushButton("차트 설정 적용")
             self.apply_chart_button.setToolTip(
                 "선택한 줄을 만든 판정 설정을 차트 패널에 넣습니다.\n"
                 "차트가 닫혀 있으면 열면서 넣습니다.")
             self.apply_chart_button.clicked.connect(self._apply_selected_scoring)
             history_title.addWidget(self.apply_chart_button)
+            self.include_trading_check = QtWidgets.QCheckBox("매매설정 포함")
+            self.include_trading_check.setToolTip(
+                "켜면 판정값뿐 아니라 종목·사이징·청산 등 매매 설정도 함께 "
+                "가져옵니다.\n끄면 차트에 그려지는 판정값만 바뀝니다.")
+            history_title.addWidget(self.include_trading_check)
             self.view_config_button = QtWidgets.QPushButton("백테스트 설정보기")
             self.view_config_button.clicked.connect(self._view_selected_config)
             history_title.addWidget(self.view_config_button)
@@ -618,6 +641,7 @@ def build_config_window(parent: Any = None) -> Any:
             outer.addWidget(self.history_table, 1)
             self._update_split_controls()
             self._reload_history()
+            self._reload_presets()
             self.refresh_summary()
 
         def _reload_presets(self, selected_name: Optional[str] = None) -> None:
@@ -982,6 +1006,75 @@ def build_config_window(parent: Any = None) -> Any:
             if scroll_bottom and records:
                 self.history_table.scrollToBottom()
 
+        def _reload_presets(self, keep: str = "") -> None:
+            import strategy_presets
+
+            self.preset_combo.blockSignals(True)
+            self.preset_combo.clear()
+            self.preset_combo.addItem("— 저장된 설정 —", "")
+            for name in strategy_presets.names():
+                self.preset_combo.addItem(name, name)
+            if keep:
+                index = self.preset_combo.findData(keep)
+                if index >= 0:
+                    self.preset_combo.setCurrentIndex(index)
+            self.preset_combo.blockSignals(False)
+
+        def _save_preset(self) -> None:
+            """이력에서 고른 줄의 설정을 이름 붙여 저장합니다."""
+            import strategy_presets
+
+            record_id = self._current_record_id()
+            if record_id is None:
+                self.backtest_result.setText(
+                    "<span style='color:#FFCC80'>이력에서 줄을 먼저 고르세요.</span>")
+                return
+            entry = self._history_store.get(record_id)
+            config = dict((entry or {}).get("config") or {})
+            if not config:
+                self.backtest_result.setText(
+                    "<span style='color:#FFCC80'>그 줄에는 저장된 설정이 "
+                    "없습니다.</span>")
+                return
+            name, ok = QtWidgets.QInputDialog.getText(
+                self, "설정 저장", "이름 (공백과 : 는 쓸 수 없습니다)")
+            if not ok:
+                return
+            try:
+                strategy_presets.save(name.strip(), config)
+            except ValueError as exc:
+                self.backtest_result.setText(
+                    f"<span style='color:#FF8A80'>{exc}</span>")
+                return
+            self._reload_presets(keep=name.strip())
+            self.backtest_result.setText(
+                f"<span style='color:#80CBC4'>'{name.strip()}' 으로 "
+                "저장했습니다. 콤보에서 다시 불러올 수 있습니다.</span>")
+
+        def _preset_selected(self, _index: int = 0) -> None:
+            """
+            고른 설정을 설정 창에 채웁니다.
+
+            **실제 반영은 설정 창의 [저장]을 눌러야** 됩니다. 콤보를 건드린
+            것만으로 실전 설정이 바뀌면 사고입니다.
+            """
+            import strategy_presets
+
+            name = self.preset_combo.currentData()
+            if not name:
+                return
+            values = strategy_presets.get(name)
+            if values is None:
+                return
+            if self._preset_applied is not None:
+                self._preset_applied(dict(values))
+            scoring = dict(values.get("regime_scoring") or {})
+            if scoring:
+                self._apply_history_scoring(scoring)
+            self.backtest_result.setText(
+                f"<span style='color:#80CBC4'>'{name}' 을 불러왔습니다. "
+                "설정 창에서 [저장]을 눌러야 실제로 반영됩니다.</span>")
+
         def _apply_selected_scoring(self) -> None:
             """선택한 이력 줄의 판정 설정을 차트로 보냅니다."""
             record_id = self._current_record_id()
@@ -990,8 +1083,13 @@ def build_config_window(parent: Any = None) -> Any:
                     "<span style='color:#FFCC80'>이력에서 줄을 먼저 고르세요.</span>")
                 return
             entry = self._history_store.get(record_id)
-            scoring = dict(((entry or {}).get("config") or {}).get(
-                "regime_scoring") or {})
+            config = dict((entry or {}).get("config") or {})
+            if self.include_trading_check.isChecked() and config:
+                import strategy_presets
+
+                if self._preset_applied is not None:
+                    self._preset_applied(strategy_presets.extract(config))
+            scoring = dict(config.get("regime_scoring") or {})
             if not scoring:
                 self.backtest_result.setText(
                     "<span style='color:#FFCC80'>그 줄에는 저장된 판정 설정이 "
@@ -1678,6 +1776,9 @@ def build_config_window(parent: Any = None) -> Any:
                 self._backtest_window = BacktestWindow(
                     self.collect, self._set_backtest_presets,
                     self._set_regime_scoring)
+                # 저장된 설정을 고르면 이 폼으로 돌아옵니다. 실제 반영은
+                # [저장]을 눌러야 하므로 여기서 파일을 쓰지는 않습니다.
+                self._backtest_window._preset_applied = self.apply_preset_values
             self._backtest_window.refresh_summary()
             self._backtest_window.show()
             self._backtest_window.raise_()
@@ -1891,6 +1992,68 @@ def build_config_window(parent: Any = None) -> Any:
             self.status.setStyleSheet(f"color: {color}; font-size: 11px;")
             self.status.setText(text)
 
+        def apply_preset_values(self, values: Dict[str, Any]) -> None:
+            """
+            저장된 설정을 폼에 채웁니다.
+
+            **여기서 실제 반영은 하지 않습니다.** [저장]을 눌러야 파일에
+            들어가고 봇에 전달됩니다. 콤보를 건드린 것만으로 실전 설정이
+            바뀌면 사고입니다.
+            """
+            mapping = {
+                "risk_per_trade": (self.risk_spin, 100.0),
+                "ma_window": (self.ma_spin, 1.0),
+                "fixed_k": (self.k_spin, 1.0),
+                "btc_min_weight": (self.btc_min_weight_spin, 100.0),
+                "backtest_slippage_rate": (self.slippage_spin, 100.0),
+                "auto_liquidity_top": (self.auto_top_spin, 1.0),
+                "auto_selection_count": (self.auto_count_spin, 1.0),
+                "auto_rebalance_days": (self.auto_rebalance_spin, 1.0),
+            }
+            for key, (widget, scale) in mapping.items():
+                if widget is None or key not in values:
+                    continue
+                try:
+                    widget.setValue(float(values[key]) * scale)
+                except (TypeError, ValueError):
+                    continue
+            checks = {
+                "use_dynamic_k": self.dynamic_k,
+                "force_simulation": None,          # 계정 계열은 건드리지 않습니다
+                "fixed_selection_enabled": self.fixed_selection,
+                "additional_selection_enabled": self.additional_selection,
+            }
+            for key, widget in checks.items():
+                if widget is not None and key in values:
+                    widget.setChecked(bool(values[key]))
+            if "additional_selection_mode" in values:
+                auto = str(values["additional_selection_mode"]) == "auto"
+                self.additional_auto.setChecked(auto)
+                self.additional_manual.setChecked(not auto)
+            if "fixed_tickers" in values:
+                self.fixed_tickers_edit.setText(
+                    format_tickers(list(values["fixed_tickers"])))
+            if "additional_tickers" in values:
+                self.additional_tickers_edit.setText(
+                    format_tickers(list(values["additional_tickers"])))
+            for key, combo in (("investment_strategy",
+                                getattr(self, "investment_strategy_combo", None)),
+                               ("exit_timing", getattr(self, "exit_timing_combo", None)),
+                               ("position_sizing", getattr(self, "sizing_combo", None)),
+                               ("signal_reference",
+                                getattr(self, "signal_reference_combo", None))):
+                if combo is None or key not in values:
+                    continue
+                index = combo.findData(values[key])
+                if index >= 0:
+                    combo.setCurrentIndex(index)
+            # 판정값은 초안으로 넘겨 백테스트·차트가 같이 따라오게 합니다.
+            scoring = values.get("regime_scoring")
+            if isinstance(scoring, dict) and self._backtest_window is not None:
+                self._backtest_window._update_regime_draft(dict(scoring))
+            self._set_status(
+                "저장된 설정을 불러왔습니다 · [저장]을 눌러야 반영됩니다", "warn")
+
         def collect(self) -> Dict[str, Any]:
             """현재 입력값을 config.json 스키마로 수집"""
             config = dict(self.config)
@@ -1974,12 +2137,25 @@ def build_config_window(parent: Any = None) -> Any:
                     payload[env_var] = value
 
             config_ok = config_manager.save_config(config)
+            # 돌고 있는 봇에 바로 물립니다. 예전에는 파일만 바뀌고 봇은 켤 때
+            # 읽은 값으로 계속 돌아서, 창을 닫았다 여는 것으로는 부족하고
+            # 프로그램을 재시작해야 했습니다.
+            applied = []
+            if config_ok and callable(getattr(self, "_live_apply", None)):
+                try:
+                    applied = self._live_apply(dict(config)) or []
+                except Exception as exc:
+                    applied = [f"즉시 적용 실패: {exc}"]
             env_ok = config_manager.update_env(payload)
             self.config = config
 
             if config_ok and env_ok:
                 saved = ", ".join(payload.keys()) or "(키 변경 없음)"
-                self._set_status(f"저장 완료 · {key_to_display(exchange)} · {saved}", "ok")
+                tail = ""
+                if applied:
+                    tail = f" · 봇에 즉시 적용 {len(applied)}건"
+                self._set_status(
+                    f"저장 완료 · {key_to_display(exchange)} · {saved}{tail}", "ok")
                 self._offer_restart()
             else:
                 self._set_status("저장 실패 - 로그를 확인해주세요.", "danger")
@@ -2072,7 +2248,10 @@ def build_config_window(parent: Any = None) -> Any:
             self.test_button.setEnabled(True)
             self.test_button.setText("연결 테스트")
 
-    return ConfigWindow(parent)
+    window = ConfigWindow(parent)
+    # 저장할 때 돌고 있는 봇에 바로 물릴 콜백. 없으면 파일만 씁니다.
+    window._live_apply = live_apply
+    return window
 
 
 def run_config_gui() -> int:

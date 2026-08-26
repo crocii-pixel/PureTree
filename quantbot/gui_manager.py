@@ -403,7 +403,11 @@ class Dashboard(QWidget):
         from config_gui import build_config_window
 
         if getattr(self, "_config_window", None) is None:
-            self._config_window = build_config_window()
+            # 저장을 누르면 돌고 있는 봇이 바로 새 설정을 읽습니다.
+            # 종목·전략처럼 장중에 바꾸면 위험한 값은 다음 일일 판정으로
+            # 미뤄집니다(main.DEFERRED).
+            self._config_window = build_config_window(
+                live_apply=getattr(self.bot, "apply_config", None))
         self._config_window.show()
         # 대시보드를 보면서 고치는 창이라 오른쪽에 붙여 엽니다.
         ui_theme.dock_right_of(self._config_window, self)

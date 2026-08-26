@@ -1835,6 +1835,91 @@ class QuantBot:
                     " (전환)" if self.period_regime_changed else "")
         return state
 
+    #: 돌면서 바꿔도 안전한 값. 읽어서 속성만 갈아 끼우면 끝입니다.
+    RELOADABLE = (
+        "ma_window", "bear_exit_ma_window", "bear_market_exit", "exit_timing",
+        "use_dynamic_k", "fixed_k",
+        "position_sizing", "risk_per_trade", "atr_stop_multiple", "atr_window",
+        "sizing_equity_cap_krw", "btc_min_weight", "position_refill_threshold",
+        "skip_immediate_exit_buys", "rebalance_mode", "rebalance_band",
+        "btc_breakout_confirm", "btc_regime_filter", "btc_decline_threshold",
+        "higher_timeframe_filter", "higher_timeframe_ma",
+        "regime_short_ma", "regime_long_ma", "regime_ma_months",
+        "regime_entry_confirm_days", "regime_exit_confirm_days",
+        "explosive_era_guard", "explosive_era_threshold", "explosive_era_years",
+        "exit_on_selection_drop", "regime_scoring",
+    )
+
+    #: 돌면서 바꾸면 위험한 값. 다음 일일 루틴이나 재시작에서만 반영합니다.
+    DEFERRED = ("tickers", "fixed_tickers", "additional_tickers",
+                "additional_selection_mode", "additional_selection_enabled",
+                "fixed_selection_enabled", "investment_strategy",
+                "signal_reference")
+
+    #: 절대 갈아 끼우지 않는 값. 프리셋이나 원격 명령으로 계정이 바뀌면 사고입니다.
+    LOCKED = ("exchange", "api_key", "secret_key", "force_simulation",
+              "telegram_enabled")
+
+    def apply_config(self, new_config: Dict[str, Any]) -> List[str]:
+        """
+        돌고 있는 봇에 설정을 다시 읽힙니다. 재시작 없이.
+
+        전부 갈아 끼우지는 않습니다. 종목 목록을 장중에 바꾸면 이미 들고 있는
+        물량이 관리 대상에서 빠져 **아무도 안 파는 포지션**이 됩니다. 그래서
+        종목·전략·신호기준은 다음 일일 루틴(일봉 경계)에서 반영하고, 그때까지는
+        지금 목록으로 계속 관리합니다.
+
+        거래소와 키는 아예 건드리지 않습니다.
+
+        :return: 사람이 읽을 변경 내역. 빈 목록이면 바뀐 것이 없습니다.
+        """
+        changes: List[str] = []
+        deferred: List[str] = []
+        for key, value in dict(new_config or {}).items():
+            if key in self.LOCKED:
+                continue
+            before = self.config.get(key)
+            if before == value:
+                continue
+            if key in self.DEFERRED:
+                deferred.append(key)
+                self.config[key] = value        # 다음 루틴이 읽어 갑니다
+                continue
+            if key not in self.RELOADABLE:
+                self.config[key] = value        # 파생 속성이 없는 값
+                continue
+            self.config[key] = value
+            changes.append(f"{key}: {before} -> {value}")
+
+        # 파생 속성 다시 만들기
+        self.ma_window = int(self.config.get("ma_window", 5))
+        self.use_dynamic_k = bool(self.config.get("use_dynamic_k", True))
+        self.k = (None if self.use_dynamic_k
+                  else float(self.config.get("fixed_k", 0.5)))
+        self.bear_exit_ma = int(self.config.get("bear_exit_ma_window", 5))
+        self.bear_market_exit = bool(self.config.get("bear_market_exit", True))
+        self.exit_timing = str(self.config.get("exit_timing", "daily")).lower()
+        self.regime_ma_months = int(self.config.get("regime_ma_months", 6))
+        self.era_threshold = float(self.config.get("explosive_era_threshold", 75.0))
+        self.era_years = int(self.config.get("explosive_era_years", 4))
+        self.explosive_era_guard = bool(self.config.get("explosive_era_guard", True))
+        self.exit_on_selection_drop = bool(
+            self.config.get("exit_on_selection_drop", True))
+        self.position_refill_threshold = max(0.0, min(1.0, float(
+            self.config.get("position_refill_threshold", 0.95))))
+        try:
+            self.strategy_engine = StrategyEngine(
+                k=self.k, ma_window=self.ma_window,
+                use_dynamic_k=self.use_dynamic_k)
+        except Exception as exc:
+            logger.warning("전략 엔진을 다시 만들지 못했습니다: %s", exc)
+
+        if deferred:
+            changes.append("다음 일일 판정에서 반영: " + ", ".join(deferred))
+        if changes:
+            logger.info("[설정 재적용] " + " · ".join(changes))
+        return changes
+
     def _sell_units(self, ticker: str, units: float, reason: str) -> bool:
         """수량을 지정해 시장가 매도. 리밸런싱 차액 정리에 씁니다."""
         if units <= 0:
