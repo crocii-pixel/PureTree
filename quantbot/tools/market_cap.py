@@ -77,10 +77,26 @@ PEGGED_SYMBOLS = frozenset({
 
 
 def _cache_root() -> pathlib.Path:
-    """스냅샷 캐시 위치. 시세 아카이브와 같은 뿌리 아래에 둡니다."""
+    """
+    시점 시가총액 스냅샷의 위치.
+
+    **리포에 담긴 것을 먼저 봅니다.** 이 스냅샷은 CoinMarketCap 이 과거
+    엔드포인트를 닫으면 다시 만들 수 없어서, 백업되지 않는 %LOCALAPPDATA%
+    한 곳에만 두면 디스크와 함께 사라집니다.
+
+    시세 아카이브(v1)와 달리 여기는 **파생 사슬이 없습니다.** 날짜별 파일이
+    각자 완결이라 리포를 단일 원본으로 삼아도 갱신 경로가 깨지지 않습니다.
+    v1 은 1h·1d 가 1m 에서 파생되므로 그쪽은 기존 위치를 그대로 씁니다.
+    """
     override = os.getenv("QUANTBOT_MARKET_CAP_DIR")
     if override:
         return pathlib.Path(override).expanduser()
+    if getattr(sys, "frozen", False):
+        bundled = pathlib.Path(sys.executable).resolve().parent / "data" / "market_cap"
+    else:
+        bundled = pathlib.Path(__file__).resolve().parent.parent / "data" / "market_cap"
+    if bundled.is_dir():
+        return bundled
     try:
         sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
         from global_market_data import shared_market_data_root

@@ -8,6 +8,7 @@
 """
 import datetime as dt
 import json
+import pathlib
 
 import pytest
 
@@ -268,3 +269,53 @@ def test_current_skips_rows_without_market_cap(monkeypatch):
                         lambda url, timeout=45: json.dumps(payload).encode())
     assert [row["symbol"] for row in market_cap.fetch_current(limit=5)] == [
         "BTC", "ETH"]
+
+
+# ----------------------------------------------------------------------
+# 캐시 위치 — 리포에 담긴 스냅샷을 먼저 본다
+# ----------------------------------------------------------------------
+def test_cache_root_prefers_the_snapshots_committed_to_the_repo(monkeypatch, tmp_path):
+    """
+    시점 시가총액 스냅샷은 **다시 만들 수 없습니다.**
+
+    CoinMarketCap 이 과거 목록 엔드포인트를 닫으면 끝이고, 백업되지 않는
+    %LOCALAPPDATA% 한 곳에만 두면 디스크와 함께 사라집니다. 그래서 리포에
+    담아 두고 그쪽을 먼저 봅니다.
+
+    시세 아카이브(v1)는 이렇게 하지 않습니다 - 거기는 1h·1d 가 1m 에서
+    파생되는 사슬이 있어서, 1m 없이 리포만 가리키면 새 봉을 만들지 못하고
+    ensure_global_btc_current() 가 조용히 False 를 돌려줍니다. 시총 스냅샷은
+    날짜별 파일이 각자 완결이라 그 문제가 없습니다.
+    """
+    import pathlib
+
+    repo_data = pathlib.Path(market_cap.__file__).resolve().parent.parent / "data"
+    bundled = repo_data / "market_cap"
+    if not bundled.is_dir():
+        pytest.skip("리포에 스냅샷이 담겨 있지 않습니다")
+
+    monkeypatch.delenv("QUANTBOT_MARKET_CAP_DIR", raising=False)
+    assert market_cap._cache_root() == bundled
+    # 실제로 스냅샷이 들어 있어야 의미가 있습니다.
+    assert len(list(bundled.glob("*.json"))) > 1000
+
+    # 환경변수는 여전히 이깁니다. 다른 사본으로 돌려 볼 수 있어야 합니다.
+    monkeypatch.setenv("QUANTBOT_MARKET_CAP_DIR", str(tmp_path))
+    assert market_cap._cache_root() == tmp_path
+
+
+def test_market_archive_stays_out_of_the_repo(monkeypatch):
+    """
+    시세 아카이브는 리포로 옮기지 않습니다.
+
+    1h 와 1d 의 manifest 가 `derived_from: "1m"` 이고, 1m 은 66MB 에 Parquet
+    이라 git 압축이 들지 않습니다(1.0:1). 1m 없이 경로만 리포로 돌리면
+    갱신이 멈추는데 **예외가 아니라 False 로 조용히** 멈춥니다.
+    """
+    import config_manager
+
+    root = str(config_manager.MARKET_DATA_DIR)
+    repo = str(pathlib.Path(market_cap.__file__).resolve().parent.parent)
+    assert not root.startswith(repo), (
+        "시세 아카이브가 리포를 가리킵니다. 1m 이 함께 있지 않으면 "
+        "ensure_global_btc_current() 가 조용히 실패합니다.")
