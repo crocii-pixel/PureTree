@@ -574,13 +574,19 @@ def build_config_window(parent: Any = None, live_apply: Any = None) -> Any:
             self.backtest_result.setCursor(QtCore.Qt.CursorShape.IBeamCursor)
             outer.addWidget(self.backtest_result)
 
+            # 버튼이 여섯 개라 한 줄에 늘어놓으면 창을 좁힐 수 없고, 무엇이
+            # 무엇과 관련 있는지도 안 보입니다. 두 줄로 나누되 **하는 일로**
+            # 가릅니다.
+            #   윗줄  저장된 설정을 다루는 것   (콤보 · 이 결과를 저장)
+            #   아랫줄 고른 줄에 하는 것        (차트 적용 · 설정보기 · 삭제)
+            history_head = QtWidgets.QVBoxLayout()
+            history_head.setSpacing(6)
+
             history_title = QtWidgets.QHBoxLayout()
             history_label = QtWidgets.QLabel("결과 이력")
             history_label.setObjectName("Title")
             history_title.addWidget(history_label)
             history_title.addStretch(1)
-            # 줄마다 버튼을 두면 표가 산만하고, 결국 한 번에 하나만 씁니다.
-            # 선택한 줄의 판정 설정을 차트로 보내는 버튼 하나로 충분합니다.
             # 프리셋: 이력에서 고른 줄을 이름 붙여 저장하고, 콤보에서 되불러옵니다.
             self.preset_combo = QtWidgets.QComboBox()
             self.preset_combo.setMinimumWidth(150)
@@ -596,26 +602,34 @@ def build_config_window(parent: Any = None, live_apply: Any = None) -> Any:
                 "나중에 텔레그램에서 /설정:이름 으로도 불러옵니다.")
             self.save_preset_strategy_button.clicked.connect(self._save_preset)
             history_title.addWidget(self.save_preset_strategy_button)
+            history_head.addLayout(history_title)
 
+            # 아랫줄 - 모두 "이력에서 고른 줄"에 대한 동작입니다.
+            history_actions = QtWidgets.QHBoxLayout()
+            history_actions.addStretch(1)
             self.apply_chart_button = QtWidgets.QPushButton("차트 설정 적용")
             self.apply_chart_button.setToolTip(
                 "선택한 줄을 만든 판정 설정을 차트 패널에 넣습니다.\n"
                 "차트가 닫혀 있으면 열면서 넣습니다.")
             self.apply_chart_button.clicked.connect(self._apply_selected_scoring)
-            history_title.addWidget(self.apply_chart_button)
+            history_actions.addWidget(self.apply_chart_button)
             self.include_trading_check = QtWidgets.QCheckBox("매매설정 포함")
             self.include_trading_check.setToolTip(
                 "켜면 판정값뿐 아니라 종목·사이징·청산 등 매매 설정도 함께 "
                 "가져옵니다.\n끄면 차트에 그려지는 판정값만 바뀝니다.")
-            history_title.addWidget(self.include_trading_check)
+            history_actions.addWidget(self.include_trading_check)
+            history_actions.addSpacing(12)
             self.view_config_button = QtWidgets.QPushButton("백테스트 설정보기")
             self.view_config_button.clicked.connect(self._view_selected_config)
-            history_title.addWidget(self.view_config_button)
+            history_actions.addWidget(self.view_config_button)
+            history_actions.addSpacing(12)
             self.delete_results_button = QtWidgets.QPushButton("선택 삭제")
             self.delete_results_button.setObjectName("Danger")
             self.delete_results_button.clicked.connect(self._delete_selected_results)
-            history_title.addWidget(self.delete_results_button)
-            outer.addLayout(history_title)
+            history_actions.addWidget(self.delete_results_button)
+            history_head.addLayout(history_actions)
+
+            outer.addLayout(history_head)
 
             self.history_table = _HistoryTable()
             self.history_table.setObjectName("BacktestTable")

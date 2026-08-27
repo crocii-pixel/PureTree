@@ -631,3 +631,64 @@ def test_legend_toggles_each_overlay_without_panning_the_chart(monkeypatch):
 
     window.close()
     app.processEvents()
+
+
+def test_theme_styles_the_history_widget_by_its_actual_class(monkeypatch):
+    """
+    결과 이력 위젯의 **실제 클래스**에 스타일 규칙이 있어야 합니다.
+
+    Qt 스타일시트는 클래스 이름으로 고릅니다. 이력을 QTableWidget 에서
+    QTreeWidget 으로 바꿨을 때 ui_theme 에는 QTableWidget 규칙만 남아 있어,
+    이력만 스타일이 통째로 빠진 채 Qt 기본 팔레트로 그려졌습니다.
+    한 줄 걸러 배경이 허옇게 떠서 글자가 묻혔습니다.
+
+    이 테스트는 "위젯 클래스를 바꿨는데 스타일시트를 안 따라갔다"는 부류를
+    통째로 잡습니다. 위젯을 또 바꾸면 여기서 걸립니다.
+    """
+    try:
+        from PyQt6 import QtWidgets
+    except ImportError:
+        try:
+            from PyQt5 import QtWidgets
+        except ImportError:
+            pytest.skip("PyQt5/PyQt6 unavailable")
+    import copy
+    import config_manager
+    import config_gui
+    import ui_theme
+
+    monkeypatch.setattr(
+        config_manager, "load_config",
+        lambda: copy.deepcopy(config_manager.DEFAULT_CONFIG))
+    monkeypatch.setattr(config_manager, "read_env", lambda *_a, **_k: {})
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    app.setStyleSheet(ui_theme.stylesheet())
+    window = config_gui.build_config_window()
+    window._open_backtest()
+    backtest = window._backtest_window
+
+    sheet = ui_theme.stylesheet()
+    widget = backtest.history_table
+    class_name = type(widget).__mro__[1].__name__      # _HistoryTable -> QTreeWidget
+    assert class_name.startswith("QTree"), class_name
+    assert f"{class_name} {{" in sheet, (
+        f"{class_name} 에 대한 스타일 규칙이 없습니다. "
+        "위젯 클래스를 바꿨다면 ui_theme 도 같이 고쳐야 합니다.")
+
+    # objectName 으로 거는 세부 규칙도 살아 있어야 합니다.
+    assert widget.objectName() == "BacktestTable"
+    assert f"{class_name}#BacktestTable" in sheet
+
+    # 어두운 테마에서 한 줄 걸러 배경이 뜨면 안 됩니다. 기본 팔레트로
+    # 떨어지지 않았는지 실제로 칠해진 색을 봅니다.
+    backtest.resize(900, 700)
+    backtest.show()
+    app.processEvents()
+    if backtest.history_table.topLevelItemCount() >= 2:
+        image = backtest.history_table.grab().toImage()
+        rows = [image.pixelColor(300, y) for y in range(40, 120, 4)]
+        spread = max(c.lightness() for c in rows) - min(c.lightness() for c in rows)
+        assert spread < 40, f"행 간 밝기 차이가 {spread} 로 너무 큽니다"
+
+    window.close()
+    app.processEvents()

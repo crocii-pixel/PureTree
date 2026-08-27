@@ -416,6 +416,44 @@ QTableWidget#BacktestTable::item:selected {{
 }}
 QTableCornerButton::section {{ background-color: {c['surface']}; border: none; }}
 
+/* ---------- 트리 ----------
+   Qt 스타일시트는 **클래스 이름으로** 고릅니다. 위의 QTableWidget 규칙은
+   QTreeWidget 에 하나도 걸리지 않습니다. 결과 이력을 표에서 트리로 바꿀 때
+   이 사실을 놓쳐, 이력만 스타일이 통째로 빠진 채 Qt 기본 팔레트로
+   그려졌습니다 - 한 줄 걸러 배경이 허옇게 뜨고 글자가 묻혔습니다. */
+QTreeWidget {{
+    background-color: {c['surface']};
+    alternate-background-color: {c['border_soft']};
+    border: none;
+    outline: none;
+}}
+QTreeWidget::item {{
+    padding: 6px 8px;
+    border: none;
+}}
+QTreeWidget::item:selected {{
+    background-color: {c['accent_dim']};
+    color: {c['text']};
+}}
+QTreeWidget#BacktestTable {{
+    background-color: #111419;
+    alternate-background-color: #161A20;
+    border: 1px solid #323943;
+    color: #F4F7FA;
+}}
+QTreeWidget#BacktestTable::item {{
+    padding: 7px 9px;
+    border-bottom: 1px solid #2A3038;
+}}
+QTreeWidget#BacktestTable::item:selected {{
+    background-color: #244A5C;
+    color: #FFFFFF;
+}}
+/* ::branch 는 건드리지 않습니다. 여기에 image 를 주면 펼침 화살표가
+   사라져서, 자식이 있는 줄인지 알 수 없게 됩니다. Qt 기본 화살표가
+   위에서 지정한 글자색을 따라갑니다. */
+QTreeWidget::branch {{ background: transparent; }}
+
 /* ---------- 로그 ---------- */
 QTextEdit#Log {{
     background-color: {c['bg']};
