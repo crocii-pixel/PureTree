@@ -692,3 +692,69 @@ def test_theme_styles_the_history_widget_by_its_actual_class(monkeypatch):
 
     window.close()
     app.processEvents()
+
+
+def test_period_and_strategy_preset_combos_are_separate_widgets(monkeypatch):
+    """
+    기간 콤보와 저장된 설정 콤보는 서로 다른 위젯이어야 합니다.
+
+    둘 다 ``self.preset_combo`` 라는 같은 이름으로 만들어져서, 나중에
+    만든 전략 콤보가 기간 콤보를 가렸습니다. ``_reload_presets`` 도 두 번
+    정의돼 아래쪽(전략용)이 이겼습니다. 그 결과:
+
+      * 기간 선택 칸에 기간이 아니라 전략 프리셋 이름이 떴습니다.
+      * [현재 기간 추가] 를 눌러도 기간 목록에 아무것도 안 늘었습니다.
+
+    같은 이름을 두 번 쓰면 Python 은 조용히 뒤엣것을 택합니다. 이름이
+    갈려 있는지, 그리고 각자 제 목록을 채우는지 여기서 고정합니다.
+    """
+    try:
+        from PyQt6 import QtWidgets
+    except ImportError:
+        try:
+            from PyQt5 import QtWidgets
+        except ImportError:
+            pytest.skip("PyQt5/PyQt6 unavailable")
+    import copy
+    import config_manager
+    import config_gui
+
+    monkeypatch.setattr(
+        config_manager, "load_config",
+        lambda: copy.deepcopy(config_manager.DEFAULT_CONFIG))
+    monkeypatch.setattr(config_manager, "read_env", lambda *_a, **_k: {})
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    window = config_gui.build_config_window()
+    window._open_backtest()
+    backtest = window._backtest_window
+
+    period = backtest.preset_combo
+    strategy = backtest.strategy_preset_combo
+    assert period is not strategy, "두 콤보가 같은 위젯입니다"
+
+    # 기간 콤보에는 기간이 들어 있어야 합니다. 전략 프리셋의 자리표시자가
+    # 여기 뜨면 덮어쓰기가 되살아난 것입니다.
+    period_items = [period.itemText(i) for i in range(period.count())]
+    assert "최근 1년" in period_items, period_items
+    assert "— 저장된 설정 —" not in period_items, period_items
+    # 기간 항목은 시작·종료를 들고 있습니다.
+    assert isinstance(period.itemData(period.findText("최근 1년")), dict)
+
+    # 저장된 설정 콤보는 자리표시자로 시작합니다.
+    assert strategy.itemText(0) == "— 저장된 설정 —"
+
+    # [현재 기간 추가] 가 기간 콤보에만 줄을 늘려야 합니다.
+    before_period, before_strategy = period.count(), strategy.count()
+    monkeypatch.setattr(
+        QtWidgets.QInputDialog, "getText",
+        staticmethod(lambda *a, **k: ("검증용구간", True)))
+    backtest._all_period_selected = False
+    backtest._save_custom_preset()
+
+    assert period.count() == before_period + 1, "기간이 늘지 않았습니다"
+    assert strategy.count() == before_strategy, "전략 콤보가 같이 변했습니다"
+    assert period.findText("검증용구간") >= 0
+    assert period.currentText() == "검증용구간", "추가한 기간이 선택되지 않았습니다"
+
+    window.close()
+    app.processEvents()

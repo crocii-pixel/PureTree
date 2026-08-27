@@ -588,14 +588,14 @@ def build_config_window(parent: Any = None, live_apply: Any = None) -> Any:
             history_title.addWidget(history_label)
             history_title.addStretch(1)
             # 프리셋: 이력에서 고른 줄을 이름 붙여 저장하고, 콤보에서 되불러옵니다.
-            self.preset_combo = QtWidgets.QComboBox()
-            self.preset_combo.setMinimumWidth(150)
-            self.preset_combo.setToolTip(
+            self.strategy_preset_combo = QtWidgets.QComboBox()
+            self.strategy_preset_combo.setMinimumWidth(150)
+            self.strategy_preset_combo.setToolTip(
                 "저장된 설정. 고르면 설정 창의 값이 통째로 바뀝니다.\n"
                 "실제 반영은 설정 창에서 [저장]을 눌러야 됩니다.")
-            self.preset_combo.currentIndexChanged.connect(self._preset_selected)
+            self.strategy_preset_combo.currentIndexChanged.connect(self._preset_selected)
             history_title.addWidget(QtWidgets.QLabel("저장된 설정"))
-            history_title.addWidget(self.preset_combo)
+            history_title.addWidget(self.strategy_preset_combo)
             self.save_preset_strategy_button = QtWidgets.QPushButton("이 결과를 저장")
             self.save_preset_strategy_button.setToolTip(
                 "이력에서 고른 줄의 설정을 이름 붙여 저장합니다.\n"
@@ -667,7 +667,8 @@ def build_config_window(parent: Any = None, live_apply: Any = None) -> Any:
             outer.addWidget(self.history_table, 1)
             self._update_split_controls()
             self._reload_history()
-            self._reload_presets()
+            self._reload_presets()              # 기간 콤보
+            self._reload_strategy_presets()     # 저장된 설정 콤보
             self.refresh_summary()
 
         def _reload_presets(self, selected_name: Optional[str] = None) -> None:
@@ -1074,19 +1075,19 @@ def build_config_window(parent: Any = None, live_apply: Any = None) -> Any:
             elif scroll_bottom and tree.topLevelItemCount():
                 tree.scrollToItem(tree.topLevelItem(tree.topLevelItemCount() - 1))
 
-        def _reload_presets(self, keep: str = "") -> None:
+        def _reload_strategy_presets(self, keep: str = "") -> None:
             import strategy_presets
 
-            self.preset_combo.blockSignals(True)
-            self.preset_combo.clear()
-            self.preset_combo.addItem("— 저장된 설정 —", "")
+            self.strategy_preset_combo.blockSignals(True)
+            self.strategy_preset_combo.clear()
+            self.strategy_preset_combo.addItem("— 저장된 설정 —", "")
             for name in strategy_presets.names():
-                self.preset_combo.addItem(name, name)
+                self.strategy_preset_combo.addItem(name, name)
             if keep:
-                index = self.preset_combo.findData(keep)
+                index = self.strategy_preset_combo.findData(keep)
                 if index >= 0:
-                    self.preset_combo.setCurrentIndex(index)
-            self.preset_combo.blockSignals(False)
+                    self.strategy_preset_combo.setCurrentIndex(index)
+            self.strategy_preset_combo.blockSignals(False)
 
         def _save_preset(self) -> None:
             """이력에서 고른 줄의 설정을 이름 붙여 저장합니다."""
@@ -1114,7 +1115,7 @@ def build_config_window(parent: Any = None, live_apply: Any = None) -> Any:
                 self.backtest_result.setText(
                     f"<span style='color:#FF8A80'>{exc}</span>")
                 return
-            self._reload_presets(keep=name.strip())
+            self._reload_strategy_presets(keep=name.strip())
             self.backtest_result.setText(
                 f"<span style='color:#80CBC4'>'{name.strip()}' 으로 "
                 "저장했습니다. 콤보에서 다시 불러올 수 있습니다.</span>")
@@ -1128,7 +1129,7 @@ def build_config_window(parent: Any = None, live_apply: Any = None) -> Any:
             """
             import strategy_presets
 
-            name = self.preset_combo.currentData()
+            name = self.strategy_preset_combo.currentData()
             if not name:
                 return
             values = strategy_presets.get(name)
