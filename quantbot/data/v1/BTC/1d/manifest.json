@@ -1,0 +1,10 @@
+{
+  "aggregation_version": 1,
+  "dataset_id": "BTC-USD-GLOBAL-BITSTAMP",
+  "derived_from": "1m",
+  "interval": "1d",
+  "interval_seconds": 86400,
+  "partition_policy": "utc_year",
+  "sealed_files_contain_complete_utc_dates": true,
+  "timezone": "UTC"
+}
