@@ -38,3 +38,9 @@ quantbot/tools/_cache/*_1h.csv
 # 인스턴스마다 갱신 시각이 달라 추적하면 매번 충돌합니다.
 # 파일이 없으면 fee_manager.DEFAULT_RATES로 안전하게 대체됩니다.
 quantbot/fee_rates.json
+
+# 차트 패널·프리셋의 개인 상태. 세션마다 바뀌고 사람마다 다릅니다.
+# 추적하면 백테스트를 한 번 돌릴 때마다 diff 가 생깁니다.
+quantbot/chart_settings.json
+quantbot/chart_view.json
+quantbot/strategy_presets.json
