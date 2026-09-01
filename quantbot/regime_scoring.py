@@ -64,9 +64,19 @@ DEFAULT_REGIME_SCORE_CONFIG: Dict[str, Any] = {
 }
 
 
+#: 판정기를 안 쓰는 값. 점수를 0 으로 두므로 그 방향은 **영영 안 켜집니다**
+#: (`>0` 도 `<0` 도 거짓). 다만 `ready` 는 유지되어 반대쪽 판정은 그대로
+#: 돕니다 - NaN 으로 두면 "판정 준비" 가 되어 양쪽이 다 멈춥니다.
+#:
+#: 한쪽만 켜면 그 판정기의 적용점을 단독으로 볼 수 있습니다. 둘을 같이
+#: 걸었을 때와 견주면 "합쳐져서 달라진 것" 이 분리됩니다.
+DETECTOR_NONE = "none"
+
 BULL_DETECTOR_IDS = {
+    DETECTOR_NONE,
     "dual_ma", "log_macd", "volatility_breakout", "lower_channel"}
 BEAR_DETECTOR_IDS = {
+    DETECTOR_NONE,
     "dual_ma", "log_macd", "volatility_decline", "lower_channel"}
 DECISION_INTERVAL_IDS = {
     "1m", "15m", "30m", "1h", "2h", "3h", "4h", "1d", "1w", "1mo"}
@@ -225,6 +235,11 @@ def validate_scoring_config(config: Optional[Mapping[str, Any]] = None,
         errors.append("상승 판정 방식을 선택해 주세요.")
     if str(merged.get("bear_detector", "")) not in BEAR_DETECTOR_IDS:
         errors.append("하락 판정 방식을 선택해 주세요.")
+    if (str(merged.get("bull_detector", "")) == DETECTOR_NONE
+            and str(merged.get("bear_detector", "")) == DETECTOR_NONE):
+        # 둘 다 끄면 모든 날이 "안정" 이 됩니다. 돌아가기는 하지만 그건
+        # 판정이 아니라 한 칸으로 고정한 것이라, 실수라고 보고 막습니다.
+        errors.append("상승·하락 판정을 둘 다 '없음' 으로 둘 수는 없습니다.")
     if str(merged.get("decision_interval", "")) not in DECISION_INTERVAL_IDS:
         errors.append("장세 판정 시간 간격을 선택해 주세요.")
     if str(merged.get("defensive_entry_method", "atr")) not in {
@@ -375,6 +390,11 @@ def _breakout_component(frame: pd.DataFrame, bull_atr_window: int,
 def _detector_score(parts: pd.DataFrame, detector: str,
                     slope_bars: int) -> pd.Series:
     """Return a causal direction in [-1, 1] for one selected detector."""
+    if detector == DETECTOR_NONE:
+        # **0 은 "판정 안 함" 입니다.** NaN 이 아닙니다 - NaN 이면
+        # `ready` 가 거짓이 되어 반대쪽 판정까지 "판정 준비" 로 멈춥니다.
+        # 0 이면 그 방향만 조용히 꺼집니다.
+        return pd.Series(0.0, index=parts.index, dtype=float)
     if detector == "dual_ma":
         return pd.to_numeric(parts["haltu_score"], errors="coerce")
     if detector == "log_macd":

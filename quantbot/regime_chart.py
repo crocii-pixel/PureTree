@@ -153,10 +153,20 @@ DETECTOR_OPTIONS: Tuple[Tuple[str, str], ...] = (
     ("volatility_decline", "ATR 변동성 하락"),
     ("lower_channel", "하방 채널선"),
 )
+
+#: 한쪽을 끄는 값. 맨 아래에 둡니다 - 기본 선택이 되면 안 되고, 목록을
+#: 훑을 때 판정기들 사이에 끼어 있으면 판정기처럼 읽힙니다.
+#:
+#: 끄면 그 방향은 **영영 안 켜집니다.** 반대쪽 판정기 하나만 놓고 그
+#: 적용점을 단독으로 볼 때 씁니다.
+DETECTOR_NONE_OPTION = ("none", "없음 (이 방향 안 씀)")
+
 BULL_DETECTOR_OPTIONS = tuple(
-    item for item in DETECTOR_OPTIONS if item[0] != "volatility_decline")
+    item for item in DETECTOR_OPTIONS
+    if item[0] != "volatility_decline") + (DETECTOR_NONE_OPTION,)
 BEAR_DETECTOR_OPTIONS = tuple(
-    item for item in DETECTOR_OPTIONS if item[0] != "volatility_breakout")
+    item for item in DETECTOR_OPTIONS
+    if item[0] != "volatility_breakout") + (DETECTOR_NONE_OPTION,)
 
 #: 예약매수 기준선은 이제 '예약매수 방식'에서 ATR 하단과 하방 채널선 중에
 #: 고릅니다. 전략 이름에 "ATR 하단"을 박아 두면 틀린 설명이 되고, 콤보가
@@ -1894,7 +1904,9 @@ def build_regime_chart_window(QtCore: Any, QtGui: Any, QtWidgets: Any,
                 return
             apply_text = ("켜짐(백테스트만)" if self._score["use_for_backtest"]
                           else "꺼짐(연구용)")
-            detector_labels = dict(DETECTOR_OPTIONS)
+            # '없음' 도 라벨이 있어야 합니다. 목록에서 빠뜨리면 여기서
+            # KeyError 로 터지고, 상태줄이 통째로 안 나옵니다.
+            detector_labels = dict(DETECTOR_OPTIONS + (DETECTOR_NONE_OPTION,))
             strategy_labels = dict(STRATEGY_OPTIONS)
             phase_key = ("bull_strategy" if latest["regime"] == "상승"
                          else "bear_strategy" if latest["regime"] == "하락"
